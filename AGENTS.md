@@ -15,13 +15,14 @@
 
 ## Scope (current)
 
-- **Current scope:** local Hyprland desktop activity capture plus idle periods, stored locally and printed as a daily timeline. Do not add cloud sync, screenshots, clipboard capture, browser content capture, dashboard UI, AI narrative generation, multi-user design, or non-desktop tracking without a present need and explicit decision.
+- **Current scope:** local Hyprland desktop activity capture plus idle periods, stored locally in SQLite and printed as a daily timeline. Browser window titles are redacted by default because titles can contain page content. Browser private/incognito detection is best-effort until a browser extension provides a structured signal. Do not add cloud sync, screenshots, clipboard capture, browser content capture, dashboard UI, AI narrative generation, multi-user design, or non-desktop tracking without a present need and explicit decision.
 
 ## Privacy & Security
 
 - Store data locally only.
-- Do not capture screenshots, clipboard content, page content, or browser private/incognito windows.
+- Do not capture screenshots, clipboard content, or page content.
 - Redact sensitive URLs and tokens before storing browser-derived activity.
+- Redact browser window titles unless a later browser extension provides a safer structured source.
 - Keep blacklist support for domains and applications in the first capture milestone.
 - Make logs easy to delete and export.
 - When touching capture, storage, redaction, filesystem paths, or browser/native messaging, flag the security risk and add a testable guard.
