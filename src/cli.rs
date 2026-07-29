@@ -1,6 +1,6 @@
 use crate::activity::ActivitySnapshot;
-use crate::config::Config;
-use crate::desktop::HyprlandClient;
+use crate::config::{Blacklist, Config};
+use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::input::InputActivity;
 use crate::storage::Store;
 use crate::timeline::{render_today, today_bounds, unix_now};
@@ -77,25 +77,83 @@ fn run_daemon(config: Config) -> Result<(), String> {
     let mut store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
     store.close_stale_open_segments()?;
 
+    let mut streak = FailureStreak::default();
     while running.load(Ordering::Relaxed) {
         let observed_at = unix_now();
-        let snapshot = if observed_at - input_activity.last_activity_at()
-            >= config.idle_after.as_secs() as i64
-        {
-            Some(ActivitySnapshot::idle())
-        } else {
-            hyprland.active_snapshot(&config.blacklist)?
-        };
+        let is_idle =
+            observed_at - input_activity.last_activity_at() >= config.idle_after.as_secs() as i64;
 
-        match snapshot {
-            Some(snapshot) => store.record_observation(observed_at, &snapshot)?,
-            None => store.close_open(observed_at)?,
+        match capture_once(
+            &mut store,
+            &hyprland,
+            &config.blacklist,
+            observed_at,
+            is_idle,
+        ) {
+            Ok(()) => streak.record_success(),
+            Err(error) => match streak.record_failure() {
+                Some(count) => eprintln!(
+                    "daytrace: observation failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
+                ),
+                None => {
+                    return Err(format!(
+                        "capture failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
+                    ));
+                }
+            },
         }
 
         wait_for_next_poll(&running, config.poll_interval);
     }
 
     store.close_open(unix_now())
+}
+
+/// How many consecutive failed observations end the daemon.
+///
+/// WHY tolerate any: one failed compositor query used to terminate capture for the rest of
+/// the day, and a restarted compositor or a momentarily busy socket produces exactly that.
+/// The failure was invisible until the timeline turned up empty hours later.
+///
+/// WHY not tolerate forever: a permanently broken setup would then spin silently, which from
+/// the outside is indistinguishable from working. At the default poll interval this is about
+/// a minute of uninterrupted failure before the daemon gives up and says why.
+const MAX_CONSECUTIVE_FAILURES: u32 = 60;
+
+#[derive(Debug, Default)]
+struct FailureStreak {
+    consecutive: u32,
+}
+
+impl FailureStreak {
+    fn record_success(&mut self) {
+        self.consecutive = 0;
+    }
+
+    /// The streak so far, or `None` once the daemon has to stop.
+    fn record_failure(&mut self) -> Option<u32> {
+        self.consecutive += 1;
+        (self.consecutive < MAX_CONSECUTIVE_FAILURES).then_some(self.consecutive)
+    }
+}
+
+fn capture_once(
+    store: &mut Store,
+    source: &dyn ActiveWindowSource,
+    blacklist: &Blacklist,
+    observed_at: i64,
+    is_idle: bool,
+) -> Result<(), String> {
+    let snapshot = if is_idle {
+        Some(ActivitySnapshot::idle())
+    } else {
+        source.active_snapshot(blacklist)?
+    };
+
+    match snapshot {
+        Some(snapshot) => store.record_observation(observed_at, &snapshot),
+        None => store.close_open(observed_at),
+    }
 }
 
 fn wait_for_next_poll(running: &AtomicBool, poll_interval: Duration) {
@@ -123,7 +181,89 @@ fn render_timeline(config: Config) -> Result<String, String> {
 
 #[cfg(test)]
 mod tests {
-    use super::run;
+    use super::{FailureStreak, MAX_CONSECUTIVE_FAILURES, capture_once, run};
+    use crate::activity::ActivitySnapshot;
+    use crate::config::Blacklist;
+    use crate::desktop::ActiveWindowSource;
+    use crate::storage::Store;
+    use std::cell::RefCell;
+
+    /// A desktop boundary that replays a fixed script of outcomes, so a transient failure
+    /// followed by a recovery can be staged deterministically.
+    struct ScriptedWindowSource {
+        remaining: RefCell<Vec<Result<Option<ActivitySnapshot>, String>>>,
+    }
+
+    impl ScriptedWindowSource {
+        fn new(responses: Vec<Result<Option<ActivitySnapshot>, String>>) -> Self {
+            Self {
+                remaining: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl ActiveWindowSource for ScriptedWindowSource {
+        fn active_snapshot(
+            &self,
+            _blacklist: &Blacklist,
+        ) -> Result<Option<ActivitySnapshot>, String> {
+            self.remaining
+                .borrow_mut()
+                .pop()
+                .expect("script ran out of responses")
+        }
+    }
+
+    #[test]
+    fn a_failed_observation_does_not_stop_later_ones() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        // Popped from the back, so the failure is served first.
+        let source = ScriptedWindowSource::new(vec![
+            Ok(Some(window.clone())),
+            Err("hyprctl activewindow failed".to_string()),
+        ]);
+        let blacklist = Blacklist::default();
+
+        capture_once(&mut store, &source, &blacklist, 100, false)
+            .expect_err("the compositor query failed");
+        capture_once(&mut store, &source, &blacklist, 110, false)
+            .expect("the recovered query is recorded");
+        store.close_open(120).expect("close");
+
+        let rows = store.timeline_between(0, 200, 200).expect("timeline");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].started_at, 110);
+        assert_eq!(rows[0].snapshot, window);
+    }
+
+    #[test]
+    fn transient_failures_are_tolerated_but_a_sustained_one_gives_up() {
+        let mut streak = FailureStreak::default();
+
+        for expected in 1..MAX_CONSECUTIVE_FAILURES {
+            assert_eq!(streak.record_failure(), Some(expected));
+        }
+        assert_eq!(streak.record_failure(), None);
+    }
+
+    #[test]
+    fn a_success_clears_the_failure_streak() {
+        let mut streak = FailureStreak::default();
+
+        for _ in 0..MAX_CONSECUTIVE_FAILURES - 1 {
+            streak.record_failure();
+        }
+        streak.record_success();
+
+        assert_eq!(streak.record_failure(), Some(1));
+    }
 
     #[test]
     fn prints_help_without_args() {

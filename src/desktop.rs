@@ -3,6 +3,15 @@ use crate::config::{Blacklist, redact_title};
 use serde::Deserialize;
 use std::process::Command;
 
+/// The desktop boundary the capture loop observes through.
+///
+/// Exists so the loop's failure handling can be driven by a fake: a compositor query that
+/// fails once and then recovers is the case that used to end the daemon, and it cannot be
+/// staged against a live compositor.
+pub trait ActiveWindowSource {
+    fn active_snapshot(&self, blacklist: &Blacklist) -> Result<Option<ActivitySnapshot>, String>;
+}
+
 pub struct HyprlandClient {
     command: String,
 }
@@ -29,11 +38,10 @@ impl HyprlandClient {
             command: "hyprctl".to_string(),
         }
     }
+}
 
-    pub fn active_snapshot(
-        &self,
-        blacklist: &Blacklist,
-    ) -> Result<Option<ActivitySnapshot>, String> {
+impl ActiveWindowSource for HyprlandClient {
+    fn active_snapshot(&self, blacklist: &Blacklist) -> Result<Option<ActivitySnapshot>, String> {
         let output = Command::new(&self.command)
             .args(["-j", "activewindow"])
             .output()
