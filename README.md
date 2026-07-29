@@ -22,13 +22,14 @@ The first milestone is a small Rust CLI and daemon that records active-window ch
 ```sh
 daytrace start
 daytrace today
+daytrace today --date 2026-07-20
 ```
 
 `daytrace start` runs the local capture loop. It polls Hyprland for the active window, watches `/dev/input/event*` for input activity timestamps, and stores segments in a local SQLite database.
 
 AFK tracking requires read access to at least one `/dev/input/event*` device. If no readable input devices are available, `daytrace start` exits instead of recording misleading activity.
 
-`daytrace today` prints today's chronological timeline with segment durations.
+`daytrace today` prints today's chronological timeline with segment durations. `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly.
 
 The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
 

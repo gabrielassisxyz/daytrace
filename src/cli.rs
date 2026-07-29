@@ -4,7 +4,8 @@ use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::input::InputActivity;
 use crate::service::render_user_unit;
 use crate::storage::Store;
-use crate::timeline::{render_today, today_bounds, unix_now};
+use crate::timeline::{day_bounds, local_date, render_day, unix_now};
+use chrono::NaiveDate;
 use std::env;
 use std::process::ExitCode;
 use std::sync::Arc;
@@ -17,13 +18,13 @@ daytrace
 
 Usage:
   daytrace start
-  daytrace today
+  daytrace today [--date YYYY-MM-DD]
   daytrace service unit
   daytrace help
 
 Commands:
   start         Start the desktop activity capture daemon.
-  today         Print today's chronological activity timeline.
+  today         Print a chronological activity timeline, by default for today.
   service unit  Print a systemd user unit that runs the daemon for this login session.
   help          Print this help text.
 
@@ -60,9 +61,12 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
             run_daemon(config)?;
             Ok(String::new())
         }
-        [arg] if arg == "today" => {
+        // The arguments are read before the environment, so a mistyped flag is reported as
+        // itself rather than as whatever the configuration complains about first.
+        [arg, rest @ ..] if arg == "today" => {
+            let requested = requested_day(rest)?;
             let config = Config::from_env()?;
-            render_timeline(config)
+            render_timeline(config, requested)
         }
         [first, second] if first == "service" && second == "unit" => render_service_unit(),
         [unknown] => Err(format!("unknown command: {unknown}")),
@@ -77,6 +81,31 @@ fn render_service_unit() -> Result<String, String> {
     let exec_path = env::current_exe()
         .map_err(|error| format!("failed to resolve the daytrace binary path: {error}"))?;
     Ok(render_user_unit(&exec_path))
+}
+
+/// The day named by `--date`, or `None` when the caller wants the default.
+///
+/// Hand-rolled rather than delegated to an argument parser: the surface is one flag, and
+/// what an argument parser would add here is a dependency, not an explanation of what a
+/// rejected date should have looked like.
+fn requested_day(args: &[String]) -> Result<Option<NaiveDate>, String> {
+    match args {
+        [] => Ok(None),
+        [flag, value] if flag == "--date" => parse_day(value).map(Some),
+        [single] if single == "--date" => {
+            Err("--date needs a day, as --date YYYY-MM-DD".to_string())
+        }
+        [single] => match single.strip_prefix("--date=") {
+            Some(value) => parse_day(value).map(Some),
+            None => Err(format!("unexpected argument: {single}")),
+        },
+        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+    }
+}
+
+fn parse_day(value: &str) -> Result<NaiveDate, String> {
+    NaiveDate::parse_from_str(value, "%Y-%m-%d")
+        .map_err(|_| format!("invalid date: {value}, expected YYYY-MM-DD"))
 }
 
 fn run_daemon(config: Config) -> Result<(), String> {
@@ -205,25 +234,35 @@ fn wait_for_next_poll(running: &AtomicBool, poll_interval: Duration) {
     }
 }
 
-fn render_timeline(config: Config) -> Result<String, String> {
+fn render_timeline(config: Config, requested: Option<NaiveDate>) -> Result<String, String> {
+    let now = unix_now();
+    let date = match requested {
+        Some(date) => date,
+        None => local_date(now)?,
+    };
+
     if !config.db_path.exists() {
-        return Ok("No activity events recorded for today.\n".to_string());
+        return render_day(date, &[]);
     }
 
     let store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
-    let now = unix_now();
-    let (start, end) = today_bounds(now)?;
+    let (start, end) = day_bounds(date)?;
+    // `now` still bounds a segment left open, which for a past day the query clips to the
+    // end of that day.
     let segments = store.timeline_between(start, end, now)?;
-    render_today(&segments, now)
+    render_day(date, &segments)
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, run};
+    use super::{
+        FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, requested_day, run,
+    };
     use crate::activity::ActivitySnapshot;
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
     use crate::storage::Store;
+    use chrono::NaiveDate;
     use std::cell::RefCell;
 
     /// A desktop boundary that replays a fixed script of outcomes, so a transient failure
@@ -403,6 +442,49 @@ mod tests {
             output.contains(&format!("ExecStart=\"{}\" start", exec_path.display())),
             "the unit must point at the binary that printed it: {output}"
         );
+    }
+
+    #[test]
+    fn no_date_argument_asks_for_the_default_day() {
+        assert_eq!(requested_day(&[]).expect("no argument"), None);
+    }
+
+    #[test]
+    fn a_date_argument_selects_that_day_in_either_spelling() {
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 20);
+
+        for spelling in [
+            vec!["--date".to_string(), "2026-07-20".to_string()],
+            vec!["--date=2026-07-20".to_string()],
+        ] {
+            assert_eq!(
+                requested_day(&spelling).expect("valid date"),
+                expected,
+                "failed for {spelling:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_rejected_date_says_what_a_day_should_look_like() {
+        for argument in [
+            vec!["--date".to_string()],
+            vec!["--date".to_string(), "2026-13-40".to_string()],
+            vec!["--date".to_string(), "yesterday".to_string()],
+            vec!["--date=".to_string()],
+        ] {
+            let error = requested_day(&argument).expect_err("should be rejected");
+            assert!(
+                error.contains("YYYY-MM-DD"),
+                "{argument:?} was rejected without saying what was expected: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_argument_that_is_not_a_date_flag_is_named_in_the_error() {
+        let error = requested_day(&["yesterday".to_string()]).expect_err("should be rejected");
+        assert_eq!(error, "unexpected argument: yesterday");
     }
 
     #[test]
