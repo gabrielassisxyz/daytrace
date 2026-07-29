@@ -27,7 +27,7 @@ Commands:
 Environment:
   DAYTRACE_DB_PATH                 Override the SQLite database path.
   DAYTRACE_IDLE_AFTER_SECONDS      Idle threshold, default 300.
-  DAYTRACE_BLACKLIST_APPS          Comma-separated app classes to skip.
+  DAYTRACE_BLACKLIST_APPS          Comma-separated app class substrings to skip.
   DAYTRACE_BLACKLIST_TITLES        Comma-separated title substrings to skip.
   DAYTRACE_BLACKLIST_DOMAINS       Comma-separated URL/domain substrings to skip.
 ";

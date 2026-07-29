@@ -58,18 +58,22 @@ impl Blacklist {
         let app_class = app_class.map(str::to_ascii_lowercase);
         let title = title.map(str::to_ascii_lowercase);
 
-        app_class
-            .as_deref()
-            .is_some_and(|value| self.app_classes.iter().any(|blocked| blocked == value))
-            || title.as_deref().is_some_and(|value| {
-                self.title_terms
+        // Substring, not equality: compositors report reverse-DNS classes, so an entry has to
+        // match `org.keepassxc.KeePassXC` when it says `keepassxc`. Requiring the whole string
+        // meant a blacklisted password manager was recorded anyway, in silence.
+        app_class.as_deref().is_some_and(|value| {
+            self.app_classes
+                .iter()
+                .any(|blocked| value.contains(blocked))
+        }) || title.as_deref().is_some_and(|value| {
+            self.title_terms
+                .iter()
+                .any(|blocked| value.contains(blocked))
+                || self
+                    .domain_terms
                     .iter()
                     .any(|blocked| value.contains(blocked))
-                    || self
-                        .domain_terms
-                        .iter()
-                        .any(|blocked| value.contains(blocked))
-            })
+        })
     }
 }
 
@@ -155,6 +159,14 @@ mod tests {
             redact_title(title),
             "Issue [redacted-url] token=[redacted] key=[redacted]"
         );
+    }
+
+    #[test]
+    fn blacklist_matches_reverse_dns_application_classes() {
+        let blacklist = Blacklist::new(vec!["keepassxc".to_string()], Vec::new(), Vec::new());
+
+        assert!(blacklist.should_skip(Some("org.keepassxc.KeePassXC"), Some("Passwords")));
+        assert!(!blacklist.should_skip(Some("com.mitchellh.ghostty"), Some("tmux")));
     }
 
     #[test]
