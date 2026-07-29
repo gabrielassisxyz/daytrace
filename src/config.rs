@@ -84,8 +84,12 @@ pub fn redact_title(title: &str) -> String {
     let url_re = URL_RE.get_or_init(|| {
         Regex::new(r"(?i)\b((https?://|www\.)[^\s]+)").expect("URL regex should compile")
     });
+    // The keyword may carry a prefix (`access_token`, `api_key`). A word boundary cannot
+    // express that: `_` is itself a word character, so `\b` never matched after one and the
+    // most common real spellings passed through unredacted. Over-matching a word that merely
+    // ends in a keyword is the safe direction for a guard like this.
     let secret_re = SECRET_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(token|secret|key|code|password)=([^\s&]+)")
+        Regex::new(r"(?i)([A-Za-z0-9_-]*(?:token|secret|key|code|password))=([^\s&]+)")
             .expect("secret regex should compile")
     });
 
@@ -159,6 +163,21 @@ mod tests {
             redact_title(title),
             "Issue [redacted-url] token=[redacted] key=[redacted]"
         );
+    }
+
+    #[test]
+    fn redacts_secret_keys_that_carry_a_prefix() {
+        for title in [
+            "callback access_token=abc123",
+            "request api_key=sk-live-9999",
+            "form user_password=hunter2",
+        ] {
+            let redacted = redact_title(title);
+            assert!(
+                redacted.ends_with("=[redacted]"),
+                "expected {title} to be redacted, got {redacted}"
+            );
+        }
     }
 
     #[test]
