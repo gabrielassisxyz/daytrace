@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+fail=0
+
+for b in cargo cargo-audit git python3; do
+    if ! command -v "$b" >/dev/null 2>&1; then
+        echo "missing: $b" >&2
+        fail=1
+    fi
+done
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> bin/ci FAILED"
+    exit 1
+fi
+
+echo "==> format check"
+cargo fmt --check || fail=1
+
+echo "==> lint"
+cargo clippy -- -D warnings || fail=1
+
+echo "==> test"
+cargo test || fail=1
+
+echo "==> dependency audit"
+cargo audit || fail=1
+
+echo "==> markdown wrap"
+scripts/md-unwrap.py --check || fail=1
+
+echo "==> prose guard"
+bin/slop-guard || fail=1
+
+if [ "$fail" -ne 0 ]; then
+    echo "==> bin/ci FAILED"
+    exit 1
+fi
+
+echo "CI green."
