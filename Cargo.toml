@@ -1,0 +1,8 @@
+[package]
+name = "daytrace"
+version = "0.1.0"
+edition = "2024"
+description = "Local-first personal activity timeline logger"
+publish = false
+
+[dependencies]

@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Deterministic gate: block a staged secret from ever reaching a commit.
+# The probabilistic counterpart (show `git diff --cached` before commit) lives in
+# AGENTS.md — this hook is the trava that survives forgetting.
+set -euo pipefail
+
+if ! command -v gitleaks >/dev/null 2>&1; then
+    echo "gitleaks not installed — see https://github.com/gitleaks/gitleaks" >&2
+    exit 1
+fi
+
+gitleaks protect --staged --no-banner
