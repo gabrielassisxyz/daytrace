@@ -29,7 +29,23 @@ daytrace today --date 2026-07-20
 
 AFK tracking requires read access to at least one `/dev/input/event*` device. If no readable input devices are available, `daytrace start` exits instead of recording misleading activity.
 
-`daytrace today` prints today's chronological timeline with segment durations. `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly.
+`daytrace today` prints the chronological timeline with segment durations, then totals the day by application, so the report answers both what happened in order and what consumed the day:
+
+```text
+Timeline for 2026-07-20
+09:10-09:34  24m     ghostty - tmux
+09:34-09:51  17m     firefox - [browser title redacted]
+09:51-10:07  16m     AFK
+
+Time per application
+   24m  ghostty
+   17m  firefox
+   16m  AFK
+```
+
+Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute even where each individual row rounds to `0m`. Absence is totalled as `AFK`, apart from any application.
+
+`--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly.
 
 The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
 
