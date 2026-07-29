@@ -12,6 +12,7 @@
 - **Test:** `cargo test`
 - **Full gate:** `bin/ci`
 - **Planning:** Use `br` for maintainer issues and `bv --robot-*` for graph triage. Never run bare `bv`. Keep the public planning surface in `ROADMAP.md`.
+- **Development tracker:** `local/DEVELOPMENT.md` maps the layered plan to the beads graph and carries the queue order and the open decisions. Read it before picking up work, and update it in the same session that closes a bead, opens one, or settles a decision. It is maintainer-facing, so bead IDs belong there and never in `ROADMAP.md`. If `local/` is absent the checkout simply has no maintainer notes, which is normal.
 
 ## Scope (current)
 
