@@ -16,6 +16,13 @@ struct OpenSegment {
     snapshot: ActivitySnapshot,
 }
 
+/// How far a recovered segment may reach when the daemon never closed it.
+///
+/// WHY a separate column instead of just writing `ended_at` on every poll: `ended_at IS NULL`
+/// is what marks the segment still in progress, so heartbeating into it would close the
+/// segment against itself and every later observation would start a new one.
+const LAST_SEEN_COLUMN: &str = "last_seen_at";
+
 impl Store {
     pub fn open(path: impl AsRef<Path>, secure_data_dir: Option<PathBuf>) -> Result<Self, String> {
         if let Some(parent) = path.as_ref().parent() {
@@ -62,10 +69,19 @@ impl Store {
         let open = load_open_segment(&tx)?;
 
         match open {
-            Some(open) if open.snapshot == *snapshot => {}
+            // An unchanged snapshot still has to leave a trace: without it a segment that
+            // stays in focus for hours carries no evidence of how long it lasted, and a
+            // daemon killed before the next window change loses the whole stretch.
+            Some(open) if open.snapshot == *snapshot => {
+                tx.execute(
+                    "UPDATE activity_segments SET last_seen_at = ?1 WHERE id = ?2",
+                    params![observed_at, open.id],
+                )
+                .map_err(|error| format!("failed to record segment progress: {error}"))?;
+            }
             Some(open) => {
                 tx.execute(
-                    "UPDATE activity_segments SET ended_at = ?1 WHERE id = ?2",
+                    "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE id = ?2",
                     params![observed_at, open.id],
                 )
                 .map_err(|error| format!("failed to close segment: {error}"))?;
@@ -82,17 +98,24 @@ impl Store {
     pub fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE activity_segments SET ended_at = ?1 WHERE ended_at IS NULL",
+                "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE ended_at IS NULL",
                 params![ended_at],
             )
             .map_err(|error| format!("failed to close open segments: {error}"))?;
         self.secure_permissions()
     }
 
+    /// Close whatever the previous run left open, at the last moment it was observed.
+    ///
+    /// The daemon can die without closing anything: a crash, a reboot, an OOM kill. Falling
+    /// back to `started_at` used to discard the entire stretch, so an afternoon spent in one
+    /// window disappeared from the timeline. `last_seen_at` bounds the loss to a single poll.
     pub fn close_stale_open_segments(&mut self) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE activity_segments SET ended_at = started_at WHERE ended_at IS NULL",
+                "UPDATE activity_segments
+                 SET ended_at = COALESCE(last_seen_at, started_at)
+                 WHERE ended_at IS NULL",
                 [],
             )
             .map_err(|error| format!("failed to close stale open segments: {error}"))?;
@@ -150,6 +173,7 @@ impl Store {
                     title TEXT,
                     workspace TEXT,
                     monitor INTEGER,
+                    last_seen_at INTEGER,
                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
                 );
 
@@ -157,7 +181,38 @@ impl Store {
                 ON activity_segments(started_at, ended_at);
                 ",
             )
-            .map_err(|error| format!("failed to migrate DB: {error}"))
+            .map_err(|error| format!("failed to migrate DB: {error}"))?;
+
+        self.add_last_seen_column_if_missing()
+    }
+
+    /// A database written before segment progress was tracked has no `last_seen_at`. Adding it
+    /// is the whole migration: existing rows keep NULL, and the recovery query already falls
+    /// back to `started_at` for those, which is the old behaviour for old data.
+    fn add_last_seen_column_if_missing(&self) -> Result<(), String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('activity_segments')")
+            .map_err(|error| format!("failed to inspect schema: {error}"))?;
+        let has_column = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("failed to read schema columns: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to materialize schema columns: {error}"))?
+            .iter()
+            .any(|name| name == LAST_SEEN_COLUMN);
+
+        if has_column {
+            return Ok(());
+        }
+
+        self.conn
+            .execute(
+                "ALTER TABLE activity_segments ADD COLUMN last_seen_at INTEGER",
+                [],
+            )
+            .map_err(|error| format!("failed to add {LAST_SEEN_COLUMN} column: {error}"))?;
+        Ok(())
     }
 
     fn secure_permissions(&self) -> Result<(), String> {
@@ -233,8 +288,9 @@ fn insert_segment(
     snapshot: &ActivitySnapshot,
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO activity_segments (started_at, kind, app_class, title, workspace, monitor)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO activity_segments
+            (started_at, last_seen_at, kind, app_class, title, workspace, monitor)
+         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6)",
         params![
             started_at,
             snapshot.kind.as_str(),
@@ -336,6 +392,74 @@ mod tests {
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].started_at, 100);
+        assert_eq!(rows[0].ended_at, 100);
+    }
+
+    #[test]
+    fn recovery_keeps_time_elapsed_before_an_unclean_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // One long stretch in a single window: the daemon keeps observing the same snapshot
+        // and never gets to close the segment, which is what a crash or reboot looks like.
+        store.record_observation(100, &active).expect("insert");
+        for observed_at in [200, 300, 400] {
+            store
+                .record_observation(observed_at, &active)
+                .expect("unchanged observation");
+        }
+
+        let mut recovered = Store::open(&db, None).expect("reopen after crash");
+        recovered
+            .close_stale_open_segments()
+            .expect("recover open segment");
+
+        let rows = recovered.timeline_between(0, 500, 500).expect("timeline");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].started_at, 100);
+        assert_eq!(rows[0].ended_at, 400);
+    }
+
+    #[test]
+    fn recovery_reads_databases_written_before_progress_tracking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+
+        // A schema exactly as it shipped before last_seen_at existed.
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (started_at, kind, app_class)
+                VALUES (100, 'window', 'ghostty');",
+            )
+            .expect("seed legacy rows");
+        drop(legacy);
+
+        let mut store = Store::open(&db, None).expect("migrate legacy database");
+        store
+            .close_stale_open_segments()
+            .expect("recover legacy open segment");
+
+        let rows = store.timeline_between(0, 500, 500).expect("timeline");
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, 100);
     }
 
