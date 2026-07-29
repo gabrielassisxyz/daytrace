@@ -58,18 +58,22 @@ impl Blacklist {
         let app_class = app_class.map(str::to_ascii_lowercase);
         let title = title.map(str::to_ascii_lowercase);
 
-        app_class
-            .as_deref()
-            .is_some_and(|value| self.app_classes.iter().any(|blocked| blocked == value))
-            || title.as_deref().is_some_and(|value| {
-                self.title_terms
+        // Substring, not equality: compositors report reverse-DNS classes, so an entry has to
+        // match `org.keepassxc.KeePassXC` when it says `keepassxc`. Requiring the whole string
+        // meant a blacklisted password manager was recorded anyway, in silence.
+        app_class.as_deref().is_some_and(|value| {
+            self.app_classes
+                .iter()
+                .any(|blocked| value.contains(blocked))
+        }) || title.as_deref().is_some_and(|value| {
+            self.title_terms
+                .iter()
+                .any(|blocked| value.contains(blocked))
+                || self
+                    .domain_terms
                     .iter()
                     .any(|blocked| value.contains(blocked))
-                    || self
-                        .domain_terms
-                        .iter()
-                        .any(|blocked| value.contains(blocked))
-            })
+        })
     }
 }
 
@@ -80,8 +84,12 @@ pub fn redact_title(title: &str) -> String {
     let url_re = URL_RE.get_or_init(|| {
         Regex::new(r"(?i)\b((https?://|www\.)[^\s]+)").expect("URL regex should compile")
     });
+    // The keyword may carry a prefix (`access_token`, `api_key`). A word boundary cannot
+    // express that: `_` is itself a word character, so `\b` never matched after one and the
+    // most common real spellings passed through unredacted. Over-matching a word that merely
+    // ends in a keyword is the safe direction for a guard like this.
     let secret_re = SECRET_RE.get_or_init(|| {
-        Regex::new(r"(?i)\b(token|secret|key|code|password)=([^\s&]+)")
+        Regex::new(r"(?i)([A-Za-z0-9_-]*(?:token|secret|key|code|password))=([^\s&]+)")
             .expect("secret regex should compile")
     });
 
@@ -155,6 +163,29 @@ mod tests {
             redact_title(title),
             "Issue [redacted-url] token=[redacted] key=[redacted]"
         );
+    }
+
+    #[test]
+    fn redacts_secret_keys_that_carry_a_prefix() {
+        for title in [
+            "callback access_token=abc123",
+            "request api_key=sk-live-9999",
+            "form user_password=hunter2",
+        ] {
+            let redacted = redact_title(title);
+            assert!(
+                redacted.ends_with("=[redacted]"),
+                "expected {title} to be redacted, got {redacted}"
+            );
+        }
+    }
+
+    #[test]
+    fn blacklist_matches_reverse_dns_application_classes() {
+        let blacklist = Blacklist::new(vec!["keepassxc".to_string()], Vec::new(), Vec::new());
+
+        assert!(blacklist.should_skip(Some("org.keepassxc.KeePassXC"), Some("Passwords")));
+        assert!(!blacklist.should_skip(Some("com.mitchellh.ghostty"), Some("tmux")));
     }
 
     #[test]

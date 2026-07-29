@@ -43,7 +43,7 @@ Useful environment overrides:
 - `DAYTRACE_DB_PATH`: SQLite database path.
 - `DAYTRACE_IDLE_AFTER_SECONDS`: AFK threshold, default `300`.
 - `DAYTRACE_POLL_SECONDS`: desktop polling interval, default `1`.
-- `DAYTRACE_BLACKLIST_APPS`: comma-separated application classes to skip.
+- `DAYTRACE_BLACKLIST_APPS`: comma-separated application class substrings to skip. Matching is by substring so that a short entry such as `keepassxc` covers the reverse-DNS class `org.keepassxc.KeePassXC` that a compositor actually reports.
 - `DAYTRACE_BLACKLIST_TITLES`: comma-separated title substrings to skip.
 - `DAYTRACE_BLACKLIST_DOMAINS`: comma-separated URL or domain substrings to skip.
 

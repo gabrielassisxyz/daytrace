@@ -1,5 +1,5 @@
 use crate::activity::{ActivityKind, ActivitySnapshot, TimelineSegment};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -13,8 +13,16 @@ pub struct Store {
 #[derive(Debug)]
 struct OpenSegment {
     id: i64,
+    started_at: i64,
     snapshot: ActivitySnapshot,
 }
+
+/// How far a recovered segment may reach when the daemon never closed it.
+///
+/// WHY a separate column instead of just writing `ended_at` on every poll: `ended_at IS NULL`
+/// is what marks the segment still in progress, so heartbeating into it would close the
+/// segment against itself and every later observation would start a new one.
+const LAST_SEEN_COLUMN: &str = "last_seen_at";
 
 impl Store {
     pub fn open(path: impl AsRef<Path>, secure_data_dir: Option<PathBuf>) -> Result<Self, String> {
@@ -45,33 +53,67 @@ impl Store {
         Ok(store)
     }
 
+    /// Record what is happening now, as of `starts_at`.
+    ///
+    /// The two timestamps differ whenever a transition is detected after the fact. Idle is the
+    /// case that matters: the daemon only learns the machine went idle once the threshold has
+    /// already elapsed, so `starts_at` is when input actually stopped while `seen_at` stays
+    /// the current time and keeps the segment's progress moving.
     pub fn record_observation(
         &mut self,
-        observed_at: i64,
+        starts_at: i64,
+        seen_at: i64,
         snapshot: &ActivitySnapshot,
     ) -> Result<(), String> {
         if !snapshot.is_recordable() {
-            self.close_open(observed_at)?;
+            self.close_open(seen_at)?;
             return Ok(());
         }
 
+        // IMMEDIATE, not the default DEFERRED. A deferred transaction reads first and upgrades
+        // on the first write, and SQLite answers that upgrade with SQLITE_BUSY_SNAPSHOT
+        // immediately, without ever consulting the busy handler, so the busy_timeout set in
+        // `open` would not apply and a second daytrace process would fail outright rather than
+        // wait its turn.
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to start transaction: {error}"))?;
         let open = load_open_segment(&tx)?;
 
+        // A backdated start may not reach behind time that is already accounted for, or the
+        // new segment overlaps an existing one and the day adds up to more than it lasted.
+        // The floor is the last boundary written, whether that is a closed segment's end or
+        // the open segment's start; the open segment's own progress is deliberately excluded,
+        // since displacing it is exactly what a backdated start is for.
+        let begins_at = match last_accounted_instant(&tx)? {
+            Some(floor) => starts_at.max(floor),
+            None => starts_at,
+        };
+
         match open {
-            Some(open) if open.snapshot == *snapshot => {}
+            // An unchanged snapshot still has to leave a trace: without it a segment that
+            // stays in focus for hours carries no evidence of how long it lasted, and a
+            // daemon killed before the next window change loses the whole stretch.
+            Some(open) if open.snapshot == *snapshot => {
+                // `unix_now` is wall clock, not monotonic: an NTP step backwards would
+                // otherwise park the progress marker before the segment even started, and
+                // recovery would then write an end that precedes the beginning.
+                tx.execute(
+                    "UPDATE activity_segments SET last_seen_at = ?1 WHERE id = ?2",
+                    params![seen_at.max(open.started_at), open.id],
+                )
+                .map_err(|error| format!("failed to record segment progress: {error}"))?;
+            }
             Some(open) => {
                 tx.execute(
-                    "UPDATE activity_segments SET ended_at = ?1 WHERE id = ?2",
-                    params![observed_at, open.id],
+                    "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE id = ?2",
+                    params![begins_at, open.id],
                 )
                 .map_err(|error| format!("failed to close segment: {error}"))?;
-                insert_segment(&tx, observed_at, snapshot)?;
+                insert_segment(&tx, begins_at, seen_at, snapshot)?;
             }
-            None => insert_segment(&tx, observed_at, snapshot)?,
+            None => insert_segment(&tx, begins_at, seen_at, snapshot)?,
         }
 
         tx.commit()
@@ -82,17 +124,24 @@ impl Store {
     pub fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE activity_segments SET ended_at = ?1 WHERE ended_at IS NULL",
+                "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE ended_at IS NULL",
                 params![ended_at],
             )
             .map_err(|error| format!("failed to close open segments: {error}"))?;
         self.secure_permissions()
     }
 
+    /// Close whatever the previous run left open, at the last moment it was observed.
+    ///
+    /// The daemon can die without closing anything: a crash, a reboot, an OOM kill. Falling
+    /// back to `started_at` used to discard the entire stretch, so an afternoon spent in one
+    /// window disappeared from the timeline. `last_seen_at` bounds the loss to a single poll.
     pub fn close_stale_open_segments(&mut self) -> Result<(), String> {
         self.conn
             .execute(
-                "UPDATE activity_segments SET ended_at = started_at WHERE ended_at IS NULL",
+                "UPDATE activity_segments
+                 SET ended_at = COALESCE(last_seen_at, started_at)
+                 WHERE ended_at IS NULL",
                 [],
             )
             .map_err(|error| format!("failed to close stale open segments: {error}"))?;
@@ -150,6 +199,7 @@ impl Store {
                     title TEXT,
                     workspace TEXT,
                     monitor INTEGER,
+                    last_seen_at INTEGER,
                     created_at INTEGER NOT NULL DEFAULT (unixepoch())
                 );
 
@@ -157,7 +207,42 @@ impl Store {
                 ON activity_segments(started_at, ended_at);
                 ",
             )
-            .map_err(|error| format!("failed to migrate DB: {error}"))
+            .map_err(|error| format!("failed to migrate DB: {error}"))?;
+
+        self.add_last_seen_column_if_missing()
+    }
+
+    /// A database written before segment progress was tracked has no `last_seen_at`. Adding it
+    /// is the whole migration: existing rows keep NULL, and the recovery query already falls
+    /// back to `started_at` for those, which is the old behaviour for old data.
+    fn add_last_seen_column_if_missing(&self) -> Result<(), String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('activity_segments')")
+            .map_err(|error| format!("failed to inspect schema: {error}"))?;
+        let has_column = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("failed to read schema columns: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to materialize schema columns: {error}"))?
+            .iter()
+            .any(|name| name == LAST_SEEN_COLUMN);
+
+        if has_column {
+            return Ok(());
+        }
+
+        match self.conn.execute(
+            "ALTER TABLE activity_segments ADD COLUMN last_seen_at INTEGER",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            // Two processes can both read the pre-migration schema and both try to add the
+            // column. The loser's ALTER is redundant, not a failure, and treating it as one
+            // would turn the first run after an upgrade into a hard startup error.
+            Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+            Err(error) => Err(format!("failed to add {LAST_SEEN_COLUMN} column: {error}")),
+        }
     }
 
     fn secure_permissions(&self) -> Result<(), String> {
@@ -204,7 +289,7 @@ fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
 
 fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
     conn.query_row(
-        "SELECT id, kind, app_class, title, workspace, monitor
+        "SELECT id, started_at, kind, app_class, title, workspace, monitor
          FROM activity_segments
          WHERE ended_at IS NULL
          ORDER BY id DESC
@@ -213,12 +298,13 @@ fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
         |row| {
             Ok(OpenSegment {
                 id: row.get(0)?,
+                started_at: row.get(1)?,
                 snapshot: ActivitySnapshot {
-                    kind: ActivityKind::from_str(&row.get::<_, String>(1)?),
-                    app_class: row.get(2)?,
-                    title: row.get(3)?,
-                    workspace: row.get(4)?,
-                    monitor: row.get(5)?,
+                    kind: ActivityKind::from_str(&row.get::<_, String>(2)?),
+                    app_class: row.get(3)?,
+                    title: row.get(4)?,
+                    workspace: row.get(5)?,
+                    monitor: row.get(6)?,
                 },
             })
         },
@@ -227,16 +313,33 @@ fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
     .map_err(|error| format!("failed to load open segment: {error}"))
 }
 
+/// The latest instant the timeline already accounts for, or `None` on an empty store.
+///
+/// `COALESCE(ended_at, started_at)` deliberately reads the open segment as its start rather
+/// than its progress: a segment still running is the one a backdated transition is entitled
+/// to cut short, while everything already closed is settled.
+fn last_accounted_instant(conn: &Connection) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT MAX(COALESCE(ended_at, started_at)) FROM activity_segments",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map_err(|error| format!("failed to read the last accounted instant: {error}"))
+}
+
 fn insert_segment(
     conn: &Connection,
     started_at: i64,
+    last_seen_at: i64,
     snapshot: &ActivitySnapshot,
 ) -> Result<(), String> {
     conn.execute(
-        "INSERT INTO activity_segments (started_at, kind, app_class, title, workspace, monitor)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        "INSERT INTO activity_segments
+            (started_at, last_seen_at, kind, app_class, title, workspace, monitor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             started_at,
+            last_seen_at.max(started_at),
             snapshot.kind.as_str(),
             snapshot.app_class,
             snapshot.title,
@@ -271,9 +374,15 @@ mod tests {
             Some(0),
         );
 
-        store.record_observation(100, &ghostty).expect("insert");
-        store.record_observation(105, &ghostty).expect("no change");
-        store.record_observation(120, &browser).expect("change");
+        store
+            .record_observation(100, 100, &ghostty)
+            .expect("insert");
+        store
+            .record_observation(105, 105, &ghostty)
+            .expect("no change");
+        store
+            .record_observation(120, 120, &browser)
+            .expect("change");
         store.close_open(150).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
@@ -306,9 +415,9 @@ mod tests {
             None,
         );
 
-        store.record_observation(100, &active).expect("insert");
+        store.record_observation(100, 100, &active).expect("insert");
         store
-            .record_observation(110, &ActivitySnapshot::unknown())
+            .record_observation(110, 110, &ActivitySnapshot::unknown())
             .expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
@@ -328,7 +437,7 @@ mod tests {
             None,
         );
 
-        store.record_observation(100, &active).expect("insert");
+        store.record_observation(100, 100, &active).expect("insert");
         store
             .close_stale_open_segments()
             .expect("recover stale open segment");
@@ -336,6 +445,74 @@ mod tests {
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].started_at, 100);
+        assert_eq!(rows[0].ended_at, 100);
+    }
+
+    #[test]
+    fn recovery_keeps_time_elapsed_before_an_unclean_shutdown() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // One long stretch in a single window: the daemon keeps observing the same snapshot
+        // and never gets to close the segment, which is what a crash or reboot looks like.
+        store.record_observation(100, 100, &active).expect("insert");
+        for observed_at in [200, 300, 400] {
+            store
+                .record_observation(observed_at, observed_at, &active)
+                .expect("unchanged observation");
+        }
+
+        let mut recovered = Store::open(&db, None).expect("reopen after crash");
+        recovered
+            .close_stale_open_segments()
+            .expect("recover open segment");
+
+        let rows = recovered.timeline_between(0, 500, 500).expect("timeline");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].started_at, 100);
+        assert_eq!(rows[0].ended_at, 400);
+    }
+
+    #[test]
+    fn recovery_reads_databases_written_before_progress_tracking() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+
+        // A schema exactly as it shipped before last_seen_at existed.
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (started_at, kind, app_class)
+                VALUES (100, 'window', 'ghostty');",
+            )
+            .expect("seed legacy rows");
+        drop(legacy);
+
+        let mut store = Store::open(&db, None).expect("migrate legacy database");
+        store
+            .close_stale_open_segments()
+            .expect("recover legacy open segment");
+
+        let rows = store.timeline_between(0, 500, 500).expect("timeline");
+        assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, 100);
     }
 
@@ -351,6 +528,7 @@ mod tests {
         let mut store = Store::open(&db, Some(data_dir.clone())).expect("store");
         store
             .record_observation(
+                100,
                 100,
                 &ActivitySnapshot::window(
                     Some("ghostty".to_string()),
