@@ -3,6 +3,7 @@ mod cli;
 mod config;
 mod desktop;
 mod input;
+mod service;
 mod storage;
 mod timeline;
 

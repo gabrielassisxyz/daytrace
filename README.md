@@ -47,6 +47,48 @@ Useful environment overrides:
 - `DAYTRACE_BLACKLIST_TITLES`: comma-separated title substrings to skip.
 - `DAYTRACE_BLACKLIST_DOMAINS`: comma-separated URL or domain substrings to skip.
 
+## Running as a User Service
+
+Nothing is recorded while the daemon is not running, so a login that does not start it loses the day without saying so. `daytrace service unit` prints a systemd user unit for the current installation:
+
+```sh
+mkdir -p ~/.config/systemd/user
+daytrace service unit > ~/.config/systemd/user/daytrace.service
+systemctl --user daemon-reload
+systemctl --user enable --now daytrace.service
+```
+
+`ExecStart` carries the fully resolved path of the binary that printed the unit, which is what the running process reports about itself. A binary installed as a symlink therefore renders the link target rather than the link, so read the printed `ExecStart` before enabling the unit, and render it again after the binary moves.
+
+Inspect it, follow its output, and stop it with:
+
+```sh
+systemctl --user status daytrace.service
+journalctl --user -u daytrace.service -f
+systemctl --user stop daytrace.service
+systemctl --user reset-failed daytrace.service
+systemctl --user disable --now daytrace.service
+```
+
+The unit is wanted by `graphical-session.target`, so it starts with the desktop session and stops at logout. That is deliberate: the daemon reads the compositor, and the compositor is only reachable from inside that session. A session that never activates `graphical-session.target`, such as Hyprland launched directly without a session manager like `uwsm`, will not start the service on its own. Start it from the compositor configuration instead:
+
+```ini
+exec-once = systemctl --user start daytrace.service
+```
+
+Sustained capture failure ends the daemon on purpose, so that a permanently broken setup cannot look like a working one. The unit allows five starts per hour, so four automatic restarts follow the one the session performs. That recovers a compositor which comes back, without hiding a fault that keeps recurring: once the budget is spent the unit stays in `failed` state, where `systemctl --user status` reports it. The budget counts every start, manual ones included, so `systemctl --user reset-failed daytrace.service` is what clears it once a fault is fixed.
+
+Configuration goes in a drop-in rather than an edit of the generated unit, so re-running the command does not discard it:
+
+```sh
+systemctl --user edit daytrace.service
+```
+
+```ini
+[Service]
+Environment=DAYTRACE_IDLE_AFTER_SECONDS=180
+```
+
 ## Development
 
 ```sh

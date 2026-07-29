@@ -2,6 +2,7 @@ use crate::activity::ActivitySnapshot;
 use crate::config::{Blacklist, Config};
 use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::input::InputActivity;
+use crate::service::render_user_unit;
 use crate::storage::Store;
 use crate::timeline::{render_today, today_bounds, unix_now};
 use std::env;
@@ -17,12 +18,14 @@ daytrace
 Usage:
   daytrace start
   daytrace today
+  daytrace service unit
   daytrace help
 
 Commands:
-  start   Start the desktop activity capture daemon.
-  today   Print today's chronological activity timeline.
-  help    Print this help text.
+  start         Start the desktop activity capture daemon.
+  today         Print today's chronological activity timeline.
+  service unit  Print a systemd user unit that runs the daemon for this login session.
+  help          Print this help text.
 
 Environment:
   DAYTRACE_DB_PATH                 Override the SQLite database path.
@@ -61,9 +64,19 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
             let config = Config::from_env()?;
             render_timeline(config)
         }
+        [first, second] if first == "service" && second == "unit" => render_service_unit(),
         [unknown] => Err(format!("unknown command: {unknown}")),
-        _ => Err("expected exactly one command".to_string()),
+        _ => Err(format!("unknown command: {}", args.join(" "))),
     }
+}
+
+/// The unit has to name the binary that will actually run, and only the running process
+/// knows where that is. Rendering from the running path means the printed unit points at
+/// the same installation that produced it, instead of at a guessed location.
+fn render_service_unit() -> Result<String, String> {
+    let exec_path = env::current_exe()
+        .map_err(|error| format!("failed to resolve the daytrace binary path: {error}"))?;
+    Ok(render_user_unit(&exec_path))
 }
 
 fn run_daemon(config: Config) -> Result<(), String> {
@@ -377,6 +390,19 @@ mod tests {
         let output = run(Vec::<String>::new()).expect("help should succeed");
         assert!(output.contains("daytrace start"));
         assert!(output.contains("DAYTRACE_BLACKLIST_APPS"));
+    }
+
+    #[test]
+    fn prints_a_systemd_unit_pointing_at_the_running_binary() {
+        let output = run(["service".to_string(), "unit".to_string()])
+            .expect("the unit should render for the running binary");
+        let exec_path = std::env::current_exe().expect("current exe");
+
+        assert!(output.contains("[Install]"), "not a unit file: {output}");
+        assert!(
+            output.contains(&format!("ExecStart=\"{}\" start", exec_path.display())),
+            "the unit must point at the binary that printed it: {output}"
+        );
     }
 
     #[test]

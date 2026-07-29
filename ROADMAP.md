@@ -7,6 +7,7 @@
 - `daytrace start` records Hyprland active-window segments and AFK segments.
 - Activity segments are stored locally in SQLite.
 - `daytrace today` prints a chronological daily timeline with durations.
+- `daytrace service unit` prints a systemd user unit that runs the capture daemon for the desktop session.
 - Application, title, and domain blacklist environment variables exist.
 - Browser titles are redacted by default and private/incognito browser windows are skipped when Hyprland exposes a recognizable private-mode title marker.
 - Deterministic project gates exist for Rust CI, dependency audit, secret scanning, Markdown wrapping, and public prose hygiene.
