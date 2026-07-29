@@ -1,5 +1,5 @@
 use crate::activity::{ActivityKind, ActivitySnapshot, TimelineSegment};
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -70,9 +70,14 @@ impl Store {
             return Ok(());
         }
 
+        // IMMEDIATE, not the default DEFERRED. A deferred transaction reads first and upgrades
+        // on the first write, and SQLite answers that upgrade with SQLITE_BUSY_SNAPSHOT
+        // immediately, without ever consulting the busy handler, so the busy_timeout set in
+        // `open` would not apply and a second daytrace process would fail outright rather than
+        // wait its turn.
         let tx = self
             .conn
-            .transaction()
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to start transaction: {error}"))?;
         let open = load_open_segment(&tx)?;
 
@@ -227,13 +232,17 @@ impl Store {
             return Ok(());
         }
 
-        self.conn
-            .execute(
-                "ALTER TABLE activity_segments ADD COLUMN last_seen_at INTEGER",
-                [],
-            )
-            .map_err(|error| format!("failed to add {LAST_SEEN_COLUMN} column: {error}"))?;
-        Ok(())
+        match self.conn.execute(
+            "ALTER TABLE activity_segments ADD COLUMN last_seen_at INTEGER",
+            [],
+        ) {
+            Ok(_) => Ok(()),
+            // Two processes can both read the pre-migration schema and both try to add the
+            // column. The loser's ALTER is redundant, not a failure, and treating it as one
+            // would turn the first run after an upgrade into a hard startup error.
+            Err(error) if error.to_string().contains("duplicate column name") => Ok(()),
+            Err(error) => Err(format!("failed to add {LAST_SEEN_COLUMN} column: {error}")),
+        }
     }
 
     fn secure_permissions(&self) -> Result<(), String> {
