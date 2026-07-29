@@ -157,9 +157,15 @@ impl Store {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT started_at, COALESCE(ended_at, ?3), kind, app_class, title, workspace, monitor
+                // A segment still open reads as ending at its last observation, and only a row
+                // with no observation recorded falls back to the moment of the read. Resolving
+                // straight to that moment let a segment the daemon never closed grow without
+                // bound: five minutes left open by a crash reported as a full day, on its own
+                // day and on every day since, and an export stated that as fact. Recovery at
+                // the next daemon start writes the same value, so this only anticipates it.
+                "SELECT started_at, COALESCE(ended_at, last_seen_at, ?3), kind, app_class, title, workspace, monitor
                  FROM activity_segments
-                 WHERE started_at < ?2 AND COALESCE(ended_at, ?3) > ?1
+                 WHERE started_at < ?2 AND COALESCE(ended_at, last_seen_at, ?3) > ?1
                  ORDER BY started_at ASC, id ASC",
             )
             .map_err(|error| format!("failed to prepare timeline query: {error}"))?;
@@ -514,6 +520,88 @@ mod tests {
         let rows = store.timeline_between(0, 500, 500).expect("timeline");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, 100);
+    }
+
+    #[test]
+    fn an_unclosed_segment_stops_at_its_last_observation() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // A daemon killed without a chance to close leaves `ended_at` NULL until the next
+        // start recovers it. Reading the timeline used to resolve that against the moment of
+        // the read, so five minutes left open reported as everything since.
+        store.record_observation(100, 100, &active).expect("insert");
+        store
+            .record_observation(150, 150, &active)
+            .expect("unchanged observation");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(
+            rows[0].ended_at, 150,
+            "an unclosed segment may not claim time nobody observed"
+        );
+    }
+
+    #[test]
+    fn a_later_day_does_not_inherit_an_unclosed_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store.record_observation(100, 150, &active).expect("insert");
+
+        let rows = store
+            .timeline_between(1_000, 2_000, 10_000)
+            .expect("timeline");
+        assert!(
+            rows.is_empty(),
+            "a segment last seen at 150 cannot appear in a window that opens at 1000: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_row_written_before_progress_tracking_still_reaches_the_present() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (started_at, kind, app_class)
+                VALUES (100, 'window', 'ghostty');",
+            )
+            .expect("seed legacy rows");
+        drop(legacy);
+
+        // Such a row has no observation to fall back to, so the old reading is the only one
+        // available and stays in place rather than collapsing the row to nothing.
+        let store = Store::open(&db, None).expect("migrate legacy database");
+
+        let rows = store.timeline_between(0, 10_000, 500).expect("timeline");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ended_at, 500);
     }
 
     #[cfg(unix)]
