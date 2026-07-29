@@ -13,6 +13,7 @@ pub struct Store {
 #[derive(Debug)]
 struct OpenSegment {
     id: i64,
+    started_at: i64,
     snapshot: ActivitySnapshot,
 }
 
@@ -52,13 +53,20 @@ impl Store {
         Ok(store)
     }
 
+    /// Record what is happening now, as of `starts_at`.
+    ///
+    /// The two timestamps differ whenever a transition is detected after the fact. Idle is the
+    /// case that matters: the daemon only learns the machine went idle once the threshold has
+    /// already elapsed, so `starts_at` is when input actually stopped while `seen_at` stays
+    /// the current time and keeps the segment's progress moving.
     pub fn record_observation(
         &mut self,
-        observed_at: i64,
+        starts_at: i64,
+        seen_at: i64,
         snapshot: &ActivitySnapshot,
     ) -> Result<(), String> {
         if !snapshot.is_recordable() {
-            self.close_open(observed_at)?;
+            self.close_open(seen_at)?;
             return Ok(());
         }
 
@@ -68,26 +76,39 @@ impl Store {
             .map_err(|error| format!("failed to start transaction: {error}"))?;
         let open = load_open_segment(&tx)?;
 
+        // A backdated start may not reach behind time that is already accounted for, or the
+        // new segment overlaps an existing one and the day adds up to more than it lasted.
+        // The floor is the last boundary written, whether that is a closed segment's end or
+        // the open segment's start; the open segment's own progress is deliberately excluded,
+        // since displacing it is exactly what a backdated start is for.
+        let begins_at = match last_accounted_instant(&tx)? {
+            Some(floor) => starts_at.max(floor),
+            None => starts_at,
+        };
+
         match open {
             // An unchanged snapshot still has to leave a trace: without it a segment that
             // stays in focus for hours carries no evidence of how long it lasted, and a
             // daemon killed before the next window change loses the whole stretch.
             Some(open) if open.snapshot == *snapshot => {
+                // `unix_now` is wall clock, not monotonic: an NTP step backwards would
+                // otherwise park the progress marker before the segment even started, and
+                // recovery would then write an end that precedes the beginning.
                 tx.execute(
                     "UPDATE activity_segments SET last_seen_at = ?1 WHERE id = ?2",
-                    params![observed_at, open.id],
+                    params![seen_at.max(open.started_at), open.id],
                 )
                 .map_err(|error| format!("failed to record segment progress: {error}"))?;
             }
             Some(open) => {
                 tx.execute(
                     "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE id = ?2",
-                    params![observed_at, open.id],
+                    params![begins_at, open.id],
                 )
                 .map_err(|error| format!("failed to close segment: {error}"))?;
-                insert_segment(&tx, observed_at, snapshot)?;
+                insert_segment(&tx, begins_at, seen_at, snapshot)?;
             }
-            None => insert_segment(&tx, observed_at, snapshot)?,
+            None => insert_segment(&tx, begins_at, seen_at, snapshot)?,
         }
 
         tx.commit()
@@ -259,7 +280,7 @@ fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
 
 fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
     conn.query_row(
-        "SELECT id, kind, app_class, title, workspace, monitor
+        "SELECT id, started_at, kind, app_class, title, workspace, monitor
          FROM activity_segments
          WHERE ended_at IS NULL
          ORDER BY id DESC
@@ -268,12 +289,13 @@ fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
         |row| {
             Ok(OpenSegment {
                 id: row.get(0)?,
+                started_at: row.get(1)?,
                 snapshot: ActivitySnapshot {
-                    kind: ActivityKind::from_str(&row.get::<_, String>(1)?),
-                    app_class: row.get(2)?,
-                    title: row.get(3)?,
-                    workspace: row.get(4)?,
-                    monitor: row.get(5)?,
+                    kind: ActivityKind::from_str(&row.get::<_, String>(2)?),
+                    app_class: row.get(3)?,
+                    title: row.get(4)?,
+                    workspace: row.get(5)?,
+                    monitor: row.get(6)?,
                 },
             })
         },
@@ -282,17 +304,33 @@ fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
     .map_err(|error| format!("failed to load open segment: {error}"))
 }
 
+/// The latest instant the timeline already accounts for, or `None` on an empty store.
+///
+/// `COALESCE(ended_at, started_at)` deliberately reads the open segment as its start rather
+/// than its progress: a segment still running is the one a backdated transition is entitled
+/// to cut short, while everything already closed is settled.
+fn last_accounted_instant(conn: &Connection) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT MAX(COALESCE(ended_at, started_at)) FROM activity_segments",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map_err(|error| format!("failed to read the last accounted instant: {error}"))
+}
+
 fn insert_segment(
     conn: &Connection,
     started_at: i64,
+    last_seen_at: i64,
     snapshot: &ActivitySnapshot,
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO activity_segments
             (started_at, last_seen_at, kind, app_class, title, workspace, monitor)
-         VALUES (?1, ?1, ?2, ?3, ?4, ?5, ?6)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
         params![
             started_at,
+            last_seen_at.max(started_at),
             snapshot.kind.as_str(),
             snapshot.app_class,
             snapshot.title,
@@ -327,9 +365,15 @@ mod tests {
             Some(0),
         );
 
-        store.record_observation(100, &ghostty).expect("insert");
-        store.record_observation(105, &ghostty).expect("no change");
-        store.record_observation(120, &browser).expect("change");
+        store
+            .record_observation(100, 100, &ghostty)
+            .expect("insert");
+        store
+            .record_observation(105, 105, &ghostty)
+            .expect("no change");
+        store
+            .record_observation(120, 120, &browser)
+            .expect("change");
         store.close_open(150).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
@@ -362,9 +406,9 @@ mod tests {
             None,
         );
 
-        store.record_observation(100, &active).expect("insert");
+        store.record_observation(100, 100, &active).expect("insert");
         store
-            .record_observation(110, &ActivitySnapshot::unknown())
+            .record_observation(110, 110, &ActivitySnapshot::unknown())
             .expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
@@ -384,7 +428,7 @@ mod tests {
             None,
         );
 
-        store.record_observation(100, &active).expect("insert");
+        store.record_observation(100, 100, &active).expect("insert");
         store
             .close_stale_open_segments()
             .expect("recover stale open segment");
@@ -409,10 +453,10 @@ mod tests {
 
         // One long stretch in a single window: the daemon keeps observing the same snapshot
         // and never gets to close the segment, which is what a crash or reboot looks like.
-        store.record_observation(100, &active).expect("insert");
+        store.record_observation(100, 100, &active).expect("insert");
         for observed_at in [200, 300, 400] {
             store
-                .record_observation(observed_at, &active)
+                .record_observation(observed_at, observed_at, &active)
                 .expect("unchanged observation");
         }
 
@@ -475,6 +519,7 @@ mod tests {
         let mut store = Store::open(&db, Some(data_dir.clone())).expect("store");
         store
             .record_observation(
+                100,
                 100,
                 &ActivitySnapshot::window(
                     Some("ghostty".to_string()),
