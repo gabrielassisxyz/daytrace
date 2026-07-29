@@ -1,6 +1,7 @@
-use crate::activity::ActivitySnapshot;
+use crate::activity::{ActivitySnapshot, TimelineSegment};
 use crate::config::{Blacklist, Config};
 use crate::desktop::{ActiveWindowSource, HyprlandClient};
+use crate::export::render_day_export;
 use crate::input::InputActivity;
 use crate::service::render_user_unit;
 use crate::storage::Store;
@@ -19,12 +20,14 @@ daytrace
 Usage:
   daytrace start
   daytrace today [--date YYYY-MM-DD]
+  daytrace export [--date YYYY-MM-DD]
   daytrace service unit
   daytrace help
 
 Commands:
   start         Start the desktop activity capture daemon.
   today         Print a chronological activity timeline, by default for today.
+  export        Print one day of stored activity as JSON, by default today.
   service unit  Print a systemd user unit that runs the daemon for this login session.
   help          Print this help text.
 
@@ -65,8 +68,13 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
         // itself rather than as whatever the configuration complains about first.
         [arg, rest @ ..] if arg == "today" => {
             let requested = requested_day(rest)?;
-            let config = Config::from_env()?;
-            render_timeline(config, requested)
+            let (date, segments) = stored_day(&Config::from_env()?, requested)?;
+            render_day(date, &segments)
+        }
+        [arg, rest @ ..] if arg == "export" => {
+            let requested = requested_day(rest)?;
+            let (date, segments) = stored_day(&Config::from_env()?, requested)?;
+            render_day_export(date, &segments)
         }
         [first, second] if first == "service" && second == "unit" => render_service_unit(),
         [unknown] => Err(format!("unknown command: {unknown}")),
@@ -234,7 +242,14 @@ fn wait_for_next_poll(running: &AtomicBool, poll_interval: Duration) {
     }
 }
 
-fn render_timeline(config: Config, requested: Option<NaiveDate>) -> Result<String, String> {
+/// The stored segments of the requested day, or of today when no day was requested.
+///
+/// A day that was never recorded reads as an empty day rather than an error, so a machine
+/// that has not run the daemon yet gets an answer instead of a failure.
+fn stored_day(
+    config: &Config,
+    requested: Option<NaiveDate>,
+) -> Result<(NaiveDate, Vec<TimelineSegment>), String> {
     let now = unix_now();
     let date = match requested {
         Some(date) => date,
@@ -242,15 +257,14 @@ fn render_timeline(config: Config, requested: Option<NaiveDate>) -> Result<Strin
     };
 
     if !config.db_path.exists() {
-        return render_day(date, &[]);
+        return Ok((date, Vec::new()));
     }
 
     let store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
     let (start, end) = day_bounds(date)?;
     // `now` still bounds a segment left open, which for a past day the query clips to the
     // end of that day.
-    let segments = store.timeline_between(start, end, now)?;
-    render_day(date, &segments)
+    Ok((date, store.timeline_between(start, end, now)?))
 }
 
 #[cfg(test)]
@@ -258,7 +272,7 @@ mod tests {
     use super::{
         FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, requested_day, run,
     };
-    use crate::activity::ActivitySnapshot;
+    use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
     use crate::storage::Store;

@@ -2,6 +2,7 @@ mod activity;
 mod cli;
 mod config;
 mod desktop;
+mod export;
 mod input;
 mod service;
 mod storage;

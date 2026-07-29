@@ -106,6 +106,43 @@ systemctl --user edit daytrace.service
 Environment=DAYTRACE_IDLE_AFTER_SECONDS=180
 ```
 
+## Export and Deletion
+
+```sh
+daytrace export
+daytrace export --date 2026-07-20 > 2026-07-20.json
+```
+
+`daytrace export` prints one local day as JSON on standard output, defaulting to today, so a day can leave the tool without reaching into SQLite by hand.
+
+```json
+{
+  "date": "2026-07-20",
+  "segments": [
+    {
+      "started_at": "2026-07-20T09:10:00-03:00",
+      "ended_at": "2026-07-20T09:34:00-03:00",
+      "duration_seconds": 1440,
+      "kind": "window",
+      "app_class": "com.mitchellh.ghostty",
+      "title": "tmux",
+      "workspace": "3",
+      "monitor": 1
+    }
+  ]
+}
+```
+
+Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window` or `idle`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
+
+Deleting is removing the database, since nothing is kept anywhere else:
+
+```sh
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/daytrace"
+```
+
+Stop the daemon first. A running process holds the database open, so deleting the file under it leaves the process writing to a file that no longer has a name.
+
 ## Development
 
 ```sh
