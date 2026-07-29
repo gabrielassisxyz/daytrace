@@ -135,6 +135,8 @@ daytrace export --date 2026-07-20 > 2026-07-20.json
 
 Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window` or `idle`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
 
+A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
+
 Deleting is removing the database, since nothing is kept anywhere else:
 
 ```sh

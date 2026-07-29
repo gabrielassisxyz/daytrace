@@ -1,5 +1,5 @@
 use crate::activity::{ActivityKind, TimelineSegment};
-use chrono::{Local, NaiveDate, TimeZone};
+use chrono::{Local, MappedLocalTime, NaiveDate, TimeZone};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
@@ -29,11 +29,28 @@ fn local_day_start(date: NaiveDate) -> Result<i64, String> {
     let midnight = date
         .and_hms_opt(0, 0, 0)
         .ok_or_else(|| format!("failed to build local midnight for {date}"))?;
-    Ok(Local
-        .from_local_datetime(&midnight)
-        .earliest()
-        .ok_or_else(|| format!("local midnight does not exist for {date}"))?
-        .timestamp())
+
+    match Local.from_local_datetime(&midnight) {
+        MappedLocalTime::Single(at) => Ok(at.timestamp()),
+        // A clock moved back repeats the hour, so midnight happens twice and the day has to
+        // open at the first of the two. The two instants are compared rather than asking for
+        // the earliest of the pair, because the earliest of two *local* readings is the one
+        // with the smaller offset, which is the later instant: in a zone that falls back at
+        // one in the morning, that credited the first hour of the day to the day before.
+        MappedLocalTime::Ambiguous(one, other) => Ok(one.timestamp().min(other.timestamp())),
+        // A clock moved forward can delete midnight outright. The day still happened, and it
+        // began when the clock jumped. Refusing to name its start refused the report for two
+        // days at once: the requested one, and the one before it, whose end is this start.
+        MappedLocalTime::None => first_hour_that_exists(date),
+    }
+}
+
+fn first_hour_that_exists(date: NaiveDate) -> Result<i64, String> {
+    (1..=3)
+        .filter_map(|hour| date.and_hms_opt(hour, 0, 0))
+        .find_map(|local| Local.from_local_datetime(&local).earliest())
+        .map(|at| at.timestamp())
+        .ok_or_else(|| format!("no local start of day exists for {date}"))
 }
 
 /// Time one application held, summed over a day.
@@ -63,9 +80,20 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
             seconds,
         })
         .collect();
-    // A stable sort over labels already in order leaves ties alphabetical, so the same day
-    // reads the same way twice instead of reshuffling equal totals between runs.
-    totals.sort_by_key(|total| Reverse(total.seconds));
+    // Longest first, and equal totals by name so the same day reads the same way twice.
+    // The name comparison ignores case: application classes arrive in whichever case the
+    // compositor reports, and raw byte order would sort every capitalised one above every
+    // lowercase one.
+    totals.sort_by(|left, right| {
+        Reverse(left.seconds)
+            .cmp(&Reverse(right.seconds))
+            .then_with(|| {
+                left.label
+                    .to_lowercase()
+                    .cmp(&right.label.to_lowercase())
+                    .then_with(|| left.label.cmp(&right.label))
+            })
+    });
     totals
 }
 
@@ -292,21 +320,24 @@ mod tests {
     }
 
     #[test]
-    fn applications_holding_equal_time_keep_a_stable_order() {
+    fn applications_holding_equal_time_are_ordered_by_name() {
+        // Mixed case on purpose: compositors report classes such as `Zed` and `firefox` side
+        // by side, and ordering them by raw bytes puts every capitalised name above every
+        // lowercase one, which reads as an ordering nobody chose.
         let totals = application_totals(&[
-            segment(0, 600, "zed"),
-            segment(600, 1200, "ghostty"),
-            segment(1200, 1800, "firefox"),
+            segment(0, 600, "Zed"),
+            segment(600, 1200, "alacritty"),
+            segment(1200, 1800, "Brave"),
         ]);
 
         assert_eq!(
             totals,
             vec![
-                total("firefox", 600),
-                total("ghostty", 600),
-                total("zed", 600)
+                total("alacritty", 600),
+                total("Brave", 600),
+                total("Zed", 600)
             ],
-            "a tie must not reshuffle between runs, or the same day reads differently twice"
+            "a tie must be ordered by name and never reshuffle between runs"
         );
     }
 

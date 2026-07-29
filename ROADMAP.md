@@ -3,7 +3,7 @@
 ## Current State
 
 - Rust CLI crate exists.
-- `daytrace start` and `daytrace today` define the initial command surface.
+- `daytrace start`, `daytrace today`, and `daytrace export` define the initial command surface.
 - `daytrace start` records Hyprland active-window segments and AFK segments.
 - Activity segments are stored locally in SQLite.
 - `daytrace today` prints a chronological daily timeline with durations, followed by per-application totals.

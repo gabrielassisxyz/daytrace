@@ -111,7 +111,17 @@ fn requested_day(args: &[String]) -> Result<Option<NaiveDate>, String> {
     }
 }
 
+/// The exact format is required, not merely a readable one.
+///
+/// Date parsing accepts an unpadded field, which turns two plausible typos into a report for
+/// a day nobody asked for: `26-07-20` reads as the year 26, and the report is then headed with
+/// a date the reader has to notice is wrong.
 fn parse_day(value: &str) -> Result<NaiveDate, String> {
+    const EXPECTED_LENGTH: usize = "YYYY-MM-DD".len();
+
+    if value.len() != EXPECTED_LENGTH {
+        return Err(format!("invalid date: {value}, expected YYYY-MM-DD"));
+    }
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
         .map_err(|_| format!("invalid date: {value}, expected YYYY-MM-DD"))
 }
@@ -486,6 +496,10 @@ mod tests {
             vec!["--date".to_string(), "2026-13-40".to_string()],
             vec!["--date".to_string(), "yesterday".to_string()],
             vec!["--date=".to_string()],
+            // Both parse, and neither means what it looks like: an unpadded day is not the
+            // documented format, and a two-digit year is read as the year 26.
+            vec!["--date".to_string(), "2026-7-2".to_string()],
+            vec!["--date".to_string(), "26-07-20".to_string()],
         ] {
             let error = requested_day(&argument).expect_err("should be rejected");
             assert!(
