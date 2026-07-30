@@ -14,7 +14,16 @@
 //! daemon was not running for, whether the machine was off or the daemon merely stopped: the
 //! clocks restart at boot and a fresh process has no earlier reading, so that stays an ordinary
 //! hole in the day. It cannot say when within one poll interval the machine went down or came
-//! back, so each endpoint carries up to a poll of error.
+//! back, so each endpoint carries up to a poll of error, and because the endpoints come from the
+//! wall clock they also carry whatever error that clock holds at the moment of the resume: a
+//! stretch of the right length can be placed at the wrong time, and on the wrong calendar day.
+//!
+//! One thing it does not fully guarantee, since the guarantee above is about the wall clock and
+//! this is not. The two since-boot clocks are read one after the other, so a delay between those
+//! two calls inflates the next poll's reading by the same amount, and a delay longer than
+//! `MIN_POWERED_DOWN_SECONDS` becomes a stretch nobody spent. The floor is the bound, the window
+//! is microseconds wide, and the ceiling is whatever the machine has really suspended since boot.
+//! The reasoning is with that constant.
 //!
 //! What would make the choice wrong: a kernel whose boot-time clock did not count suspended
 //! time. Then the two readings would agree and nothing would ever be recorded: a missing
@@ -65,10 +74,16 @@ pub struct SystemSessionClock;
 
 impl SessionClock for SystemSessionClock {
     fn read(&self) -> ClockReading {
-        // Boot time first and monotonic second, deliberately. Whatever delay falls between the
-        // two calls is then counted into monotonic alone, which can only shrink the difference
-        // the detection reads, never inflate it: a descheduled read hides a suspend rather than
-        // inventing one.
+        // Boot time first and monotonic second, deliberately, though not for the reason it looks
+        // like. The two calls are not simultaneous, so whatever delay falls between them is
+        // counted into the second clock alone and understates this reading's difference by that
+        // much. That does not remove the error, it defers it: the next poll's delta is inflated
+        // by however much the previous reading was understated, so either order can inflate a
+        // delta by the same amount. What the order does buy is a ceiling. Reading boot time first
+        // means the shortfall lands in the clock that is subtracted, so the difference saturates
+        // at zero and the most a delay can ever hand the next poll is the suspend the machine has
+        // actually accumulated since booting. Monotonic first has no such ceiling, and would
+        // manufacture a stretch out of a machine that had never suspended at all.
         let boottime = since_boot(libc::CLOCK_BOOTTIME);
         let monotonic = since_boot(libc::CLOCK_MONOTONIC);
 
@@ -119,9 +134,19 @@ pub struct SessionObservation {
 
 /// The shortest suspend that earns a segment of its own.
 ///
-/// This is a policy, not a guard against noise: the quantity it filters is exact, so a shorter
-/// suspend is a real one that is simply not worth breaking a day into three rows for. The
-/// seconds it discards stay with whatever segment was open, which is where they already were.
+/// Mostly a policy: a suspend shorter than this is a real one that is not worth breaking a day
+/// into three rows for, and the seconds it discards stay with whatever segment was open, which is
+/// where they already were.
+///
+/// It is also the only bound on the one way this can still be wrong. The two clock reads of a
+/// single poll are not simultaneous, so a delay between them understates that reading and inflates
+/// the next poll's delta by the same amount. A delay of at least this floor therefore shows up as
+/// a stretch nobody spent. The window is roughly a microsecond wide out of a poll interval of
+/// seconds, and the one realistic multi-second freeze that could land inside it is a real suspend,
+/// which falls the safe way: boot time is read before it and elapsed time after, so the stretch is
+/// counted correctly and only the thaw is over-credited. A process frozen by a signal or a cgroup
+/// can land anywhere, capped by the suspend accumulated since boot. Bracketing the reads would
+/// close it; the odds did not earn the machinery.
 const MIN_POWERED_DOWN_SECONDS: u64 = 5;
 
 /// Watches successive polls for time the machine spent suspended between them.
