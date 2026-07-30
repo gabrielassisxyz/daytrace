@@ -101,6 +101,6 @@
 
 ## Common Hurdles
 
-No ungated common hurdles are recorded yet.
+- **A shared cargo target directory makes a test run report another branch's code.** Where `build.target-dir` points every checkout at one directory, two worktrees of this package write the same artifact paths, and cargo can judge the units fresh from the other worktree's fingerprints. The run then passes without compiling the current sources: new tests never appear in the output, and `CARGO_BIN_EXE_daytrace` starts a binary built from another branch, so a whole-binary case exercises code that is not under test. Set `CARGO_TARGET_DIR` to a path of its own before trusting a result from a worktree.
 
 When a gotcha appears, add it here only if no deterministic gate already catches it. A hurdle promoted to a gate is deleted from this section, not duplicated.
