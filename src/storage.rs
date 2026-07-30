@@ -356,13 +356,14 @@ impl Store {
     /// A path with no parent, or one that is not valid UTF-8, keeps SQLite's default: this can
     /// only improve on a location it can name.
     fn keep_the_rebuild_scratch_beside_the_database(&self) -> Result<(), String> {
-        let Some(directory) = self.db_path.parent().and_then(Path::to_str) else {
+        let Some(directory) = scratch_directory_beside(&self.db_path) else {
             return Ok(());
         };
-        if directory.is_empty() {
-            return Ok(());
-        }
 
+        // `temp_store_directory` is process-wide rather than per connection, which is why SQLite
+        // deprecated it. Nothing here is harmed by that, since one process prunes one store, but
+        // it does mean the setting cannot be read back to find out what this call asked for: a
+        // second connection anywhere in the process would answer for it.
         self.conn
             .pragma_update(None, "temp_store_directory", directory)
             .map_err(|error| format!("failed to place the rebuild scratch file: {error}"))
@@ -579,6 +580,18 @@ fn secure_sqlite_permissions(
     _secure_data_dir: Option<&Path>,
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// The directory the rebuild's scratch copy belongs in, which is the store's own.
+///
+/// Split out from the call that applies it because the pragma that applies it is process-wide and
+/// therefore cannot be read back to see what was asked for. This is the part worth pinning: what
+/// SQLite does with the setting was measured by hand instead.
+fn scratch_directory_beside(db_path: &Path) -> Option<&str> {
+    db_path
+        .parent()
+        .and_then(Path::to_str)
+        .filter(|directory| !directory.is_empty())
 }
 
 fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
@@ -1334,31 +1347,27 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// The rebuild's scratch copy must not land outside the directory the store is kept private
+    /// in, which is where SQLite would otherwise put it.
+    ///
+    /// This pins the directory the code asks for, not the pragma's value: `temp_store_directory`
+    /// is process-wide, so reading it back answers for whichever connection in the process set it
+    /// last. A test that read it back passed alone and failed once other cases pruned in parallel.
     #[test]
-    fn the_rebuild_scratch_file_stays_beside_the_database() {
+    fn the_rebuild_scratch_file_belongs_beside_the_database() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
-        let mut store = Store::open(&db, None).expect("store");
-        seed_segments(&mut store, 50, "expired-window-title", 0);
 
-        store
-            .prune_segments_ended_before(50_000, 200_000)
-            .expect("prune");
-
-        // The scratch database is unlinked as soon as the rebuild ends, so what can be pinned
-        // here is where SQLite was told to put it. That it honours the setting was measured by
-        // hand: the file appears as `<dir>/etilqs_<random>`, mode 0600, once the store is large
-        // enough to spill out of memory.
-        let told: String = store
-            .conn
-            .pragma_query_value(None, "temp_store_directory", |row| row.get(0))
-            .expect("temp_store_directory");
         assert_eq!(
-            told,
-            dir.path().to_str().expect("a utf-8 path"),
+            super::scratch_directory_beside(&db),
+            dir.path().to_str(),
             "a plaintext copy of the store must not be written outside the directory the store \
              is kept private in"
+        );
+        assert_eq!(
+            super::scratch_directory_beside(Path::new("daytrace.db")),
+            None,
+            "a bare filename has no directory to name, so SQLite's own choice stands"
         );
     }
 
