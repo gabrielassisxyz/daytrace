@@ -3,10 +3,12 @@
 ## Current State
 
 - Rust CLI crate exists.
-- `daytrace start` and `daytrace today` define the initial command surface.
+- `daytrace start`, `daytrace today`, and `daytrace export` define the initial command surface.
 - `daytrace start` records Hyprland active-window segments and AFK segments.
 - Activity segments are stored locally in SQLite.
-- `daytrace today` prints a chronological daily timeline with durations.
+- `daytrace today` prints a chronological daily timeline with durations, followed by per-application totals.
+- `daytrace today --date` and `daytrace export --date` report and export any past local day.
+- `daytrace export` emits one day of stored activity as JSON on standard output.
 - `daytrace service unit` prints a systemd user unit that runs the capture daemon for the desktop session.
 - Application, title, and domain blacklist environment variables exist.
 - Browser titles are redacted by default and private/incognito browser windows are skipped when Hyprland exposes a recognizable private-mode title marker.
@@ -15,7 +17,7 @@
 ## First Milestone
 
 - Harden daemon lifecycle around startup recovery and shutdown behavior.
-- Add a documented deletion/export command for local logs.
+- Add a documented deletion command for local logs.
 - Add configuration file support if environment variables become insufficient.
 - Add focused integration coverage around Hyprland command failures.
 - Make browser private/incognito detection reliable through the browser extension milestone.

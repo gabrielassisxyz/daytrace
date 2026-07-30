@@ -22,13 +22,30 @@ The first milestone is a small Rust CLI and daemon that records active-window ch
 ```sh
 daytrace start
 daytrace today
+daytrace today --date 2026-07-20
 ```
 
 `daytrace start` runs the local capture loop. It polls Hyprland for the active window, watches `/dev/input/event*` for input activity timestamps, and stores segments in a local SQLite database.
 
 AFK tracking requires read access to at least one `/dev/input/event*` device. If no readable input devices are available, `daytrace start` exits instead of recording misleading activity.
 
-`daytrace today` prints today's chronological timeline with segment durations.
+`daytrace today` prints the chronological timeline with segment durations, then totals the day by application, so the report answers both what happened in order and what consumed the day:
+
+```text
+Timeline for 2026-07-20
+09:10-09:34  24m     ghostty - tmux
+09:34-09:51  17m     firefox - [browser title redacted]
+09:51-10:07  16m     AFK
+
+Time per application
+   24m  ghostty
+   17m  firefox
+   16m  AFK
+```
+
+Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute even where each individual row rounds to `0m`. Absence is totalled as `AFK`, apart from any application.
+
+`--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly.
 
 The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
 
@@ -88,6 +105,45 @@ systemctl --user edit daytrace.service
 [Service]
 Environment=DAYTRACE_IDLE_AFTER_SECONDS=180
 ```
+
+## Export and Deletion
+
+```sh
+daytrace export
+daytrace export --date 2026-07-20 > 2026-07-20.json
+```
+
+`daytrace export` prints one local day as JSON on standard output, defaulting to today, so a day can leave the tool without reaching into SQLite by hand.
+
+```json
+{
+  "date": "2026-07-20",
+  "segments": [
+    {
+      "started_at": "2026-07-20T09:10:00-03:00",
+      "ended_at": "2026-07-20T09:34:00-03:00",
+      "duration_seconds": 1440,
+      "kind": "window",
+      "app_class": "com.mitchellh.ghostty",
+      "title": "tmux",
+      "workspace": "3",
+      "monitor": 1
+    }
+  ]
+}
+```
+
+Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window` or `idle`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
+
+A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
+
+Deleting is removing the database, since nothing is kept anywhere else:
+
+```sh
+rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/daytrace"
+```
+
+Stop the daemon first. A running process holds the database open, so deleting the file under it leaves the process writing to a file that no longer has a name.
 
 ## Development
 
