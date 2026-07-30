@@ -15,6 +15,7 @@ The first milestone is a small Rust CLI and daemon that records active-window ch
 - Browser window titles are redacted by default because they can contain page content.
 - Browser private and incognito windows are skipped when Hyprland exposes a recognizable private-mode title marker.
 - Domain and application blacklists exist from the first capture milestone.
+- Stored activity has a retention window, the last `90` days by default, applied on demand by `daytrace prune` and never automatically.
 - Logs are easy to delete and export.
 
 ## Initial Commands
@@ -72,6 +73,7 @@ Useful environment overrides:
 - `DAYTRACE_DB_PATH`: SQLite database path.
 - `DAYTRACE_IDLE_AFTER_SECONDS`: AFK threshold, default `300`.
 - `DAYTRACE_POLL_SECONDS`: desktop polling interval, default `1`.
+- `DAYTRACE_RETENTION_DAYS`: days before today that `daytrace prune` keeps, default `90`, so the default keeps 91 calendar days. An empty value reads as unset; `0` is refused rather than read as "keep only today", since the difference between those two is a whole history.
 - `DAYTRACE_BLACKLIST_APPS`: comma-separated application class substrings to skip. Matching is by substring so that a short entry such as `keepassxc` covers the reverse-DNS class `org.keepassxc.KeePassXC` that a compositor actually reports.
 - `DAYTRACE_BLACKLIST_TITLES`: comma-separated title substrings to skip.
 - `DAYTRACE_BLACKLIST_DOMAINS`: comma-separated URL or domain substrings to skip.
@@ -151,13 +153,52 @@ Every segment carries the same keys, with an absent value written as `null` rath
 
 A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
 
-Deleting is removing the database, since nothing is kept anywhere else:
+Deleting everything is removing the database, since nothing is kept anywhere else:
 
 ```sh
+systemctl --user stop daytrace.service
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/daytrace"
 ```
 
-Stop the daemon first. A running process holds the database open, so deleting the file under it leaves the process writing to a file that no longer has a name.
+Stop the daemon first for this one. Removing the file is not something SQLite is told about, so a running process goes on writing to a file that no longer has a name, and recreates the store at the next window change. Deleting part of the history rather than all of it is `daytrace prune`, described below, which needs no such thing and is meant to run alongside the daemon.
+
+## Retention
+
+Capture writes at most one segment a second and never expires anything on its own, so the store is a permanent record of every window that held focus until something removes part of it. The retention window is how much of that history is meant to be kept: the last `90` days plus today by default, and `DAYTRACE_RETENTION_DAYS` sets it.
+
+```sh
+daytrace prune --dry-run
+daytrace prune
+DAYTRACE_RETENTION_DAYS=30 daytrace prune
+```
+
+```text
+Retention window: 90 days plus today, keeping activity from 2026-04-30 onwards.
+Deleted 412 activity segments.
+```
+
+Both forms print the window and the first day it keeps before saying what happened, so the policy being applied is visible in the output of the command that applies it. `--dry-run` reports how many segments are outside the window and deletes nothing, which is worth doing first: there is no undo, and `daytrace export` is the only way to keep a copy of a day that is about to go.
+
+**Nothing prunes automatically.** No command deletes as a side effect, and neither the daemon nor the reporting commands apply the window. Deleting activity that nobody asked to lose, at a moment nobody was present for, is not something a background process should decide, and an activity log that quietly loses days is worse than one that grows. The cost of that choice is that an installation where `daytrace prune` is never run keeps everything, so a systemd user timer calling `daytrace prune` is what makes retention continuous, on a schedule its owner chose and can read.
+
+The window opens at a local midnight that many days back, not at this time of day that many days back, so pruning twice in one day removes nothing the second time, and a day the clock shortened, lengthened or opened without a midnight still counts as one day. Moving the machine to another timezone, or a clock correction that crosses midnight, does move the boundary by a day, because there is no record of which zone a segment was recorded in. A segment that straddles the boundary is kept whole rather than trimmed, since cutting it would rewrite a span that was actually observed. A segment left open by a crash ages out by the last moment it was seen, and one with no observation recorded at all is kept until a daemon start writes it a real end: nothing a report still shows is deleted by the window.
+
+### What deleting guarantees
+
+After a successful prune, the deleted activity is no longer readable in the store, and the space it used is back with the filesystem. Both take more than a `DELETE`, and both were measured rather than assumed. Removing rows leaves their bytes in the pages they freed, so the database is rebuilt from the rows that survived, which also gives the space back: 400 half-hour segments deleted took a store from 49152 bytes with 468 readable copies of their window titles to 12288 bytes with none, with the capture daemon attached throughout. The write-ahead log is then copied into the file and reset to nothing, because until that happens the file still holds the pages as they were, the log holds a copy of everything the prune touched, and the store has grown rather than shrunk.
+
+The file does not shrink below the size its busiest window needs, and it does not have to: a day recorded after a prune reuses the space, so a store that is pruned regularly settles at the size of its window instead of growing forever.
+
+The rebuild is written to a scratch copy of the database first. SQLite would place that in the system temporary directory, which on a Linux desktop is `/var/tmp`, so it is pointed at the store's own directory instead: a full plaintext copy of the activity log should not land outside the `0700` directory the store is kept in, on a filesystem nobody chose for it. The copy is created `0600` and unlinked as soon as the rebuild ends, and pruning therefore needs free space beside the database roughly equal to its size.
+
+`daytrace prune` can run while the capture daemon runs, which is the arrangement a timer produces. Writes wait for each other rather than failing, and the segment currently being recorded can never fall outside the window, because the daemon moves its progress marker every poll. If something is reading the store from an older snapshot at that moment, the rewrite cannot start, and the command says so rather than reporting a clean deletion:
+
+```text
+Deleted 412 activity segments.
+The deleted activity is still readable in the database file, because another process is reading it. Running prune again finishes clearing it.
+```
+
+The rows are gone either way. What is left is the copy in the file, which the next `daytrace prune` clears even when it deletes nothing.
 
 ## Development
 

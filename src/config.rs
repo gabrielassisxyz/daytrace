@@ -10,8 +10,18 @@ pub struct Config {
     pub secure_data_dir: Option<PathBuf>,
     pub idle_after: Duration,
     pub poll_interval: Duration,
+    pub retention_days: u32,
     pub blacklist: Blacklist,
 }
+
+/// How many days of activity the retention window keeps by default.
+///
+/// A quarter is long enough that a bare `daytrace prune` cannot surprise anyone who wanted
+/// last month back, and short enough that the store is no longer a permanent record of every
+/// window that ever held focus. Nothing enforces it on its own: it is the window `prune`
+/// applies when asked, so the value that matters is the one a reader can predict before
+/// running an irreversible command.
+const DEFAULT_RETENTION_DAYS: u32 = 90;
 
 #[derive(Clone, Debug, Default)]
 pub struct Blacklist {
@@ -28,6 +38,7 @@ impl Config {
             secure_data_dir: db_location.secure_data_dir,
             idle_after: duration_from_env("DAYTRACE_IDLE_AFTER_SECONDS", 300)?,
             poll_interval: duration_from_env("DAYTRACE_POLL_SECONDS", 1)?,
+            retention_days: retention_days(env::var("DAYTRACE_RETENTION_DAYS").ok().as_deref())?,
             blacklist: Blacklist::from_env(),
         })
     }
@@ -134,6 +145,29 @@ fn duration_from_env(name: &str, default_seconds: u64) -> Result<Duration, Strin
     Ok(Duration::from_secs(seconds.max(1)))
 }
 
+/// The retention window in days, from `DAYTRACE_RETENTION_DAYS` or the documented default.
+///
+/// A window of zero is rejected rather than clamped, which is where this departs from the
+/// other numeric settings. Raising a zero poll interval to one second changes nothing a user
+/// can lose; reading a zero retention window as one day would silently disagree with a
+/// variable that, as written, means "keep only today" and would take everything else with it.
+fn retention_days(configured: Option<&str>) -> Result<u32, String> {
+    // An empty value means unset, not invalid. `Environment=DAYTRACE_RETENTION_DAYS=` in a
+    // systemd drop-in produces exactly this, and every command reads the whole configuration, so
+    // refusing it would stop capture over a setting only `prune` ever uses.
+    let value = configured.map(str::trim).filter(|value| !value.is_empty());
+    let Some(value) = value else {
+        return Ok(DEFAULT_RETENTION_DAYS);
+    };
+
+    match value.parse::<u32>() {
+        Ok(0) | Err(_) => {
+            Err("DAYTRACE_RETENTION_DAYS must be a whole number of days, at least 1".to_string())
+        }
+        Ok(days) => Ok(days),
+    }
+}
+
 fn list_from_env(name: &str) -> Vec<String> {
     env::var(name)
         .unwrap_or_default()
@@ -154,7 +188,55 @@ fn normalize_list(values: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blacklist, redact_title};
+    use super::{Blacklist, DEFAULT_RETENTION_DAYS, redact_title, retention_days};
+
+    #[test]
+    fn an_unset_retention_window_falls_back_to_the_documented_default() {
+        assert_eq!(
+            retention_days(None).expect("an unset window has a default"),
+            DEFAULT_RETENTION_DAYS
+        );
+        assert_eq!(
+            DEFAULT_RETENTION_DAYS, 90,
+            "the default is documented in the README, so a change to it is a change to a \
+             published promise rather than to a constant"
+        );
+    }
+
+    #[test]
+    fn a_configured_retention_window_is_read_as_days() {
+        assert_eq!(retention_days(Some("14")).expect("a valid window"), 14);
+        assert_eq!(
+            retention_days(Some(" 14 ")).expect("a padded window"),
+            14,
+            "a value that arrives with whitespace, as one written in a systemd drop-in can, \
+             must not fall back to the default in silence"
+        );
+    }
+
+    #[test]
+    fn an_empty_retention_window_reads_as_unset_rather_than_as_an_error() {
+        for value in ["", "  "] {
+            assert_eq!(
+                retention_days(Some(value)).unwrap_or_else(|error| panic!(
+                    "an empty setting must not stop every command, including capture: {error}"
+                )),
+                DEFAULT_RETENTION_DAYS
+            );
+        }
+    }
+
+    #[test]
+    fn a_retention_window_that_would_delete_everything_is_refused() {
+        for value in ["0", "-1", "ninety", "90 days"] {
+            let error = retention_days(Some(value))
+                .expect_err(&format!("{value} is not a number of days to keep"));
+            assert!(
+                error.contains("at least 1"),
+                "{value} was rejected without saying what a window should be: {error}"
+            );
+        }
+    }
 
     #[test]
     fn redacts_urls_and_token_values_from_titles() {

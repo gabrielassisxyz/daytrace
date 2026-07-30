@@ -72,6 +72,35 @@ fn stored_kinds_include_suspended(conn: &Connection) -> Result<bool, String> {
     // nothing to widen.
     Ok(ddl.is_none_or(|sql| sql.contains("'suspended'")))
 }
+/// What a prune deleted, and what it could not finish once the deletion had committed.
+///
+/// The two are reported apart because they fail apart. The rows go in a transaction that either
+/// commits or does not; rewriting the file so the deleted activity stops being readable happens
+/// after that commit, and can be refused by a reader that is still attached. Answering with a
+/// bare failure for the second would say nothing about the first, which has already happened and
+/// cannot be undone.
+#[derive(Debug)]
+pub struct Pruned {
+    pub deleted: u64,
+    /// Why the deleted activity is still readable in the database file, when it is.
+    pub still_in_the_file: Option<String>,
+}
+
+/// Which segments a retention window no longer covers: cutoff in `?1`, the present in `?2`.
+///
+/// A segment has to have ENDED before the cutoff, so one that straddles the boundary is kept
+/// whole: trimming it to fit would rewrite a span that was actually observed, and the day it
+/// belongs to would then report less time than it lasted.
+///
+/// The chain is deliberately the one `timeline_between` reads a segment's end through, down to
+/// the last fallback, so that nothing can be deleted while a report still shows it. `last_seen_at`
+/// is the progress marker every poll advances, so a segment a crash left open ages out by the
+/// last moment anyone saw it, and the segment a running daemon is writing can never match because
+/// its marker is seconds old. A row stored before that column existed has neither, and both sides
+/// resolve it to the present: the report draws it as reaching now, so pruning has to treat it as
+/// reaching now too, which keeps it until a daemon start writes it a real end. Reading it as its
+/// own start instead would delete a block the same store had just printed as covering today.
+const ENDED_BEFORE_CUTOFF: &str = "COALESCE(ended_at, last_seen_at, ?2) < ?1";
 
 impl Store {
     pub fn open(path: impl AsRef<Path>, secure_data_dir: Option<PathBuf>) -> Result<Self, String> {
@@ -242,6 +271,129 @@ impl Store {
             )
             .map_err(|error| format!("failed to close stale open segments: {error}"))?;
         self.secure_permissions()
+    }
+
+    /// How many stored segments fall outside a window opening at `cutoff`, removing none.
+    ///
+    /// The count is what makes an irreversible window inspectable before it is applied, so it
+    /// has to answer the same question the delete does, from the same predicate.
+    pub fn count_segments_ended_before(&self, cutoff: i64, now: i64) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM activity_segments WHERE {ENDED_BEFORE_CUTOFF}"),
+                params![cutoff, now],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(|error| format!("failed to count segments outside the window: {error}"))
+    }
+
+    /// Delete every stored segment that ended before `cutoff`.
+    pub fn prune_segments_ended_before(&mut self, cutoff: i64, now: i64) -> Result<Pruned, String> {
+        // IMMEDIATE, matching `record_observation`, the write this one has to interleave with.
+        // A deferred transaction reads first and upgrades on its first write, and SQLite
+        // answers that upgrade with SQLITE_BUSY_SNAPSHOT without consulting the busy handler,
+        // so pruning beside a running daemon would fail outright rather than wait its turn.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start transaction: {error}"))?;
+        let deleted = tx
+            .execute(
+                &format!("DELETE FROM activity_segments WHERE {ENDED_BEFORE_CUTOFF}"),
+                params![cutoff, now],
+            )
+            .map_err(|error| format!("failed to delete segments outside the window: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit the prune: {error}"))?;
+
+        // Past this point the rows are gone for good, so nothing below may be raised as if the
+        // deletion had not happened. The rewrite is attempted every time rather than only after
+        // a delete, which is what makes running the command again finish an interrupted one.
+        let still_in_the_file = self.rewrite_the_file_without_the_deleted_rows().err();
+        self.secure_permissions()?;
+        Ok(Pruned {
+            deleted: deleted as u64,
+            still_in_the_file,
+        })
+    }
+
+    /// Make the deleted activity stop being readable on disk. Two steps, both required.
+    fn rewrite_the_file_without_the_deleted_rows(&self) -> Result<(), String> {
+        self.rebuild_from_the_rows_that_are_left()?;
+        self.copy_the_log_into_the_file()
+    }
+
+    /// Rebuild every page of the database from the rows that survived.
+    ///
+    /// WHY a rebuild rather than the cheaper `PRAGMA secure_delete`, which zeroes a row's bytes
+    /// as it frees them: zeroing only reaches what this delete frees. Earlier writes leave stale
+    /// copies in the unused tail of pages that are still in use, and a page split copies cells
+    /// rather than moving them. Measured on a store filled the way the daemon fills one, a
+    /// transaction per observation: of 300 deleted window titles, six were still readable in the
+    /// file after a secure delete, in one contiguous run, and none after a rebuild. A retention
+    /// policy that leaves an arbitrary sample of what it deleted behind is not one.
+    ///
+    /// The rebuild also returns the freed space to the filesystem, which zeroing does not.
+    fn rebuild_from_the_rows_that_are_left(&self) -> Result<(), String> {
+        self.keep_the_rebuild_scratch_beside_the_database()?;
+        // Outside any transaction, because SQLite refuses to rebuild inside one.
+        self.conn
+            .execute_batch("VACUUM")
+            .map_err(|error| format!("rebuilding it failed: {error}"))
+    }
+
+    /// Point SQLite's scratch file at the database's own directory.
+    ///
+    /// WHY: the rebuild is written to a temporary database and copied back, and SQLite places
+    /// that file wherever its temp-file rules point, which is `/var/tmp` on a Linux desktop. A
+    /// full plaintext copy of the activity store therefore lands outside the 0700 directory the
+    /// store is deliberately kept in, on a filesystem nobody chose for it, and unlinking it at
+    /// the end does not scrub the blocks it used. Keeping it beside the database keeps it inside
+    /// the private tree, still created 0600 and still unlinked immediately, and makes the free
+    /// space the rebuild needs come from the filesystem the store already lives on.
+    ///
+    /// A path with no parent, or one that is not valid UTF-8, keeps SQLite's default: this can
+    /// only improve on a location it can name.
+    fn keep_the_rebuild_scratch_beside_the_database(&self) -> Result<(), String> {
+        let Some(directory) = self.db_path.parent().and_then(Path::to_str) else {
+            return Ok(());
+        };
+        if directory.is_empty() {
+            return Ok(());
+        }
+
+        self.conn
+            .pragma_update(None, "temp_store_directory", directory)
+            .map_err(|error| format!("failed to place the rebuild scratch file: {error}"))
+    }
+
+    /// Copy the log into the database file and reset it to nothing.
+    ///
+    /// WHY this is part of deleting rather than housekeeping: in WAL mode every write lands in
+    /// the log, the rebuild included, and the file keeps the page images that still hold the
+    /// removed activity until a checkpoint overwrites them. SQLite's automatic checkpoint is
+    /// passive and cannot get through while another connection is attached, which is precisely
+    /// the arrangement this tool recommends: a timer beside a daemon that runs all day. Measured
+    /// there, a prune without this left the file unchanged with every deleted title still in it
+    /// and added a copy of each to the log, so the store came out larger than it went in.
+    /// TRUNCATE waits for the readers instead, then resets the log to zero bytes.
+    ///
+    /// A checkpoint that cannot start answers with `busy = 1` and no error at all, so the flag
+    /// is what has to be read; treating the call's success as the rewrite's success would state
+    /// a guarantee without having kept it.
+    fn copy_the_log_into_the_file(&self) -> Result<(), String> {
+        let busy = self
+            .conn
+            .query_row("PRAGMA wal_checkpoint(TRUNCATE)", [], |row| {
+                row.get::<_, i64>(0)
+            })
+            .map_err(|error| format!("rewriting it failed: {error}"))?;
+
+        if busy != 0 {
+            return Err("another process is reading it".to_string());
+        }
+        Ok(())
     }
 
     pub fn timeline_between(
@@ -510,7 +662,10 @@ fn insert_segment(
 mod tests {
     use super::Store;
     use crate::activity::{ActivitySnapshot, TimelineSegment};
-
+    use rusqlite::Connection;
+    use std::fs;
+    use std::path::{Path, PathBuf};
+    use std::time::Duration;
     #[test]
     fn records_only_changes_as_segments() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -751,6 +906,543 @@ mod tests {
         let rows = store.timeline_between(0, 10_000, 500).expect("timeline");
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].ended_at, 500);
+    }
+
+    /// How many times `payload` appears in the bytes of `path`, which need not exist.
+    ///
+    /// Deliberately not a pragma. `page_count` and `freelist_count` describe what the database
+    /// uses, and cleartext sitting in a page the database has stopped using is precisely what a
+    /// deletion has to remove, so only the file on disk can answer this. Reading it through the
+    /// same connection that performed the delete answers a third question again, since that
+    /// connection sees the write-ahead log the rest of the world has not been given yet.
+    fn occurrences_in(path: &Path, payload: &str) -> usize {
+        let Ok(bytes) = fs::read(path) else {
+            return 0;
+        };
+        bytes
+            .windows(payload.len())
+            .filter(|window| *window == payload.as_bytes())
+            .count()
+    }
+
+    /// The same count over both files a store is kept in.
+    ///
+    /// The guarantee is about what is readable on disk, and until a checkpoint runs a write lives
+    /// in the log rather than in the database file, so measuring only one of the two would call a
+    /// prune clean whenever the copies had simply not been moved yet.
+    fn occurrences_on_disk(db_path: &Path, payload: &str) -> usize {
+        occurrences_in(db_path, payload) + occurrences_in(&wal_of(db_path), payload)
+    }
+
+    fn byte_len(path: &Path) -> u64 {
+        fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
+    }
+
+    fn wal_of(db_path: &Path) -> PathBuf {
+        PathBuf::from(format!("{}-wal", db_path.display()))
+    }
+
+    /// Fill the store with `count` segments, ten seconds apart, whose titles carry `payload`.
+    fn seed_segments(store: &mut Store, count: i64, payload: &str, first_at: i64) {
+        for index in 0..count {
+            let at = first_at + index * 10;
+            store
+                .record_observation(
+                    at,
+                    at,
+                    &ActivitySnapshot::window(
+                        Some(format!("app-{index}")),
+                        Some(format!("{payload}-{index}")),
+                        None,
+                        None,
+                    ),
+                )
+                .expect("record");
+        }
+        store.close_open(first_at + count * 10).expect("close");
+    }
+
+    fn window_snapshot(app_class: &str) -> ActivitySnapshot {
+        ActivitySnapshot::window(
+            Some(app_class.to_string()),
+            Some("a window".to_string()),
+            None,
+            None,
+        )
+    }
+
+    #[test]
+    fn pruning_removes_only_the_segments_that_ended_before_the_cutoff() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let outside = window_snapshot("outside-the-window");
+        let inside = window_snapshot("inside-the-window");
+
+        store
+            .record_observation(100, 100, &outside)
+            .expect("old segment");
+        store.close_open(200).expect("close the old segment");
+        store
+            .record_observation(1_000, 1_000, &inside)
+            .expect("recent segment");
+        store.close_open(1_100).expect("close the recent segment");
+
+        let pruned = store
+            .prune_segments_ended_before(500, 2_000)
+            .expect("prune the old segment");
+
+        assert_eq!(pruned.deleted, 1);
+        let rows = store.timeline_between(0, 2_000, 2_000).expect("timeline");
+        assert_eq!(rows.len(), 1, "only the segment inside the window survives");
+        assert_eq!(rows[0].snapshot, inside);
+    }
+
+    #[test]
+    fn a_segment_straddling_the_cutoff_is_kept_whole() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(400, 400, &window_snapshot("across-the-boundary"))
+            .expect("record");
+        store.close_open(600).expect("close");
+
+        let pruned = store
+            .prune_segments_ended_before(500, 1_000)
+            .expect("prune");
+
+        assert_eq!(pruned.deleted, 0);
+        let rows = store.timeline_between(0, 1_000, 1_000).expect("timeline");
+        assert_eq!(
+            (rows.len(), rows[0].started_at, rows[0].ended_at),
+            (1, 400, 600),
+            "a segment is removed whole or kept whole: trimming it to the window would rewrite \
+             a span that was actually observed"
+        );
+    }
+
+    #[test]
+    fn the_segment_capture_is_still_writing_cannot_be_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = window_snapshot("still-in-focus");
+
+        // What a running daemon leaves in the store: no `ended_at` yet, and a progress marker
+        // that every poll moves forward. Pruning while capture runs must not reach it.
+        store.record_observation(100, 100, &active).expect("insert");
+        store
+            .record_observation(1_000, 1_000, &active)
+            .expect("unchanged observation");
+
+        let pruned = store
+            .prune_segments_ended_before(500, 2_000)
+            .expect("prune");
+
+        assert_eq!(
+            pruned.deleted, 0,
+            "an unclosed segment last observed after the cutoff is still in progress"
+        );
+        let rows = store.timeline_between(0, 2_000, 2_000).expect("timeline");
+        assert_eq!((rows.len(), rows[0].started_at), (1, 100));
+    }
+
+    #[test]
+    fn an_unclosed_segment_last_observed_before_the_cutoff_is_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        // A segment a crash left open months ago. It has no end, so only the moment it was
+        // last observed says whether it belongs to the window.
+        store
+            .record_observation(100, 100, &window_snapshot("crashed-app"))
+            .expect("insert");
+
+        let pruned = store
+            .prune_segments_ended_before(500, 2_000)
+            .expect("prune");
+
+        assert_eq!(pruned.deleted, 1);
+        assert!(
+            store
+                .timeline_between(0, 2_000, 2_000)
+                .expect("timeline")
+                .is_empty(),
+            "a segment nobody closed still ages out, or a crash exempts it forever"
+        );
+    }
+
+    #[test]
+    fn counting_what_a_window_would_remove_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("outside-the-window"))
+            .expect("old segment");
+        store.close_open(200).expect("close the old segment");
+        store
+            .record_observation(1_000, 1_000, &window_snapshot("inside-the-window"))
+            .expect("recent segment");
+        store.close_open(1_100).expect("close the recent segment");
+
+        let removable = store
+            .count_segments_ended_before(500, 2_000)
+            .expect("count");
+
+        assert_eq!(removable, 1);
+        assert_eq!(
+            store
+                .timeline_between(0, 2_000, 2_000)
+                .expect("timeline")
+                .len(),
+            2,
+            "counting is what makes the window inspectable before an irreversible delete, so \
+             it must not perform one"
+        );
+    }
+
+    #[test]
+    fn a_row_the_report_still_shows_is_never_pruned() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (started_at, kind, app_class)
+                VALUES (100, 'window', 'ghostty');",
+            )
+            .expect("seed legacy rows");
+        drop(legacy);
+
+        // A row with neither an end nor a progress marker is drawn by `timeline_between` as
+        // reaching the present, so the window has to read it the same way. The two chains
+        // disagreeing on this last fallback meant a store written before the column existed
+        // reported a block covering today and then had it deleted as months old.
+        let mut store = Store::open(&db, None).expect("migrate legacy database");
+        let shown = store.timeline_between(0, 2_000, 2_000).expect("timeline");
+        let pruned = store
+            .prune_segments_ended_before(500, 2_000)
+            .expect("prune");
+
+        assert_eq!(shown.len(), 1, "the report shows the row");
+        assert_eq!(
+            pruned.deleted, 0,
+            "nothing a report still shows inside the window may be deleted by the window; one \
+             daemon start writes such a row a real end, after which it ages out normally"
+        );
+    }
+
+    #[test]
+    fn a_plain_delete_leaves_the_activity_readable_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "expired-window-title", 0);
+
+        // The premise every case below rests on, measured rather than assumed: removing a row
+        // unlinks it and leaves its bytes in the page it freed. Without this, an assertion that
+        // finds nothing could be green against a build where there was never anything to find.
+        assert_eq!(
+            store
+                .conn
+                .pragma_query_value(None, "secure_delete", |row| row.get::<_, i64>(0))
+                .expect("secure_delete"),
+            0,
+            "this build deletes ordinarily, which is what pruning has to do more than"
+        );
+        store
+            .conn
+            .execute("DELETE FROM activity_segments", [])
+            .expect("delete every row");
+        store
+            .copy_the_log_into_the_file()
+            .expect("put the delete in the file");
+
+        assert!(
+            occurrences_on_disk(&db, "expired-window-title") > 0,
+            "a plain delete has to leave the titles behind, or the measurements below prove \
+             nothing"
+        );
+    }
+
+    #[test]
+    fn pruning_leaves_none_of_the_deleted_activity_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "expired-window-title", 0);
+        seed_segments(&mut store, 3, "surviving-window-title", 100_000);
+
+        let pruned = store
+            .prune_segments_ended_before(50_000, 200_000)
+            .expect("prune");
+
+        assert_eq!(pruned.deleted, 300);
+        assert_eq!(
+            pruned.still_in_the_file, None,
+            "nothing was holding the store, so the rewrite had to complete"
+        );
+        assert_eq!(
+            occurrences_on_disk(&db, "expired-window-title"),
+            0,
+            "a window title the retention window deleted must not be readable in the file or \
+             in the log"
+        );
+        assert_eq!(
+            byte_len(&wal_of(&db)),
+            0,
+            "the log is reset rather than left holding copies of what was removed"
+        );
+        assert!(
+            occurrences_on_disk(&db, "surviving-window-title") > 0,
+            "the measurement has to be able to find a title that is still stored, or it is \
+             reading the wrong bytes"
+        );
+    }
+
+    #[test]
+    fn pruning_beside_an_attached_reader_still_clears_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "expired-window-title", 0);
+
+        // The arrangement this tool recommends: a second connection attached for the whole
+        // prune, as the capture daemon is while a timer runs. SQLite's own passive checkpoint
+        // cannot get through here, so a prune that relied on one reported success while leaving
+        // every deleted title in the file and adding a copy of each to the log.
+        let daemon = Connection::open(&db).expect("a second connection on the same store");
+        let seen: i64 = daemon
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("the second connection can read");
+        assert_eq!(seen, 300, "the second connection is really attached");
+
+        let pruned = store
+            .prune_segments_ended_before(50_000, 200_000)
+            .expect("prune");
+
+        assert_eq!(pruned.deleted, 300);
+        assert_eq!(
+            pruned.still_in_the_file, None,
+            "a reader that is up to date must not stop the rewrite"
+        );
+        assert_eq!(
+            occurrences_on_disk(&db, "expired-window-title"),
+            0,
+            "the configuration the README recommends is the one that has to hold"
+        );
+        assert_eq!(byte_len(&wal_of(&db)), 0);
+        drop(daemon);
+    }
+
+    #[test]
+    fn a_reader_holding_an_older_snapshot_is_reported_rather_than_hidden() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "expired-window-title", 0);
+
+        let reader = Connection::open(&db).expect("a second connection");
+        reader.execute_batch("BEGIN").expect("open a read");
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("take a snapshot and hold it");
+        // Without this the checkpoint would sit on the busy handler for the five seconds the
+        // store is configured to wait before giving the same answer, since this reader is never
+        // going to move.
+        store
+            .conn
+            .busy_timeout(Duration::from_millis(50))
+            .expect("shorten the wait");
+
+        let pruned = store
+            .prune_segments_ended_before(50_000, 200_000)
+            .expect("the delete itself still has to succeed");
+
+        assert_eq!(
+            pruned.deleted, 300,
+            "the rows are gone whatever the file still holds, and reporting a failure here \
+             would describe a committed deletion as one that did not happen"
+        );
+        let reason = pruned
+            .still_in_the_file
+            .expect("a rewrite that could not run has to be reported");
+        assert!(
+            reason.contains("reading"),
+            "the reason has to name what stopped it: {reason}"
+        );
+        assert!(
+            occurrences_on_disk(&db, "expired-window-title") > 0,
+            "the warning has to be true: this is the case where the deleted activity really is \
+             still readable on disk"
+        );
+
+        // And the advice that goes with it has to work: once the reader lets go, running the
+        // command again finishes the rewrite, even though it now deletes nothing.
+        drop(reader);
+        let again = store
+            .prune_segments_ended_before(50_000, 200_000)
+            .expect("prune again");
+
+        assert_eq!(again.deleted, 0);
+        assert_eq!(again.still_in_the_file, None);
+        assert_eq!(occurrences_on_disk(&db, "expired-window-title"), 0);
+    }
+
+    #[test]
+    fn pruning_gives_the_space_back_and_a_later_day_reuses_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 1_000, "expired-window-title", 0);
+        // Measured after a checkpoint in every case, since until then the writes are in the log
+        // and the file says nothing about how much is stored.
+        store.copy_the_log_into_the_file().expect("checkpoint");
+        let before_pruning = byte_len(&db);
+
+        store
+            .prune_segments_ended_before(50_000, 200_000)
+            .expect("prune");
+        let after_pruning = byte_len(&db);
+        seed_segments(&mut store, 1_000, "later-window-title", 200_000);
+        store.copy_the_log_into_the_file().expect("checkpoint");
+
+        assert!(
+            after_pruning < before_pruning,
+            "pruning has to return the space, not merely stop using it: {before_pruning} bytes \
+             before, {after_pruning} after"
+        );
+        assert!(
+            byte_len(&db) <= before_pruning,
+            "a day recorded after a prune reuses what the prune gave back, so a store pruned \
+             and refilled forever stays the size of its window"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn the_rebuild_scratch_file_stays_beside_the_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 50, "expired-window-title", 0);
+
+        store
+            .prune_segments_ended_before(50_000, 200_000)
+            .expect("prune");
+
+        // The scratch database is unlinked as soon as the rebuild ends, so what can be pinned
+        // here is where SQLite was told to put it. That it honours the setting was measured by
+        // hand: the file appears as `<dir>/etilqs_<random>`, mode 0600, once the store is large
+        // enough to spill out of memory.
+        let told: String = store
+            .conn
+            .pragma_query_value(None, "temp_store_directory", |row| row.get(0))
+            .expect("temp_store_directory");
+        assert_eq!(
+            told,
+            dir.path().to_str().expect("a utf-8 path"),
+            "a plaintext copy of the store must not be written outside the directory the store \
+             is kept private in"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn database_files_are_private_on_unix() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace/daytrace.db");
+        let data_dir = dir.path().join("daytrace");
+        let mut store = Store::open(&db, Some(data_dir.clone())).expect("store");
+        store
+            .record_observation(
+                100,
+                100,
+                &ActivitySnapshot::window(
+                    Some("ghostty".to_string()),
+                    Some("tmux".to_string()),
+                    None,
+                    None,
+                ),
+            )
+            .expect("write");
+
+        let dir_mode = fs::metadata(data_dir)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let db_mode = fs::metadata(&db).expect("db metadata").permissions().mode() & 0o777;
+
+        assert_eq!(dir_mode, 0o700);
+        assert_eq!(db_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_database_parent_permissions_are_not_changed() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))
+            .expect("set parent mode");
+        let db = dir.path().join("custom.db");
+
+        Store::open(&db, None).expect("store");
+
+        let parent_mode = fs::metadata(dir.path())
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let db_mode = fs::metadata(&db).expect("db metadata").permissions().mode() & 0o777;
+
+        assert_eq!(parent_mode, 0o755);
+        assert_eq!(db_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn explicit_database_parent_named_daytrace_is_not_changed() {
+        use std::fs;
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let parent = dir.path().join("daytrace");
+        fs::create_dir(&parent).expect("create parent");
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("set parent mode");
+        let db = parent.join("custom.db");
+
+        Store::open(&db, None).expect("store");
+
+        let parent_mode = fs::metadata(parent)
+            .expect("dir metadata")
+            .permissions()
+            .mode()
+            & 0o777;
+        let db_mode = fs::metadata(&db).expect("db metadata").permissions().mode() & 0o777;
+
+        assert_eq!(parent_mode, 0o755);
+        assert_eq!(db_mode, 0o600);
     }
 
     #[test]
@@ -1011,88 +1703,5 @@ mod tests {
         assert_eq!(rows.len(), 2, "{rows:?}");
         assert_eq!(rows[0].snapshot.app_class, Some("ghostty".to_string()));
         assert_eq!(rows[1].snapshot, ActivitySnapshot::suspended());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn database_files_are_private_on_unix() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let db = dir.path().join("daytrace/daytrace.db");
-        let data_dir = dir.path().join("daytrace");
-        let mut store = Store::open(&db, Some(data_dir.clone())).expect("store");
-        store
-            .record_observation(
-                100,
-                100,
-                &ActivitySnapshot::window(
-                    Some("ghostty".to_string()),
-                    Some("tmux".to_string()),
-                    None,
-                    None,
-                ),
-            )
-            .expect("write");
-
-        let dir_mode = fs::metadata(data_dir)
-            .expect("dir metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        let db_mode = fs::metadata(&db).expect("db metadata").permissions().mode() & 0o777;
-
-        assert_eq!(dir_mode, 0o700);
-        assert_eq!(db_mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn explicit_database_parent_permissions_are_not_changed() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        fs::set_permissions(dir.path(), fs::Permissions::from_mode(0o755))
-            .expect("set parent mode");
-        let db = dir.path().join("custom.db");
-
-        Store::open(&db, None).expect("store");
-
-        let parent_mode = fs::metadata(dir.path())
-            .expect("dir metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        let db_mode = fs::metadata(&db).expect("db metadata").permissions().mode() & 0o777;
-
-        assert_eq!(parent_mode, 0o755);
-        assert_eq!(db_mode, 0o600);
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn explicit_database_parent_named_daytrace_is_not_changed() {
-        use std::fs;
-        use std::os::unix::fs::PermissionsExt;
-
-        let dir = tempfile::tempdir().expect("tempdir");
-        let parent = dir.path().join("daytrace");
-        fs::create_dir(&parent).expect("create parent");
-        fs::set_permissions(&parent, fs::Permissions::from_mode(0o755)).expect("set parent mode");
-        let db = parent.join("custom.db");
-
-        Store::open(&db, None).expect("store");
-
-        let parent_mode = fs::metadata(parent)
-            .expect("dir metadata")
-            .permissions()
-            .mode()
-            & 0o777;
-        let db_mode = fs::metadata(&db).expect("db metadata").permissions().mode() & 0o777;
-
-        assert_eq!(parent_mode, 0o755);
-        assert_eq!(db_mode, 0o600);
     }
 }

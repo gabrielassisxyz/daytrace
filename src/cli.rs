@@ -6,8 +6,8 @@ use crate::input::InputActivity;
 use crate::lock::CaptureLock;
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
-use crate::storage::Store;
-use crate::timeline::{day_bounds, local_date, render_day, unix_now};
+use crate::storage::{Pruned, Store};
+use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
 use std::env;
 use std::process::ExitCode;
@@ -23,6 +23,7 @@ Usage:
   daytrace start
   daytrace today [--date YYYY-MM-DD]
   daytrace export [--date YYYY-MM-DD]
+  daytrace prune [--dry-run]
   daytrace service unit
   daytrace help
 
@@ -30,12 +31,14 @@ Commands:
   start         Start the desktop activity capture daemon.
   today         Print a chronological activity timeline, by default for today.
   export        Print one day of stored activity as JSON, by default today.
+  prune         Delete stored activity from before the retention window.
   service unit  Print a systemd user unit that runs the daemon for this login session.
   help          Print this help text.
 
 Environment:
   DAYTRACE_DB_PATH                 Override the SQLite database path.
   DAYTRACE_IDLE_AFTER_SECONDS      Idle threshold, default 300.
+  DAYTRACE_RETENTION_DAYS          Days before today that prune keeps, default 90.
   DAYTRACE_BLACKLIST_APPS          Comma-separated app class substrings to skip.
   DAYTRACE_BLACKLIST_TITLES        Comma-separated title substrings to skip.
   DAYTRACE_BLACKLIST_DOMAINS       Comma-separated URL/domain substrings to skip.
@@ -78,6 +81,10 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
             let (date, segments) = stored_day(&Config::from_env()?, requested)?;
             render_day_export(date, &segments)
         }
+        [arg, rest @ ..] if arg == "prune" => {
+            let dry_run = prune_is_dry_run(rest)?;
+            prune_old_activity(&Config::from_env()?, dry_run)
+        }
         [first, second] if first == "service" && second == "unit" => render_service_unit(),
         [unknown] => Err(format!("unknown command: {unknown}")),
         _ => Err(format!("unknown command: {}", args.join(" "))),
@@ -109,6 +116,16 @@ fn requested_day(args: &[String]) -> Result<Option<NaiveDate>, String> {
             Some(value) => parse_day(value).map(Some),
             None => Err(format!("unexpected argument: {single}")),
         },
+        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+    }
+}
+
+/// Whether `prune` should only report what the window would remove.
+fn prune_is_dry_run(args: &[String]) -> Result<bool, String> {
+    match args {
+        [] => Ok(false),
+        [flag] if flag == "--dry-run" => Ok(true),
+        [single] => Err(format!("unexpected argument: {single}")),
         _ => Err(format!("unexpected arguments: {}", args.join(" "))),
     }
 }
@@ -301,18 +318,101 @@ fn stored_day(
     Ok((date, store.timeline_between(start, end, now)?))
 }
 
+/// Delete the stored activity that the retention window no longer covers.
+///
+/// Deleting is explicit, and nothing prunes on its own. Capture writes at most a segment a
+/// second and the window is measured in months, so there is no point at which the store has
+/// to be trimmed for the daemon to keep working; what an automatic prune would buy is a
+/// smaller file, paid for by deleting activity the user never asked to lose, at a moment they
+/// were not present for, with no undo and no record that it happened. The cost of the manual
+/// alternative is that an installation nobody prunes still grows, which is a file that gets
+/// larger rather than a day that silently disappears.
+///
+/// The report names the window and the first day it keeps before saying what happened, so the
+/// policy being applied is visible in the output of the command that applies it.
+fn prune_old_activity(config: &Config, dry_run: bool) -> Result<String, String> {
+    let now = unix_now();
+    let cutoff = retention_cutoff(now, config.retention_days)?;
+    let window = window_applied(config.retention_days, local_date(cutoff)?);
+
+    // Nothing stored is nothing to prune, and opening a store to discover that would create
+    // the database this command exists to keep small.
+    if !config.db_path.exists() {
+        return Ok(format!(
+            "{window}No stored activity was found, so nothing was deleted.\n"
+        ));
+    }
+
+    let mut store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
+    if dry_run {
+        let removable = store.count_segments_ended_before(cutoff, now)?;
+        return Ok(format!("{window}{}", render_preview(removable)));
+    }
+
+    let pruned = store.prune_segments_ended_before(cutoff, now)?;
+    Ok(format!("{window}{}", render_prune(&pruned)))
+}
+
+/// The first two facts of any prune, preview or not: the window, and where it opens.
+fn window_applied(retention_days: u32, first_day_kept: NaiveDate) -> String {
+    format!(
+        "Retention window: {retention_days} days plus today, keeping activity from \
+         {first_day_kept} onwards.\n"
+    )
+}
+
+fn render_preview(removable: u64) -> String {
+    let are = if removable == 1 { "is" } else { "are" };
+    format!(
+        "{} {are} outside it. Nothing was deleted.\n",
+        segments(removable)
+    )
+}
+
+/// What happened, and separately what could not be finished afterwards.
+///
+/// The second line is not an error, and the command does not fail: the rows are already gone,
+/// so a caller told only that something failed would be left guessing whether the deletion
+/// happened. It says what is still readable and what makes it go away.
+fn render_prune(pruned: &Pruned) -> String {
+    let mut report = format!("Deleted {}.\n", segments(pruned.deleted));
+    if let Some(reason) = &pruned.still_in_the_file {
+        report.push_str(&format!(
+            "The deleted activity is still readable in the database file, because {reason}. \
+             Running prune again finishes clearing it.\n"
+        ));
+    }
+    report
+}
+
+fn segments(count: u64) -> String {
+    if count == 1 {
+        return "1 activity segment".to_string();
+    }
+    format!("{count} activity segments")
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, requested_day, run,
+        FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, prune_is_dry_run,
+        render_preview, render_prune, requested_day, run,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
     use crate::session::PoweredDownGap;
+    use crate::storage::Pruned;
     use crate::storage::Store;
     use chrono::NaiveDate;
     use std::cell::RefCell;
+
+    fn pruned(deleted: u64, still_in_the_file: Option<&str>) -> Pruned {
+        Pruned {
+            deleted,
+            still_in_the_file: still_in_the_file.map(ToOwned::to_owned),
+        }
+    }
 
     /// A desktop boundary that replays a fixed script of outcomes, so a transient failure
     /// followed by a recovery can be staged deterministically.
@@ -654,6 +754,76 @@ mod tests {
     fn an_argument_that_is_not_a_date_flag_is_named_in_the_error() {
         let error = requested_day(&["yesterday".to_string()]).expect_err("should be rejected");
         assert_eq!(error, "unexpected argument: yesterday");
+    }
+
+    #[test]
+    fn pruning_deletes_for_real_unless_a_dry_run_is_asked_for() {
+        assert!(
+            !prune_is_dry_run(&[]).expect("no argument"),
+            "a bare prune is the working command, not a preview"
+        );
+        assert!(prune_is_dry_run(&["--dry-run".to_string()]).expect("dry run"));
+    }
+
+    #[test]
+    fn an_unrecognised_prune_argument_is_refused_rather_than_ignored() {
+        // Silently ignoring one would run the irreversible command while the caller believes
+        // they asked for something narrower.
+        for argument in [
+            vec!["--dryrun".to_string()],
+            vec!["--dry-run=yes".to_string()],
+            vec!["--older-than".to_string(), "7".to_string()],
+        ] {
+            let error = prune_is_dry_run(&argument).expect_err("should be rejected");
+            assert!(
+                error.starts_with("unexpected argument"),
+                "{argument:?} was not named in its own rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_single_segment_is_not_reported_in_the_plural() {
+        assert_eq!(
+            render_prune(&pruned(1, None)),
+            "Deleted 1 activity segment.\n"
+        );
+        assert_eq!(
+            render_preview(1),
+            "1 activity segment is outside it. Nothing was deleted.\n"
+        );
+        assert_eq!(
+            render_prune(&pruned(2, None)),
+            "Deleted 2 activity segments.\n"
+        );
+        assert_eq!(
+            render_preview(0),
+            "0 activity segments are outside it. Nothing was deleted.\n"
+        );
+    }
+
+    #[test]
+    fn a_rewrite_that_could_not_finish_is_reported_beside_the_deletion_not_instead_of_it() {
+        let report = render_prune(&pruned(7, Some("another process is reading it")));
+
+        assert!(
+            report.starts_with("Deleted 7 activity segments.\n"),
+            "the deletion has already committed and cannot be reported as a failure: {report}"
+        );
+        assert!(
+            report.contains("still readable in the database file")
+                && report.contains("another process is reading it")
+                && report.contains("Running prune again"),
+            "the reader has to learn what is left, why, and what clears it: {report}"
+        );
+    }
+
+    #[test]
+    fn the_help_text_documents_pruning_and_the_retention_window() {
+        let output = run(Vec::<String>::new()).expect("help should succeed");
+
+        assert!(output.contains("daytrace prune"), "{output}");
+        assert!(output.contains("DAYTRACE_RETENTION_DAYS"), "{output}");
     }
 
     #[test]
