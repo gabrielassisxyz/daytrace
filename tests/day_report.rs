@@ -267,13 +267,59 @@ fn the_end_of_a_day_whose_midnight_never_happened_is_still_the_end_of_that_day()
         friday.contains("-24:00"),
         "a segment clipped to the end of the day says so: {friday}"
     );
+    // The whole row, not a fragment of it: asserting the span and the duration together is what
+    // pins the boundary to the right instant, and it fails loudly if tzdata lacks the 2038 rule.
+    assert!(
+        friday.contains("23:50-24:00  10m"),
+        "the ten minutes before the day's end belong to that day and end at it: {friday}"
+    );
     assert!(
         !friday.contains("-01:00"),
         "the end of Friday must not be reported as an hour that belongs to Saturday: {friday}"
     );
+}
+
+/// The mirror of the case above, and the one that had no test at all.
+///
+/// Sao_Paulo moved the clock back *at midnight* until 2019: at 2018-02-18 00:00 the clock returned
+/// to 23:00 on the 17th, so the 17th is 25 hours long and its 23:00 hour happens twice. Naming the
+/// start of the 18th by the earlier of the two candidate instants picked one whose local reading is
+/// still 23:00 on the 17th, which put the boundary an hour inside the day it was supposed to close:
+/// the 17th reported 24 hours of a 25 hour day, and its final hour was filed under the 18th.
+#[test]
+fn a_day_whose_clock_moves_back_at_midnight_keeps_its_last_hour() {
+    // 2018-02-17 00:00 in Sao_Paulo, and the true start of the 18th, 25 hours later.
+    const SATURDAY: i64 = 1_518_832_800;
+    const SUNDAY: i64 = 1_518_922_800;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = seeded_database(
+        directory.path(),
+        &[StoredSegment {
+            started_at: SATURDAY,
+            ended_at: Some(SUNDAY),
+            last_seen_at: SUNDAY,
+            app_class: "all-day-app",
+        }],
+    );
+
+    let saturday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2018-02-17"],
+    );
+    let sunday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2018-02-18"],
+    );
+
     assert!(
-        FRIDAY_END - FRIDAY == 86_400,
-        "the fixture is wrong if this day is not 24 hours long"
+        saturday.contains("00:00-24:00  25h"),
+        "a day the clock lengthens to 25 hours has to report all of them: {saturday}"
+    );
+    assert!(
+        !sunday.contains("all-day-app"),
+        "the last hour of Saturday must not be reported as Sunday's: {sunday}"
     );
 }
 

@@ -32,17 +32,38 @@ fn local_day_start(date: NaiveDate) -> Result<i64, String> {
 
     match Local.from_local_datetime(&midnight) {
         MappedLocalTime::Single(at) => Ok(at.timestamp()),
-        // A clock moved back repeats the hour, so midnight happens twice and the day has to
-        // open at the first of the two. The two instants are compared rather than asking for
-        // the earliest of the pair, because the earliest of two *local* readings is the one
-        // with the smaller offset, which is the later instant: in a zone that falls back at
-        // one in the morning, that credited the first hour of the day to the day before.
-        MappedLocalTime::Ambiguous(one, other) => Ok(one.timestamp().min(other.timestamp())),
+        // A clock moved back repeats the hour, so midnight can happen twice and the day has to
+        // open at the first of the two. Not simply the earlier instant, though: where the clock
+        // falls back *at* midnight, as Sao_Paulo did until 2019, one of the two candidates reads
+        // locally as 23:00 on the day before, and taking it put the boundary an hour inside the
+        // day it was meant to open. The 17th of February 2018 then reported 24 hours of a 25 hour
+        // day and handed its last hour to the 18th. The earliest candidate that actually falls on
+        // this date is the one, which is also the first of two passes through a repeated midnight.
+        MappedLocalTime::Ambiguous(one, other) => earliest_instant_on(date, [one, other]),
         // A clock moved forward can delete midnight outright. The day still happened, and it
         // began when the clock jumped. Refusing to name its start refused the report for two
         // days at once: the requested one, and the one before it, whose end is this start.
         MappedLocalTime::None => first_hour_that_exists(date),
     }
+}
+
+/// The earliest of the candidate instants whose local reading falls on `date`.
+///
+/// Both candidates are the same wall clock time under two different offsets, so which of them is
+/// really on `date` is a question about the zone rather than about the clock, and only the local
+/// reading answers it. Falling back to the earliest instant if neither qualifies keeps a zone this
+/// does not anticipate reporting a day rather than refusing one.
+fn earliest_instant_on(
+    date: NaiveDate,
+    candidates: [chrono::DateTime<Local>; 2],
+) -> Result<i64, String> {
+    let mut instants = candidates.map(|at| at.timestamp());
+    instants.sort_unstable();
+
+    Ok(instants
+        .into_iter()
+        .find(|at| local_date(*at).is_ok_and(|day| day == date))
+        .unwrap_or(instants[0]))
 }
 
 fn first_hour_that_exists(date: NaiveDate) -> Result<i64, String> {
