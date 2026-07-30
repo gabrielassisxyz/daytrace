@@ -32,13 +32,15 @@ fn local_day_start(date: NaiveDate) -> Result<i64, String> {
 
     match Local.from_local_datetime(&midnight) {
         MappedLocalTime::Single(at) => Ok(at.timestamp()),
-        // A clock moved back repeats the hour, so midnight can happen twice and the day has to
-        // open at the first of the two. Not simply the earlier instant, though: where the clock
-        // falls back *at* midnight, as Sao_Paulo did until 2019, one of the two candidates reads
-        // locally as 23:00 on the day before, and taking it put the boundary an hour inside the
-        // day it was meant to open. The 17th of February 2018 then reported 24 hours of a 25 hour
-        // day and handed its last hour to the 18th. The earliest candidate that actually falls on
-        // this date is the one, which is also the first of two passes through a repeated midnight.
+        // A clock moved back gives midnight two candidate instants, and the day opens at the
+        // earliest of them that actually falls on this date. Both halves of that matter, because
+        // the two zones it covers are not the same shape. Where the clock falls back at one in
+        // the morning, midnight genuinely happens twice, both candidates fall on this date, and
+        // the day must open at the first pass. Where it falls back *at* midnight, as Sao_Paulo
+        // did until 2019, the repeated hour is the one before midnight and the second candidate
+        // reads locally as 23:00 on the day before: taking it put the boundary an hour inside the
+        // day it was meant to open, so the 17th of February 2018 reported 24 hours of a 25 hour
+        // day and handed its last hour to the 18th.
         MappedLocalTime::Ambiguous(one, other) => earliest_instant_on(date, [one, other]),
         // A clock moved forward can delete midnight outright. The day still happened, and it
         // began when the clock jumped. Refusing to name its start refused the report for two

@@ -243,8 +243,8 @@ fn a_segment_covering_a_whole_day_does_not_begin_and_end_at_the_same_time() {
 /// is exactly why this has to run against the built binary with a zone in its environment.
 #[test]
 fn the_end_of_a_day_whose_midnight_never_happened_is_still_the_end_of_that_day() {
-    // 2038-09-04 00:00 in Santiago, and the instant 24 hours later, which is that day's end.
-    const FRIDAY: i64 = 2_167_185_600;
+    // The end of 2038-09-04 in Santiago, 24 hours after that day's local midnight, and the
+    // instant a clock there reads as 01:00 on the 5th.
     const FRIDAY_END: i64 = 2_167_272_000;
     let directory = tempfile::tempdir().expect("tempdir");
     let db_path = seeded_database(
