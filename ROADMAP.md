@@ -10,6 +10,7 @@
 - `daytrace today --date` and `daytrace export --date` report and export any past local day.
 - `daytrace export` emits one day of stored activity as JSON on standard output.
 - `daytrace service unit` prints a systemd user unit that runs the capture daemon for the desktop session.
+- One capture daemon runs per database. A second `daytrace start` is refused and names the process already running.
 - Application, title, and domain blacklist environment variables exist.
 - Browser titles are redacted by default and private/incognito browser windows are skipped when Hyprland exposes a recognizable private-mode title marker.
 - Deterministic project gates exist for Rust CI, dependency audit, secret scanning, Markdown wrapping, and public prose hygiene.

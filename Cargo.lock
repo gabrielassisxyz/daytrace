@@ -118,6 +118,7 @@ dependencies = [
  "chrono",
  "ctrlc",
  "evdev",
+ "libc",
  "regex",
  "rusqlite",
  "serde",
