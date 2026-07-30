@@ -101,6 +101,6 @@
 
 ## Common Hurdles
 
-No ungated common hurdles are recorded yet.
+- **A shared cargo target directory makes one branch's tests report as another's.** A global `build.target-dir` puts every worktree's artifacts in one place, and the fingerprint does not separate two checkouts of the same package, so `cargo test` and `bin/ci` happily run a test binary another branch compiled. It reports as a clean pass or as failures in tests the branch under test does not even contain, which is worse than a crash, because it looks like an answer. Run the gate with its own target directory whenever it matters: `CARGO_TARGET_DIR=<scratch> bin/ci`, and check that the test count matches the branch. The same applies to running the built binary by hand.
 
 When a gotcha appears, add it here only if no deterministic gate already catches it. A hurdle promoted to a gate is deleted from this section, not duplicated.
