@@ -1,5 +1,5 @@
 use crate::activity::{ActivityKind, TimelineSegment};
-use chrono::{Local, MappedLocalTime, NaiveDate, TimeZone};
+use chrono::{Days, Local, MappedLocalTime, NaiveDate, TimeZone};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
 
@@ -23,6 +23,20 @@ pub fn day_bounds(date: NaiveDate) -> Result<(i64, i64), String> {
         .succ_opt()
         .ok_or_else(|| format!("{date} has no following day in the supported range"))?;
     Ok((local_day_start(date)?, local_day_start(next)?))
+}
+
+/// The first instant a window of `retention_days` keeps, given the current instant `now`.
+///
+/// The boundary is a local midnight rather than `now` minus a multiple of 86400 seconds,
+/// because every command that reads the store is addressed by local day. A window measured in
+/// raw seconds would fall part-way through the oldest day it keeps, so that day would report
+/// only the hours after the cutoff while still being labelled a whole day, and a clock change
+/// would move the boundary by an hour on top of that.
+pub fn retention_cutoff(now: i64, retention_days: u32) -> Result<i64, String> {
+    let oldest_kept = local_date(now)?
+        .checked_sub_days(Days::new(retention_days.into()))
+        .ok_or_else(|| format!("a window of {retention_days} days reaches before the calendar"))?;
+    local_day_start(oldest_kept)
 }
 
 fn local_day_start(date: NaiveDate) -> Result<i64, String> {
@@ -235,7 +249,9 @@ fn format_duration(seconds: i64) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{ApplicationTotal, application_totals, day_bounds, local_date, render_day};
+    use super::{
+        ApplicationTotal, application_totals, day_bounds, local_date, render_day, retention_cutoff,
+    };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use chrono::NaiveDate;
 
@@ -321,6 +337,52 @@ mod tests {
         let rendered = render_day(date(2026, 7, 20), &[]).expect("render");
 
         assert_eq!(rendered, "No activity events recorded for 2026-07-20.\n");
+    }
+
+    #[test]
+    fn a_retention_window_opens_at_a_local_midnight_that_many_days_back() {
+        let (start_of_today, _) = day_bounds(date(2026, 7, 29)).expect("bounds");
+        let afternoon = start_of_today + 15 * 3600;
+
+        let cutoff = retention_cutoff(afternoon, 90).expect("cutoff");
+
+        assert_eq!(
+            local_date(cutoff).expect("cutoff date"),
+            date(2026, 4, 30),
+            "ninety days before 2026-07-29 is 2026-04-30"
+        );
+        assert_eq!(
+            cutoff,
+            day_bounds(date(2026, 4, 30)).expect("bounds").0,
+            "the window must open exactly where that day opens, not part-way through it"
+        );
+    }
+
+    #[test]
+    fn the_time_of_day_does_not_move_the_retention_boundary() {
+        let (start_of_today, end_of_today) = day_bounds(date(2026, 7, 29)).expect("bounds");
+
+        let at_midnight = retention_cutoff(start_of_today, 30).expect("cutoff");
+        let last_second = retention_cutoff(end_of_today - 1, 30).expect("cutoff");
+
+        assert_eq!(
+            at_midnight, last_second,
+            "pruning twice in one day must not remove a further day the second time"
+        );
+    }
+
+    #[test]
+    fn the_shortest_window_still_keeps_the_day_before_today() {
+        let (start_of_today, _) = day_bounds(date(2026, 7, 29)).expect("bounds");
+
+        let cutoff = retention_cutoff(start_of_today, 1).expect("cutoff");
+
+        assert_eq!(
+            local_date(cutoff).expect("cutoff date"),
+            date(2026, 7, 28),
+            "a window of one day keeps yesterday and today, so the earliest kept instant is \
+             yesterday's first"
+        );
     }
 
     #[test]

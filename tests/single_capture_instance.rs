@@ -81,6 +81,32 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
 /// The claim is deliberately a file beside the database rather than the database itself, and
 /// `today` and `export` never open it. Moving the claim onto the store would break both while
 /// still passing every test above.
+/// Pruning must not wait on capture either, and for a sharper reason than reading does.
+///
+/// The command is meant to be run from a timer beside a daemon that runs all day, so a prune that
+/// took the claim would be refused on every machine that follows the documented setup, and the
+/// retention window would quietly never be applied on exactly those.
+#[test]
+fn pruning_does_not_wait_on_the_capture_claim() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = directory.path().join("daytrace.db");
+    let _holder = hold_capture_claim(&db_path);
+
+    let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
+        .arg("prune")
+        .env("DAYTRACE_DB_PATH", &db_path)
+        .env("DAYTRACE_RETENTION_DAYS", "30")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daytrace prune");
+
+    assert!(
+        output.status.success(),
+        "pruning while capture is held must succeed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 #[test]
 fn reporting_a_day_does_not_wait_on_the_capture_claim() {
     let directory = tempfile::tempdir().expect("tempdir");
