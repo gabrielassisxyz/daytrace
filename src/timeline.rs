@@ -123,6 +123,9 @@ pub fn render_day(date: NaiveDate, segments: &[TimelineSegment]) -> Result<Strin
 fn application_label(segment: &TimelineSegment) -> &str {
     match segment.snapshot.kind {
         ActivityKind::Idle => "AFK",
+        // Named apart from absence on purpose: a report that called a suspended night "AFK"
+        // would say somebody was away from a running machine for eight hours.
+        ActivityKind::Suspended => "Suspended",
         ActivityKind::Unknown => "Unknown",
         ActivityKind::Window => segment
             .snapshot
@@ -317,6 +320,35 @@ mod tests {
         ]);
 
         assert_eq!(totals, vec![total("AFK", 900), total("ghostty", 600)]);
+    }
+
+    #[test]
+    fn a_powered_down_stretch_is_reported_apart_from_ordinary_absence() {
+        let segments = [
+            segment(0, 300, "ghostty"),
+            idle_segment(300, 600),
+            TimelineSegment {
+                started_at: 600,
+                ended_at: 4_200,
+                snapshot: ActivitySnapshot::suspended(),
+            },
+        ];
+
+        let rendered = render_day(date(2026, 7, 20), &segments).expect("render");
+
+        assert_eq!(
+            application_totals(&segments),
+            vec![
+                total("Suspended", 3_600),
+                total("AFK", 300),
+                total("ghostty", 300)
+            ],
+            "a machine that was off is not somebody sitting still, and the day may not merge them"
+        );
+        assert!(
+            rendered.contains("Suspended"),
+            "the timeline has to say which absence it was: {rendered}"
+        );
     }
 
     #[test]

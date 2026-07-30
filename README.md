@@ -47,6 +47,12 @@ Time per application
 
 Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute even where each individual row rounds to `0m`. Absence is totalled as `AFK`, apart from any application.
 
+A stretch the machine spent suspended is reported as `Suspended`, separately from `AFK`. The two are the same absence of input but not the same fact about the day, and merging them makes a laptop closed overnight read as eight hours away from a running desk. The stretch is recognized on the first poll after the machine comes back, and its length is the kernel's own count of suspended time, taken as the difference between the two clocks that measure time since boot: one of them counts time spent suspended and the other does not. The segment in focus when the machine stopped is closed there rather than credited with the whole gap, and the poll after the resume opens a segment of its own.
+
+The wall clock is used only to place that stretch on the timeline, never to decide that one happened or how long it lasted. This is deliberate and it is the important part: the wall clock jumps as a matter of routine, since every boot starts it from a hardware clock that has drifted and the correction is applied as a step rather than eased in. Deriving an absence from that movement would invent segments on an ordinary morning, and an invented segment is worse than a missing one, because the report and the export state it as fact and nothing downstream can tell it from a real gap.
+
+What that leaves. Suspend and hibernate are not told apart, because the kernel counts both the same way and both mean the machine was not running. A stretch during which the daemon itself was not running stays an ordinary gap in the day, whether the machine was off or the daemon was merely stopped: the clocks restart at boot and a fresh process has nothing earlier to compare against. Each endpoint is accurate to within one polling interval, and a suspend shorter than five seconds is left with whatever segment was open rather than breaking the day into three rows.
+
 `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly.
 
 The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
@@ -137,7 +143,7 @@ daytrace export --date 2026-07-20 > 2026-07-20.json
 }
 ```
 
-Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window` or `idle`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
+Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window`, `idle`, or `suspended`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
 
 A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
 

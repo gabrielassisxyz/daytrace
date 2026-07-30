@@ -5,6 +5,7 @@ use crate::export::render_day_export;
 use crate::input::InputActivity;
 use crate::lock::CaptureLock;
 use crate::service::render_user_unit;
+use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
 use crate::storage::Store;
 use crate::timeline::{day_bounds, local_date, render_day, unix_now};
 use chrono::NaiveDate;
@@ -144,9 +145,14 @@ fn run_daemon(config: Config) -> Result<(), String> {
     let mut store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
     store.close_stale_open_segments()?;
 
+    let session_clock = SystemSessionClock;
+    let mut power_gaps = PowerGapWatch::default();
     let mut streak = FailureStreak::default();
     while running.load(Ordering::Relaxed) {
-        let observed_at = unix_now();
+        // The clock is read through the watch rather than separately, so the instant the poll
+        // is dated by is the same one the powered-down stretch was measured against.
+        let session = power_gaps.observe(&session_clock);
+        let observed_at = session.observed_at;
         // Idle is only detectable once the threshold has already passed, so the transition is
         // dated back to the last input rather than to the moment it was noticed. Dating it to
         // now credited the whole threshold window to whichever window still held focus, which
@@ -161,6 +167,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
             &config.blacklist,
             observed_at,
             idle_since,
+            session.powered_down_gap,
         ) {
             // Only a poll that actually reached the desktop is evidence that it is reachable.
             Ok(Observed::Desktop) => streak.record_success(),
@@ -225,13 +232,23 @@ enum Observed {
 
 /// Record one observation. `idle_since` carries the moment input stopped when the machine is
 /// idle, which is earlier than `observed_at` by at least the idle threshold.
+/// `powered_down_gap` carries a stretch the machine spent off, which is only ever known on the
+/// first poll after it ended.
 fn capture_once(
     store: &mut Store,
     source: &dyn ActiveWindowSource,
     blacklist: &Blacklist,
     observed_at: i64,
     idle_since: Option<i64>,
+    powered_down_gap: Option<PoweredDownGap>,
 ) -> Result<Observed, String> {
+    // Written before this poll's observation, so the segment that was open when the machine
+    // stopped ends there instead of swallowing the whole stretch, and so the observation below
+    // finds no open segment to continue and starts a fresh one at the resume.
+    if let Some(gap) = powered_down_gap {
+        store.record_powered_down_gap(gap.started_at, gap.ended_at)?;
+    }
+
     let (starts_at, snapshot, observed) = match idle_since {
         Some(idle_since) => (idle_since, Some(ActivitySnapshot::idle()), Observed::Idle),
         None => (
@@ -292,6 +309,7 @@ mod tests {
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
+    use crate::session::PoweredDownGap;
     use crate::storage::Store;
     use chrono::NaiveDate;
     use std::cell::RefCell;
@@ -339,9 +357,9 @@ mod tests {
         ]);
         let blacklist = Blacklist::default();
 
-        capture_once(&mut store, &source, &blacklist, 100, None)
+        capture_once(&mut store, &source, &blacklist, 100, None, None)
             .expect_err("the compositor query failed");
-        capture_once(&mut store, &source, &blacklist, 110, None)
+        capture_once(&mut store, &source, &blacklist, 110, None, None)
             .expect("the recovered query is recorded");
         store.close_open(120).expect("close");
 
@@ -366,8 +384,9 @@ mod tests {
 
         // Input stops at 1000. Idle is only detected at 1300, once the 300 second threshold
         // has elapsed, and the five minutes in between belong to nobody but the absence.
-        capture_once(&mut store, &source, &blacklist, 1000, None).expect("window observed");
-        capture_once(&mut store, &source, &blacklist, 1300, Some(1000)).expect("idle detected");
+        capture_once(&mut store, &source, &blacklist, 1000, None, None).expect("window observed");
+        capture_once(&mut store, &source, &blacklist, 1300, Some(1000), None)
+            .expect("idle detected");
         store.close_open(1400).expect("close");
 
         let rows = store.timeline_between(0, 2000, 2000).expect("timeline");
@@ -398,9 +417,10 @@ mod tests {
         ]);
         let blacklist = Blacklist::default();
 
-        capture_once(&mut store, &source, &blacklist, 900, None).expect("window observed");
-        capture_once(&mut store, &source, &blacklist, 1100, None).expect("window gone");
-        capture_once(&mut store, &source, &blacklist, 1300, Some(1000)).expect("idle detected");
+        capture_once(&mut store, &source, &blacklist, 900, None, None).expect("window observed");
+        capture_once(&mut store, &source, &blacklist, 1100, None, None).expect("window gone");
+        capture_once(&mut store, &source, &blacklist, 1300, Some(1000), None)
+            .expect("idle detected");
 
         let rows = store.timeline_between(0, 2000, 2000).expect("timeline");
         for pair in rows.windows(2) {
@@ -416,14 +436,128 @@ mod tests {
     }
 
     #[test]
+    fn a_suspend_is_not_credited_to_whichever_window_held_focus() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        // The same window is still in focus after the resume, which is the ordinary case and
+        // the one that used to be indistinguishable from an hour of work.
+        let source = ScriptedWindowSource::new(vec![
+            Ok(Some(window.clone())),
+            Ok(Some(window.clone())),
+            Ok(Some(window.clone())),
+        ]);
+        let blacklist = Blacklist::default();
+
+        capture_once(&mut store, &source, &blacklist, 1_000, None, None).expect("window observed");
+        capture_once(&mut store, &source, &blacklist, 1_010, None, None).expect("still observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_000,
+            None,
+            Some(PoweredDownGap {
+                started_at: 1_010,
+                ended_at: 5_000,
+            }),
+        )
+        .expect("resume observed");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        assert_eq!(
+            rows,
+            vec![
+                TimelineSegment {
+                    started_at: 1_000,
+                    ended_at: 1_010,
+                    snapshot: window.clone(),
+                },
+                TimelineSegment {
+                    started_at: 1_010,
+                    ended_at: 5_000,
+                    snapshot: ActivitySnapshot::suspended(),
+                },
+                TimelineSegment {
+                    started_at: 5_000,
+                    ended_at: 5_000,
+                    snapshot: window,
+                },
+            ],
+            "the hours the machine was off must be their own segment, and the resume must open \
+             a segment of its own rather than continue the one from before"
+        );
+    }
+
+    #[test]
+    fn a_resume_after_a_long_absence_leaves_no_overlapping_or_backwards_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        let source = ScriptedWindowSource::new(vec![Ok(Some(window))]);
+        let blacklist = Blacklist::default();
+
+        // Input stopped at 1000 and the machine went down at 1010. The input timestamps are
+        // untouched by a suspend, so the first poll after the resume reports an idle stretch
+        // dated hours before the machine came back.
+        capture_once(&mut store, &source, &blacklist, 1_000, None, None).expect("window observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_000,
+            Some(1_000),
+            Some(PoweredDownGap {
+                started_at: 1_010,
+                ended_at: 5_000,
+            }),
+        )
+        .expect("resume observed");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].ended_at <= pair[1].started_at,
+                "segments must not overlap, or the day totals more than it lasted: {rows:?}"
+            );
+        }
+        assert!(
+            rows.iter().all(|row| row.ended_at >= row.started_at),
+            "no segment may end before it starts: {rows:?}"
+        );
+        assert!(
+            rows.iter()
+                .any(|row| row.snapshot == ActivitySnapshot::suspended()),
+            "the powered-down stretch must survive the backdated idle start: {rows:?}"
+        );
+    }
+
+    #[test]
     fn an_idle_poll_is_not_evidence_that_the_desktop_is_reachable() {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
         // An empty script panics if consulted, proving the idle path never reaches the source.
         let source = ScriptedWindowSource::new(Vec::new());
 
-        let observed = capture_once(&mut store, &source, &Blacklist::default(), 1300, Some(1000))
-            .expect("idle is recorded without the desktop");
+        let observed = capture_once(
+            &mut store,
+            &source,
+            &Blacklist::default(),
+            1300,
+            Some(1000),
+            None,
+        )
+        .expect("idle is recorded without the desktop");
 
         assert_eq!(
             observed,
