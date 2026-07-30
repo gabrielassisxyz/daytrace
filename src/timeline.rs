@@ -102,9 +102,13 @@ pub fn render_day(date: NaiveDate, segments: &[TimelineSegment]) -> Result<Strin
         return Ok(format!("No activity events recorded for {date}.\n"));
     }
 
+    // A row needs the end of the reported day to tell a boundary clip from a segment that
+    // genuinely stopped at midnight, and only the day being rendered knows where that is.
+    let (_, day_end) = day_bounds(date)?;
+
     let mut output = format!("Timeline for {date}\n");
     for segment in segments {
-        output.push_str(&format_segment(segment)?);
+        output.push_str(&format_segment(segment, day_end)?);
         output.push('\n');
     }
 
@@ -136,9 +140,9 @@ pub fn unix_now() -> i64 {
     chrono::Utc::now().timestamp()
 }
 
-fn format_segment(segment: &TimelineSegment) -> Result<String, String> {
+fn format_segment(segment: &TimelineSegment, day_end: i64) -> Result<String, String> {
     let started = format_clock(segment.started_at)?;
-    let ended = format_clock(segment.ended_at)?;
+    let ended = format_end_clock(segment.ended_at, day_end)?;
     let duration = format_duration(segment.ended_at.saturating_sub(segment.started_at));
     let label = match segment.snapshot.kind {
         ActivityKind::Window => {
@@ -157,6 +161,20 @@ fn format_segment(segment: &TimelineSegment) -> Result<String, String> {
     Ok(format!(
         "{started}-{ended}  {duration:<6}  {label}{location}"
     ))
+}
+
+/// The end of a segment, where reaching the end of the reported day is said rather than shown.
+///
+/// A segment is clipped to the day it is reported under, and the clip target is the following
+/// day's first instant, which a clock formatter reads as `00:00`. So a segment covering a whole
+/// day claimed `00:00-00:00` while showing 24 hours, and one running past midnight gave no way to
+/// tell which midnight it meant. `24:00` is deliberately not a wall clock reading: it names the
+/// boundary, instead of an instant that belongs to the next day.
+fn format_end_clock(ended_at: i64, day_end: i64) -> Result<String, String> {
+    if ended_at >= day_end {
+        return Ok("24:00".to_string());
+    }
+    format_clock(ended_at)
 }
 
 fn format_clock(timestamp: i64) -> Result<String, String> {
@@ -338,6 +356,52 @@ mod tests {
                 total("Zed", 600)
             ],
             "a tie must be ordered by name and never reshuffle between runs"
+        );
+    }
+
+    #[test]
+    fn a_segment_reaching_the_end_of_the_day_says_so_rather_than_saying_midnight() {
+        let (start, end) = day_bounds(date(2026, 7, 20)).expect("bounds");
+
+        let rendered =
+            render_day(date(2026, 7, 20), &[segment(start, end, "ghostty")]).expect("render");
+
+        assert!(
+            rendered.contains("00:00-24:00"),
+            "a segment covering the whole day must not read as beginning and ending at the same \
+             instant: {rendered}"
+        );
+        assert!(
+            rendered.contains("24h"),
+            "the day it claims and the hours it shows have to agree: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_segment_clipped_at_midnight_says_which_midnight() {
+        let (_, end) = day_bounds(date(2026, 7, 20)).expect("bounds");
+
+        let rendered =
+            render_day(date(2026, 7, 20), &[segment(end - 600, end, "ghostty")]).expect("render");
+
+        assert!(
+            rendered.contains("-24:00"),
+            "a segment running into the following day ends at the end of this one: {rendered}"
+        );
+    }
+
+    /// The counterpart: only the end of the day is ambiguous. A segment that runs in from the
+    /// previous day starts at the day's first instant, and `00:00` is what that instant is.
+    #[test]
+    fn the_start_of_the_day_is_still_the_start_of_the_day() {
+        let (start, _) = day_bounds(date(2026, 7, 20)).expect("bounds");
+
+        let rendered = render_day(date(2026, 7, 20), &[segment(start, start + 600, "ghostty")])
+            .expect("render");
+
+        assert!(
+            rendered.contains("00:00-00:10"),
+            "the first instant of the day is midnight and reads as it: {rendered}"
         );
     }
 
