@@ -6,6 +6,7 @@ mod export;
 mod input;
 mod lock;
 mod service;
+mod session;
 mod storage;
 mod timeline;
 

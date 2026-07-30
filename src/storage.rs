@@ -24,6 +24,54 @@ struct OpenSegment {
 /// segment against itself and every later observation would start a new one.
 const LAST_SEEN_COLUMN: &str = "last_seen_at";
 
+const SEGMENTS_TABLE: &str = "activity_segments";
+
+/// Where the rows live while the table is being rebuilt around a wider `kind` constraint. The
+/// whole rebuild is one transaction, so this name is never visible to another connection.
+const REBUILT_SEGMENTS_TABLE: &str = "activity_segments_rebuilt";
+
+const SEGMENT_COLUMNS: &str = "id, started_at, ended_at, kind, app_class, title, workspace, \
+                               monitor, last_seen_at, created_at";
+
+/// The table as it is written today, for whichever name it is being created under.
+///
+/// One definition shared by the initial creation and by the rebuild that widens `kind`, so the
+/// two cannot drift into two different shapes of the same table.
+fn segments_table_ddl(table: &str) -> String {
+    format!(
+        "CREATE TABLE IF NOT EXISTS {table} (
+            id INTEGER PRIMARY KEY,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER,
+            kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+            app_class TEXT,
+            title TEXT,
+            workspace TEXT,
+            monitor INTEGER,
+            last_seen_at INTEGER,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+        );"
+    )
+}
+
+/// Whether the stored table already accepts a powered-down segment.
+///
+/// Read back from the schema rather than tracked in a version number, so the test for "has this
+/// migration run" cannot disagree with the migration's actual effect.
+fn stored_kinds_include_suspended(conn: &Connection) -> Result<bool, String> {
+    let ddl: Option<String> = conn
+        .query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+            params![SEGMENTS_TABLE],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(|error| format!("failed to read the stored table definition: {error}"))?;
+
+    // A table that does not exist yet will be created in its current shape, so there is
+    // nothing to widen.
+    Ok(ddl.is_none_or(|sql| sql.contains("'suspended'")))
+}
 /// What a prune deleted, and what it could not finish once the deletion had committed.
 ///
 /// The two are reported apart because they fail apart. The rows go in a transaction that either
@@ -73,7 +121,7 @@ impl Store {
         conn.pragma_update(None, "foreign_keys", "ON")
             .map_err(|error| format!("failed to enable foreign keys: {error}"))?;
 
-        let store = Self {
+        let mut store = Self {
             conn,
             db_path,
             secure_data_dir,
@@ -141,13 +189,60 @@ impl Store {
                     params![begins_at, open.id],
                 )
                 .map_err(|error| format!("failed to close segment: {error}"))?;
-                insert_segment(&tx, begins_at, seen_at, snapshot)?;
+                insert_segment(&tx, begins_at, None, seen_at, snapshot)?;
             }
-            None => insert_segment(&tx, begins_at, seen_at, snapshot)?,
+            None => insert_segment(&tx, begins_at, None, seen_at, snapshot)?,
         }
 
         tx.commit()
             .map_err(|error| format!("failed to commit observation: {error}"))?;
+        self.secure_permissions()
+    }
+
+    /// Record a stretch the machine spent powered down.
+    ///
+    /// Stored as a segment of its own rather than left as a hole in the day, because a hole is
+    /// also what a daemon that was never started looks like: only a stored gap can later say
+    /// the absence was a machine switched off rather than somebody sitting still. The segment
+    /// that was open when the machine stopped is closed at the same instant, so the application
+    /// that happened to hold focus does not absorb the whole stretch, and the poll that follows
+    /// opens a fresh segment, which is the marker a resume otherwise has none of.
+    pub fn record_powered_down_gap(
+        &mut self,
+        started_at: i64,
+        ended_at: i64,
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start transaction: {error}"))?;
+
+        // The same floor a backdated observation obeys: a gap may not reach behind time already
+        // accounted for, or it overlaps a segment already written and the day adds up to more
+        // than it lasted. A clock stepped between two polls is what produces such a gap.
+        let begins_at = match last_accounted_instant(&tx)? {
+            Some(floor) => started_at.max(floor),
+            None => started_at,
+        };
+        let ends_at = ended_at.max(begins_at);
+
+        tx.execute(
+            "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE ended_at IS NULL",
+            params![begins_at],
+        )
+        .map_err(|error| {
+            format!("failed to close the segment the machine went down in: {error}")
+        })?;
+        insert_segment(
+            &tx,
+            begins_at,
+            Some(ends_at),
+            ends_at,
+            &ActivitySnapshot::suspended(),
+        )?;
+
+        tx.commit()
+            .map_err(|error| format!("failed to commit the powered-down gap: {error}"))?;
         self.secure_permissions()
     }
 
@@ -261,13 +356,14 @@ impl Store {
     /// A path with no parent, or one that is not valid UTF-8, keeps SQLite's default: this can
     /// only improve on a location it can name.
     fn keep_the_rebuild_scratch_beside_the_database(&self) -> Result<(), String> {
-        let Some(directory) = self.db_path.parent().and_then(Path::to_str) else {
+        let Some(directory) = scratch_directory_beside(&self.db_path) else {
             return Ok(());
         };
-        if directory.is_empty() {
-            return Ok(());
-        }
 
+        // `temp_store_directory` is process-wide rather than per connection, which is why SQLite
+        // deprecated it. Nothing here is harmed by that, since one process prunes one store, but
+        // it does mean the setting cannot be read back to find out what this call asked for: a
+        // second connection anywhere in the process would answer for it.
         self.conn
             .pragma_update(None, "temp_store_directory", directory)
             .map_err(|error| format!("failed to place the rebuild scratch file: {error}"))
@@ -345,30 +441,22 @@ impl Store {
             .map_err(|error| format!("failed to materialize timeline: {error}"))
     }
 
-    fn migrate(&self) -> Result<(), String> {
+    fn migrate(&mut self) -> Result<(), String> {
         self.conn
-            .execute_batch(
-                "
-                CREATE TABLE IF NOT EXISTS activity_segments (
-                    id INTEGER PRIMARY KEY,
-                    started_at INTEGER NOT NULL,
-                    ended_at INTEGER,
-                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
-                    app_class TEXT,
-                    title TEXT,
-                    workspace TEXT,
-                    monitor INTEGER,
-                    last_seen_at INTEGER,
-                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
-                );
-
-                CREATE INDEX IF NOT EXISTS idx_activity_segments_time
-                ON activity_segments(started_at, ended_at);
-                ",
-            )
+            .execute_batch(&segments_table_ddl(SEGMENTS_TABLE))
             .map_err(|error| format!("failed to migrate DB: {error}"))?;
 
-        self.add_last_seen_column_if_missing()
+        self.add_last_seen_column_if_missing()?;
+        // After the column above, because widening the kind check means rebuilding the table
+        // and the rebuild copies every column by name. Before the index below, because the
+        // rebuild drops the indexes that belonged to the old table.
+        self.widen_stored_kinds_if_needed()?;
+        self.conn
+            .execute_batch(
+                "CREATE INDEX IF NOT EXISTS idx_activity_segments_time
+                 ON activity_segments(started_at, ended_at);",
+            )
+            .map_err(|error| format!("failed to create the timeline index: {error}"))
     }
 
     /// A database written before segment progress was tracked has no `last_seen_at`. Adding it
@@ -404,6 +492,62 @@ impl Store {
         }
     }
 
+    /// A database written before powered-down gaps existed constrains `kind` to the three
+    /// values it knew about, and SQLite cannot alter a check constraint in place. Accepting a
+    /// new value therefore means rebuilding the table around a new constraint and copying the
+    /// rows across, which is the documented way to change one.
+    ///
+    /// The rows are copied column by name rather than with `SELECT *`, which is not symmetric: a
+    /// column the copy names and the old table lacks fails the whole migration loudly, while a
+    /// column the old table has and the copy does not name is dropped along with its data and
+    /// says nothing. Only a downgrade produces the second, and this list has to grow with the
+    /// table.
+    ///
+    /// Every command opens the store, so the first one run after an upgrade performs this even
+    /// if it is a reporting command. That is the same reach the column migration above already
+    /// has, and it is a schema change rather than a change to what the day says happened.
+    fn widen_stored_kinds_if_needed(&mut self) -> Result<(), String> {
+        if stored_kinds_include_suspended(&self.conn)? {
+            return Ok(());
+        }
+
+        // IMMEDIATE for the same reason every other write uses it, and it settles the same race
+        // the duplicate-column tolerance above settles: two processes can both read the old
+        // schema, and the one that loses re-reads it inside the transaction, finds the table
+        // already rebuilt, and leaves it alone rather than rebuilding it a second time.
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start the schema transaction: {error}"))?;
+
+        if stored_kinds_include_suspended(&tx)? {
+            return Ok(());
+        }
+
+        // Dropped first, never created only if absent: the scratch table is this migration's
+        // own workspace, so anything sitting at that name is debris and not data. Skipping the
+        // creation because something was already there would copy the rows into a table of
+        // unknown shape, and a single leftover row would collide with the copy on every command
+        // from then on, with nothing in the tool able to clear it.
+        //
+        // No other table refers to the real one, so dropping that cannot orphan a foreign key,
+        // which is the case that would otherwise need the pragma dance around a rebuild.
+        tx.execute_batch(&format!(
+            "DROP TABLE IF EXISTS {REBUILT_SEGMENTS_TABLE};
+             {}
+             INSERT INTO {REBUILT_SEGMENTS_TABLE}
+                 ({SEGMENT_COLUMNS})
+             SELECT {SEGMENT_COLUMNS} FROM {SEGMENTS_TABLE};
+             DROP TABLE {SEGMENTS_TABLE};
+             ALTER TABLE {REBUILT_SEGMENTS_TABLE} RENAME TO {SEGMENTS_TABLE};",
+            segments_table_ddl(REBUILT_SEGMENTS_TABLE)
+        ))
+        .map_err(|error| format!("failed to widen the stored activity kinds: {error}"))?;
+
+        tx.commit()
+            .map_err(|error| format!("failed to commit the widened activity kinds: {error}"))
+    }
+
     fn secure_permissions(&self) -> Result<(), String> {
         secure_sqlite_permissions(&self.db_path, self.secure_data_dir.as_deref())
     }
@@ -436,6 +580,18 @@ fn secure_sqlite_permissions(
     _secure_data_dir: Option<&Path>,
 ) -> Result<(), String> {
     Ok(())
+}
+
+/// The directory the rebuild's scratch copy belongs in, which is the store's own.
+///
+/// Split out from the call that applies it because the pragma that applies it is process-wide and
+/// therefore cannot be read back to see what was asked for. This is the part worth pinning: what
+/// SQLite does with the setting was measured by hand instead.
+fn scratch_directory_beside(db_path: &Path) -> Option<&str> {
+    db_path
+        .parent()
+        .and_then(Path::to_str)
+        .filter(|directory| !directory.is_empty())
 }
 
 fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
@@ -486,18 +642,23 @@ fn last_accounted_instant(conn: &Connection) -> Result<Option<i64>, String> {
     .map_err(|error| format!("failed to read the last accounted instant: {error}"))
 }
 
+/// Insert one segment. `ended_at` is `None` for a segment still in progress, which is what
+/// `ended_at IS NULL` marks everywhere else, and `Some` only for a stretch already over when it
+/// is first learned about.
 fn insert_segment(
     conn: &Connection,
     started_at: i64,
+    ended_at: Option<i64>,
     last_seen_at: i64,
     snapshot: &ActivitySnapshot,
 ) -> Result<(), String> {
     conn.execute(
         "INSERT INTO activity_segments
-            (started_at, last_seen_at, kind, app_class, title, workspace, monitor)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            (started_at, ended_at, last_seen_at, kind, app_class, title, workspace, monitor)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         params![
             started_at,
+            ended_at,
             last_seen_at.max(started_at),
             snapshot.kind.as_str(),
             snapshot.app_class,
@@ -518,7 +679,6 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
-
     #[test]
     fn records_only_changes_as_segments() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1187,31 +1347,27 @@ mod tests {
         );
     }
 
-    #[cfg(unix)]
+    /// The rebuild's scratch copy must not land outside the directory the store is kept private
+    /// in, which is where SQLite would otherwise put it.
+    ///
+    /// This pins the directory the code asks for, not the pragma's value: `temp_store_directory`
+    /// is process-wide, so reading it back answers for whichever connection in the process set it
+    /// last. A test that read it back passed alone and failed once other cases pruned in parallel.
     #[test]
-    fn the_rebuild_scratch_file_stays_beside_the_database() {
+    fn the_rebuild_scratch_file_belongs_beside_the_database() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
-        let mut store = Store::open(&db, None).expect("store");
-        seed_segments(&mut store, 50, "expired-window-title", 0);
 
-        store
-            .prune_segments_ended_before(50_000, 200_000)
-            .expect("prune");
-
-        // The scratch database is unlinked as soon as the rebuild ends, so what can be pinned
-        // here is where SQLite was told to put it. That it honours the setting was measured by
-        // hand: the file appears as `<dir>/etilqs_<random>`, mode 0600, once the store is large
-        // enough to spill out of memory.
-        let told: String = store
-            .conn
-            .pragma_query_value(None, "temp_store_directory", |row| row.get(0))
-            .expect("temp_store_directory");
         assert_eq!(
-            told,
-            dir.path().to_str().expect("a utf-8 path"),
+            super::scratch_directory_beside(&db),
+            dir.path().to_str(),
             "a plaintext copy of the store must not be written outside the directory the store \
              is kept private in"
+        );
+        assert_eq!(
+            super::scratch_directory_beside(Path::new("daytrace.db")),
+            None,
+            "a bare filename has no directory to name, so SQLite's own choice stands"
         );
     }
 
@@ -1296,5 +1452,265 @@ mod tests {
 
         assert_eq!(parent_mode, 0o755);
         assert_eq!(db_mode, 0o600);
+    }
+
+    #[test]
+    fn a_powered_down_gap_ends_the_segment_it_interrupted_and_is_stored_on_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // Focus is held until 1010, when the machine goes down, and comes back at 5000.
+        store
+            .record_observation(100, 1000, &active)
+            .expect("insert");
+        store
+            .record_powered_down_gap(1010, 5000)
+            .expect("record the gap");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        assert_eq!(
+            rows,
+            vec![
+                TimelineSegment {
+                    started_at: 100,
+                    ended_at: 1010,
+                    snapshot: active,
+                },
+                TimelineSegment {
+                    started_at: 1010,
+                    ended_at: 5000,
+                    snapshot: ActivitySnapshot::suspended(),
+                },
+            ],
+            "the application in focus must not absorb the hours the machine was off"
+        );
+    }
+
+    #[test]
+    fn a_powered_down_gap_never_reaches_behind_time_already_accounted_for() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store.record_observation(100, 100, &active).expect("insert");
+        store
+            .record_observation(2_000, 2_000, &ActivitySnapshot::idle())
+            .expect("idle");
+        // A gap dated before the last boundary written, which a clock stepped between two polls
+        // can produce.
+        store
+            .record_powered_down_gap(500, 5_000)
+            .expect("record the gap");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        let stretch = rows
+            .iter()
+            .find(|row| row.snapshot == ActivitySnapshot::suspended())
+            .unwrap_or_else(|| panic!("the gap must still be recorded, clamped: {rows:?}"));
+        assert_eq!(
+            (stretch.started_at, stretch.ended_at),
+            (2_000, 5_000),
+            "the gap keeps its end and begins at the last instant already accounted for, rather \
+             than at the earlier moment it was dated from"
+        );
+        for pair in rows.windows(2) {
+            assert!(
+                pair[0].ended_at <= pair[1].started_at,
+                "segments must not overlap, or the day totals more than it lasted: {rows:?}"
+            );
+        }
+        assert!(
+            rows.iter().all(|row| row.ended_at >= row.started_at),
+            "no segment may end before it starts: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_database_written_before_powered_down_gaps_accepts_one_after_migration() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+
+        // The schema exactly as it shipped when `kind` had three legal values, so its check
+        // constraint rejects a powered-down segment outright.
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (started_at, ended_at, kind, app_class)
+                VALUES (100, 200, 'window', 'ghostty');",
+            )
+            .expect("seed legacy rows");
+        drop(legacy);
+
+        let mut store = Store::open(&db, None).expect("migrate legacy database");
+        store
+            .record_powered_down_gap(1_000, 5_000)
+            .expect("a migrated database must accept a powered-down gap");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        assert_eq!(
+            rows.len(),
+            2,
+            "the rows written before the migration must survive it: {rows:?}"
+        );
+        assert_eq!(rows[0].started_at, 100);
+        assert_eq!(rows[1].snapshot, ActivitySnapshot::suspended());
+    }
+
+    #[test]
+    fn widening_the_stored_kinds_keeps_the_index_the_timeline_query_reads_through() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                CREATE INDEX idx_activity_segments_time
+                ON activity_segments(started_at, ended_at);",
+            )
+            .expect("seed legacy schema");
+        drop(legacy);
+
+        // Rebuilding the table drops the indexes that belonged to it, so the migration has to
+        // put them back or every later report scans the whole history.
+        Store::open(&db, None).expect("migrate legacy database");
+
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let indexes: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master
+                 WHERE type = 'index' AND name = 'idx_activity_segments_time'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count indexes");
+        assert_eq!(indexes, 1, "the time index must survive the rebuild");
+    }
+
+    /// What SQLite bumps on every schema change, which is the only thing that can tell a
+    /// migration that did nothing from one that rebuilt the table and put the rows back.
+    fn schema_version(db: &std::path::Path) -> i64 {
+        rusqlite::Connection::open(db)
+            .expect("connection")
+            .query_row("PRAGMA schema_version", [], |row| row.get(0))
+            .expect("read schema version")
+    }
+
+    #[test]
+    fn migrating_a_database_that_is_already_current_changes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        store
+            .record_powered_down_gap(1_000, 5_000)
+            .expect("record the gap");
+        drop(store);
+        let before = schema_version(&db);
+
+        // Reopening runs every migration step again, which is what every command does.
+        let store = Store::open(&db, None).expect("reopen");
+
+        assert_eq!(
+            schema_version(&db),
+            before,
+            "an up-to-date database must not have its schema touched at all, or every command \
+             rewrites the whole history to reach it"
+        );
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        assert_eq!(
+            rows,
+            vec![TimelineSegment {
+                started_at: 1_000,
+                ended_at: 5_000,
+                snapshot: ActivitySnapshot::suspended(),
+            }],
+            "a migration that has already run must not rebuild anything: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_scratch_table_left_by_an_interrupted_rebuild_does_not_wedge_every_later_command() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        // The scratch table cannot outlive its transaction, so this is the shape of a database
+        // some future change leaves behind rather than one seen in the wild. It is seeded anyway
+        // because the cost of being wrong about that is total: the rebuild would collide with
+        // the leftover row forever, and every command, reporting included, would refuse to run
+        // with nothing in the tool able to clear it.
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (id, started_at, ended_at, kind, app_class)
+                VALUES (1, 100, 200, 'window', 'ghostty');
+                CREATE TABLE activity_segments_rebuilt (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments_rebuilt (id, started_at, kind, app_class)
+                VALUES (1, 900, 'window', 'leftover');",
+            )
+            .expect("seed a leftover scratch table");
+        drop(legacy);
+
+        let mut store = Store::open(&db, None).expect("a leftover scratch table must not wedge");
+        store
+            .record_powered_down_gap(1_000, 5_000)
+            .expect("the migration must have completed");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert_eq!(rows[0].snapshot.app_class, Some("ghostty".to_string()));
+        assert_eq!(rows[1].snapshot, ActivitySnapshot::suspended());
     }
 }

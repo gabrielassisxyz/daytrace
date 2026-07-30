@@ -5,6 +5,7 @@
 - Rust CLI crate exists.
 - `daytrace start`, `daytrace today`, and `daytrace export` define the initial command surface.
 - `daytrace start` records Hyprland active-window segments and AFK segments.
+- A stretch the machine spent suspended is stored as its own kind of segment, so a powered-down gap is not reported as time spent away from a running machine.
 - Activity segments are stored locally in SQLite.
 - `daytrace today` prints a chronological daily timeline with durations, followed by per-application totals.
 - `daytrace today --date` and `daytrace export --date` report and export any past local day.
@@ -22,6 +23,7 @@
 - Add a documented deletion command for local logs.
 - Add configuration file support if environment variables become insufficient.
 - Add focused integration coverage around Hyprland command failures.
+- Settle how screen lock and unlock are observed. Neither the compositor nor the logind locked hint reports them on a Hyprland session whose locker never publishes that hint, so the remaining source is a session-manager subscription and the dependency it costs.
 - Make browser private/incognito detection reliable through the browser extension milestone.
 
 ## Later Milestones

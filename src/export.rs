@@ -171,6 +171,21 @@ mod tests {
     }
 
     #[test]
+    fn a_powered_down_stretch_leaves_the_machine_as_its_own_kind() {
+        let value = exported(&[TimelineSegment {
+            started_at: 1_784_000_000,
+            ended_at: 1_784_003_600,
+            snapshot: ActivitySnapshot::suspended(),
+        }]);
+
+        assert_eq!(
+            value["segments"][0]["kind"], "suspended",
+            "a consumer of the export has to be able to tell a machine that was off from one \
+             nobody was using"
+        );
+    }
+
+    #[test]
     fn a_day_with_nothing_stored_exports_an_empty_list_rather_than_failing() {
         let value = exported(&[]);
 
