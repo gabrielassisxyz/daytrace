@@ -24,6 +24,10 @@ fn hold_capture_claim(db_path: &Path) -> File {
         .read(true)
         .write(true)
         .create(true)
+        // Stated rather than left to the default, because not truncating is the whole point on
+        // the real path: the claim is opened before the lock can be tested, so a truncating open
+        // would erase a live holder's pid on the way to being refused.
+        .truncate(false)
         .open(&path)
         .expect("open the capture claim");
     file.try_lock().expect("hold the capture claim");

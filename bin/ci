@@ -18,8 +18,12 @@ fi
 echo "==> format check"
 cargo fmt --check || fail=1
 
+# --all-targets, because without it clippy checks only the library and binaries and never
+# looks at a test target. Tests are where this project puts most of its reasoning, and the
+# gate was silently exempting all of it: an unused import and a dead fixture constant both
+# went green here while warning on every local `cargo test`.
 echo "==> lint"
-cargo clippy -- -D warnings || fail=1
+cargo clippy --all-targets -- -D warnings || fail=1
 
 echo "==> test"
 cargo test || fail=1
