@@ -37,7 +37,8 @@ One capture process runs per database. A second `daytrace start` is refused and 
 Timeline for 2026-07-20
 09:10-09:34  24m     ghostty - tmux
 09:34-09:51  17m     firefox - [browser title redacted]
-09:51-10:07  16m     AFK
+09:51-09:52  12s     ghostty - tmux
+09:52-10:08  16m     AFK
 23:40-24:00  20m     ghostty - tmux
 
 Time per application
@@ -46,7 +47,9 @@ Time per application
    16m  AFK
 ```
 
-Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute even where each individual row rounds to `0m`. Absence is totalled as `AFK`, apart from any application.
+A span shorter than a minute reports the seconds it lasted. Rounding it to the nearest minute called it `0m`, and with one-second polling a stretch of rapid window switching became a column of identical zeroes crowding out the blocks that held the day. A segment that lasted no time at all reads as `0s`, which says what happened instead of looking like a duration lost to rounding: a focus change with no input during an idle wait closes the displaced window at the instant it opened, and startup recovery does the same to a segment the daemon only ever observed once, which is the last application focused before it died.
+
+Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute rather than inheriting each row's rounding. Absence is totalled as `AFK`, apart from any application.
 
 `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
 

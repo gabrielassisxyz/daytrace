@@ -98,13 +98,13 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
 }
 
 pub fn render_day(date: NaiveDate, segments: &[TimelineSegment]) -> Result<String, String> {
-    if segments.is_empty() {
-        return Ok(format!("No activity events recorded for {date}.\n"));
-    }
-
     // A row needs the end of the reported day to tell a boundary clip from a segment that
     // genuinely stopped at midnight, and only the day being rendered knows where that is.
     let (_, day_end) = day_bounds(date)?;
+
+    if segments.is_empty() {
+        return Ok(format!("No activity events recorded for {date}.\n"));
+    }
 
     let mut output = format!("Timeline for {date}\n");
     for segment in segments {
@@ -187,7 +187,16 @@ fn format_clock(timestamp: i64) -> Result<String, String> {
 }
 
 fn format_duration(seconds: i64) -> String {
-    let minutes = (seconds.max(0) + 30) / 60;
+    let seconds = seconds.max(0);
+    // Rounding to the nearest minute reports everything under half a minute as no time at all,
+    // and one-second polling produces plenty of those: a stretch of rapid window switching became
+    // a column of identical zeroes crowding out the blocks that held the day. Seconds are shown
+    // only below a minute, where minutes have nothing left to say.
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+
+    let minutes = (seconds + 30) / 60;
     if minutes < 60 {
         return format!("{minutes}m");
     }
@@ -402,6 +411,78 @@ mod tests {
         assert!(
             rendered.contains("00:00-00:10"),
             "the first instant of the day is midnight and reads as it: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_visit_shorter_than_a_minute_reports_the_seconds_it_lasted() {
+        let rendered = render_day(date(2026, 7, 20), &[segment(0, 12, "ghostty")]).expect("render");
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("ghostty - "))
+            .expect("the visit is reported");
+
+        assert!(
+            row.contains("12s"),
+            "twelve seconds in a window is twelve seconds, not nothing: {row}"
+        );
+        assert!(
+            !row.contains("0m"),
+            "rounding a short visit to zero minutes hides it among the blocks that carry real \
+             time: {row}"
+        );
+    }
+
+    /// A segment can genuinely last no time, and more than one thing produces that.
+    ///
+    /// A focus change with no input during an idle wait closes the displaced window at the very
+    /// instant it opened. Startup recovery does the same to a segment the daemon only ever
+    /// observed once, and that one is the last application focused before the daemon died, which
+    /// is exactly what someone reconstructing a crash is looking for. Nothing in a stored row
+    /// says which of the two it was, so a report that hid them would be hiding the second to
+    /// tidy away the first. `0s` says what happened without pretending it was rounded.
+    #[test]
+    fn a_segment_that_lasted_no_time_says_so_rather_than_disappearing() {
+        let rendered = render_day(
+            date(2026, 7, 20),
+            &[
+                segment(0, 600, "ghostty"),
+                segment(600, 600, "displaced"),
+                segment(600, 1200, "firefox"),
+            ],
+        )
+        .expect("render");
+
+        // The row itself, not the whole report: `10m` contains `0m`, so a search over the
+        // rendered day would find the neighbouring blocks and pass for the wrong reason.
+        let row = rendered
+            .lines()
+            .find(|line| line.contains("displaced"))
+            .expect("a segment that lasted no time is still something that was recorded");
+
+        assert!(
+            row.contains("0s"),
+            "no time at all reads as no seconds, not as no minutes: {row}"
+        );
+        assert!(
+            !row.contains("0m"),
+            "`0m` reads as a duration lost to rounding, which is a different thing: {row}"
+        );
+    }
+
+    /// The report and the export must agree on whether a day happened at all.
+    ///
+    /// Filtering the rows made a day whose every segment lasted no time claim that nothing was
+    /// recorded, while `daytrace export` listed those same segments. Both halves now describe
+    /// the same stored rows.
+    #[test]
+    fn a_day_holding_only_zero_length_segments_does_not_claim_to_be_empty() {
+        let rendered = render_day(date(2026, 7, 20), &[segment(600, 600, "last-before-crash")])
+            .expect("render");
+
+        assert!(
+            rendered.contains("last-before-crash"),
+            "a recorded segment must not be reported as nothing having been recorded: {rendered}"
         );
     }
 
