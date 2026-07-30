@@ -9,6 +9,8 @@ publish = false
 chrono = "0.4.45"
 ctrlc = { version = "3.5.2", features = ["termination"] }
 evdev = "0.13.2"
+# Only for O_NOFOLLOW when the capture lock is opened; already in the tree via evdev.
+libc = "0.2.189"
 regex = "1.13.1"
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

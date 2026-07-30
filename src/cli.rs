@@ -3,6 +3,7 @@ use crate::config::{Blacklist, Config};
 use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::export::render_day_export;
 use crate::input::InputActivity;
+use crate::lock::CaptureLock;
 use crate::service::render_user_unit;
 use crate::storage::Store;
 use crate::timeline::{day_bounds, local_date, render_day, unix_now};
@@ -127,6 +128,12 @@ fn parse_day(value: &str) -> Result<NaiveDate, String> {
 }
 
 fn run_daemon(config: Config) -> Result<(), String> {
+    // Claimed before anything else, and in particular before the input devices are opened: a
+    // duplicate must not acquire that capability on its way to being refused, and refusing it
+    // here means the message says what is wrong rather than whatever the second setup step
+    // happens to complain about first.
+    let _capture = CaptureLock::acquire(&config.db_path)?;
+
     let running = Arc::new(AtomicBool::new(true));
     let running_for_signal = Arc::clone(&running);
     ctrlc::set_handler(move || running_for_signal.store(false, Ordering::Relaxed))

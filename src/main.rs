@@ -4,6 +4,7 @@ mod config;
 mod desktop;
 mod export;
 mod input;
+mod lock;
 mod service;
 mod storage;
 mod timeline;

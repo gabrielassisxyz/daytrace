@@ -29,6 +29,8 @@ daytrace today --date 2026-07-20
 
 AFK tracking requires read access to at least one `/dev/input/event*` device. If no readable input devices are available, `daytrace start` exits instead of recording misleading activity.
 
+One capture process runs per database. A second `daytrace start` is refused and names the process already running, rather than doubling capture: each process reads its own configuration, so a blacklist set in one shell is invisible to the other, and the process without it would record what the other one exists to skip. The claim is a lock on `daytrace.db.lock`, held beside the database for as long as the daemon runs and released by the kernel when it exits, so an unclean shutdown leaves nothing to clean up. Two daemons on different databases are not duplicates and both run.
+
 `daytrace today` prints the chronological timeline with segment durations, then totals the day by application, so the report answers both what happened in order and what consumed the day:
 
 ```text
@@ -94,6 +96,8 @@ exec-once = systemctl --user start daytrace.service
 ```
 
 Sustained capture failure ends the daemon on purpose, so that a permanently broken setup cannot look like a working one. The unit allows five starts per hour, so four automatic restarts follow the one the session performs. That recovers a compositor which comes back, without hiding a fault that keeps recurring: once the budget is spent the unit stays in `failed` state, where `systemctl --user status` reports it. The budget counts every start, manual ones included, so `systemctl --user reset-failed daytrace.service` is what clears it once a fault is fixed.
+
+A daemon started by hand is what the unit then collides with. The unit is refused while that process holds the claim, and the refusal spends a start from the same budget, so a manual daemon left running across a login ends with the unit in `failed`. That is the intended outcome: capture is happening, from a process with whatever configuration that shell had, and the state a human has to look at should say so rather than hide it. Stop the manual daemon, then `systemctl --user reset-failed daytrace.service`.
 
 Configuration goes in a drop-in rather than an edit of the generated unit, so re-running the command does not discard it:
 
