@@ -203,6 +203,127 @@ fn an_export_answers_for_the_requested_day() {
 }
 
 #[test]
+fn a_segment_covering_a_whole_day_does_not_begin_and_end_at_the_same_time() {
+    // 2026-07-20 and 2026-07-21 local midnight, in a zone with a fixed offset.
+    const MONDAY: i64 = 1_784_516_400;
+    const TUESDAY: i64 = 1_784_602_800;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = seeded_database(
+        directory.path(),
+        &[StoredSegment {
+            started_at: MONDAY,
+            ended_at: Some(TUESDAY),
+            last_seen_at: TUESDAY,
+            app_class: "all-day-app",
+        }],
+    );
+
+    let monday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2026-07-20"],
+    );
+
+    assert!(
+        monday.contains("00:00-24:00"),
+        "a segment holding the whole day cannot read as starting and ending at once: {monday}"
+    );
+    assert!(
+        monday.contains("24h"),
+        "the span shown and the hours claimed have to agree: {monday}"
+    );
+}
+
+/// The one case where naming the boundary and formatting the instant genuinely disagree.
+///
+/// Santiago moves the clock forward at midnight on 2038-09-05, so that local midnight never
+/// happens and the end of 2038-09-04 is the instant a clock reads as 01:00 the next day.
+/// Formatting the clip target therefore reports the end of Friday as `01:00`, which belongs to
+/// Saturday. In any zone without that transition both implementations print the same thing, which
+/// is exactly why this has to run against the built binary with a zone in its environment.
+#[test]
+fn the_end_of_a_day_whose_midnight_never_happened_is_still_the_end_of_that_day() {
+    // The end of 2038-09-04 in Santiago, 24 hours after that day's local midnight, and the
+    // instant a clock there reads as 01:00 on the 5th.
+    const FRIDAY_END: i64 = 2_167_272_000;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = seeded_database(
+        directory.path(),
+        &[StoredSegment {
+            started_at: FRIDAY_END - 600,
+            ended_at: Some(FRIDAY_END + 3600),
+            last_seen_at: FRIDAY_END + 3600,
+            app_class: "crossing-app",
+        }],
+    );
+
+    let friday = run_in_zone(
+        &db_path,
+        "America/Santiago",
+        &["today", "--date", "2038-09-04"],
+    );
+
+    assert!(
+        friday.contains("-24:00"),
+        "a segment clipped to the end of the day says so: {friday}"
+    );
+    // The whole row, not a fragment of it: asserting the span and the duration together is what
+    // pins the boundary to the right instant, and it fails loudly if tzdata lacks the 2038 rule.
+    assert!(
+        friday.contains("23:50-24:00  10m"),
+        "the ten minutes before the day's end belong to that day and end at it: {friday}"
+    );
+    assert!(
+        !friday.contains("-01:00"),
+        "the end of Friday must not be reported as an hour that belongs to Saturday: {friday}"
+    );
+}
+
+/// The mirror of the case above, and the one that had no test at all.
+///
+/// Sao_Paulo moved the clock back *at midnight* until 2019: at 2018-02-18 00:00 the clock returned
+/// to 23:00 on the 17th, so the 17th is 25 hours long and its 23:00 hour happens twice. Naming the
+/// start of the 18th by the earlier of the two candidate instants picked one whose local reading is
+/// still 23:00 on the 17th, which put the boundary an hour inside the day it was supposed to close:
+/// the 17th reported 24 hours of a 25 hour day, and its final hour was filed under the 18th.
+#[test]
+fn a_day_whose_clock_moves_back_at_midnight_keeps_its_last_hour() {
+    // 2018-02-17 00:00 in Sao_Paulo, and the true start of the 18th, 25 hours later.
+    const SATURDAY: i64 = 1_518_832_800;
+    const SUNDAY: i64 = 1_518_922_800;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = seeded_database(
+        directory.path(),
+        &[StoredSegment {
+            started_at: SATURDAY,
+            ended_at: Some(SUNDAY),
+            last_seen_at: SUNDAY,
+            app_class: "all-day-app",
+        }],
+    );
+
+    let saturday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2018-02-17"],
+    );
+    let sunday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2018-02-18"],
+    );
+
+    assert!(
+        saturday.contains("00:00-24:00  25h"),
+        "a day the clock lengthens to 25 hours has to report all of them: {saturday}"
+    );
+    assert!(
+        !sunday.contains("all-day-app"),
+        "the last hour of Saturday must not be reported as Sunday's: {sunday}"
+    );
+}
+
+#[test]
 fn a_day_left_open_by_a_crash_does_not_spill_into_later_days() {
     // 2026-07-20 09:00, observed until 09:05 and never closed.
     const MONDAY_MORNING: i64 = 1_784_557_200;
