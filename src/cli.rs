@@ -289,7 +289,7 @@ mod tests {
     use super::{
         FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, requested_day, run,
     };
-    use crate::activity::{ActivitySnapshot, TimelineSegment};
+    use crate::activity::ActivitySnapshot;
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
     use crate::storage::Store;
