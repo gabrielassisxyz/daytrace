@@ -15,6 +15,31 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
+# Build somewhere no other checkout of this package can reach.
+#
+# WHY: where cargo's `build.target-dir` points every checkout at one directory, two worktrees of
+# this package write the same artifact paths and the fingerprints do not tell them apart. The gate
+# then judges the units fresh from another branch's build and passes without compiling the current
+# sources: new tests never appear in the output, and `CARGO_BIN_EXE_daytrace` starts a binary from
+# another branch, so a whole-binary case exercises code that is not under test. That has already
+# produced a green run for code that was never built, and a conclusion that the default branch was
+# failing when it was not.
+#
+# WHY under /tmp rather than beside the crate: a target directory per worktree was deliberately
+# configured away, because one project across many worktrees wrote tens of gigabytes of build
+# artifacts to a DRAM-less SSD through btrfs and dm-crypt and stalled the desktop for seconds at a
+# time. On tmpfs those writes never reach the disk, so the gate stops lying without reintroducing
+# what the shared directory exists to prevent. Measured for this crate: 268 MB and a little over
+# eight seconds from cold, against a machine with tens of gigabytes free.
+#
+# The path is derived from the checkout, so repeated runs in one worktree reuse their build, and
+# an explicit CARGO_TARGET_DIR still wins for anyone who wants a different arrangement.
+if [ -z "${CARGO_TARGET_DIR:-}" ]; then
+    CARGO_TARGET_DIR="${TMPDIR:-/tmp}/cargo-target/$(basename "$PWD")"
+    export CARGO_TARGET_DIR
+fi
+echo "==> building in $CARGO_TARGET_DIR"
+
 echo "==> format check"
 cargo fmt --check || fail=1
 
