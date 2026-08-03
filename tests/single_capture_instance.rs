@@ -58,6 +58,14 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
         "a second daemon on a database already being captured must not start: {stderr}"
     );
     assert!(
+        output.status.code() == Some(1),
+        "a duplicate-capture refusal is a runtime failure, so it must exit 1, not 2: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Usage:"),
+        "a runtime failure must not print the usage block: {stderr}"
+    );
+    assert!(
         stderr.contains("already running"),
         "the refusal has to say capture is already running: {stderr}"
     );
@@ -73,6 +81,38 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
         !stderr.contains("/dev/input"),
         "the claim must be tested before the input devices are opened, or a duplicate acquires \
          that capability just to be refused afterwards: {stderr}"
+    );
+}
+
+#[test]
+fn a_configuration_failure_prints_only_the_error_and_exits_one() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = directory.path().join("daytrace.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
+        .arg("today")
+        .env("DAYTRACE_DB_PATH", &db_path)
+        .env("DAYTRACE_IDLE_AFTER_SECONDS", "abc")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daytrace today");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a configuration failure must fail: {stderr}"
+    );
+    assert!(
+        output.status.code() == Some(1),
+        "a configuration failure is a runtime failure, so it must exit 1: {stderr}"
+    );
+    assert!(
+        !stderr.contains("Usage:"),
+        "a runtime failure must not print the usage block: {stderr}"
+    );
+    assert!(
+        stderr.contains("DAYTRACE_IDLE_AFTER_SECONDS"),
+        "the error has to name the offending setting: {stderr}"
     );
 }
 

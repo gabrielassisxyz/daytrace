@@ -10,11 +10,18 @@ use crate::storage::{Pruned, Store};
 use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
 use std::env;
+use std::fmt;
 use std::process::ExitCode;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
+
+/// Exit code returned for a bad invocation: unknown command, mistyped flag, invalid date.
+const EXIT_USAGE: u8 = 2;
+
+/// Exit code returned when a valid invocation fails while running.
+const EXIT_RUNTIME_FAILURE: u8 = 1;
 
 const USAGE: &str = "\
 daytrace
@@ -44,22 +51,51 @@ Environment:
   DAYTRACE_BLACKLIST_DOMAINS       Comma-separated URL/domain substrings to skip.
 ";
 
+/// The two ways dispatch can fail.
+///
+/// A usage error is a bad invocation: the user asked for something the binary does not
+/// understand, so the refusal prints the usage block. A runtime failure is a valid
+/// invocation that could not complete, and the failure message alone is printed.
+#[derive(Debug, Eq, PartialEq)]
+enum AppError {
+    Usage(String),
+    Runtime(String),
+}
+
+impl fmt::Display for AppError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            AppError::Usage(message) | AppError::Runtime(message) => formatter.write_str(message),
+        }
+    }
+}
+
+impl From<String> for AppError {
+    fn from(error: String) -> Self {
+        AppError::Runtime(error)
+    }
+}
+
 pub fn main_exit() -> ExitCode {
     match run(env::args().skip(1)) {
         Ok(output) => {
             print!("{output}");
             ExitCode::SUCCESS
         }
-        Err(error) => {
+        Err(AppError::Usage(error)) => {
             eprintln!("{error}");
             eprintln!();
             eprint!("{USAGE}");
-            ExitCode::from(2)
+            ExitCode::from(EXIT_USAGE)
+        }
+        Err(AppError::Runtime(error)) => {
+            eprintln!("{error}");
+            ExitCode::from(EXIT_RUNTIME_FAILURE)
         }
     }
 }
 
-fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
+fn run(args: impl IntoIterator<Item = String>) -> Result<String, AppError> {
     let args = args.into_iter().collect::<Vec<_>>();
     match args.as_slice() {
         [] => Ok(USAGE.to_string()),
@@ -74,20 +110,25 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, String> {
         [arg, rest @ ..] if arg == "today" => {
             let requested = requested_day(rest)?;
             let (date, segments) = stored_day(&Config::from_env()?, requested)?;
-            render_day(date, &segments)
+            render_day(date, &segments).map_err(AppError::from)
         }
         [arg, rest @ ..] if arg == "export" => {
             let requested = requested_day(rest)?;
             let (date, segments) = stored_day(&Config::from_env()?, requested)?;
-            render_day_export(date, &segments)
+            render_day_export(date, &segments).map_err(AppError::from)
         }
         [arg, rest @ ..] if arg == "prune" => {
             let dry_run = prune_is_dry_run(rest)?;
-            prune_old_activity(&Config::from_env()?, dry_run)
+            prune_old_activity(&Config::from_env()?, dry_run).map_err(AppError::from)
         }
-        [first, second] if first == "service" && second == "unit" => render_service_unit(),
-        [unknown] => Err(format!("unknown command: {unknown}")),
-        _ => Err(format!("unknown command: {}", args.join(" "))),
+        [first, second] if first == "service" && second == "unit" => {
+            render_service_unit().map_err(AppError::from)
+        }
+        [unknown] => Err(AppError::Usage(format!("unknown command: {unknown}"))),
+        _ => Err(AppError::Usage(format!(
+            "unknown command: {}",
+            args.join(" ")
+        ))),
     }
 }
 
@@ -105,28 +146,34 @@ fn render_service_unit() -> Result<String, String> {
 /// Hand-rolled rather than delegated to an argument parser: the surface is one flag, and
 /// what an argument parser would add here is a dependency, not an explanation of what a
 /// rejected date should have looked like.
-fn requested_day(args: &[String]) -> Result<Option<NaiveDate>, String> {
+fn requested_day(args: &[String]) -> Result<Option<NaiveDate>, AppError> {
     match args {
         [] => Ok(None),
         [flag, value] if flag == "--date" => parse_day(value).map(Some),
-        [single] if single == "--date" => {
-            Err("--date needs a day, as --date YYYY-MM-DD".to_string())
-        }
+        [single] if single == "--date" => Err(AppError::Usage(
+            "--date needs a day, as --date YYYY-MM-DD".to_string(),
+        )),
         [single] => match single.strip_prefix("--date=") {
             Some(value) => parse_day(value).map(Some),
-            None => Err(format!("unexpected argument: {single}")),
+            None => Err(AppError::Usage(format!("unexpected argument: {single}"))),
         },
-        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+        _ => Err(AppError::Usage(format!(
+            "unexpected arguments: {}",
+            args.join(" ")
+        ))),
     }
 }
 
 /// Whether `prune` should only report what the window would remove.
-fn prune_is_dry_run(args: &[String]) -> Result<bool, String> {
+fn prune_is_dry_run(args: &[String]) -> Result<bool, AppError> {
     match args {
         [] => Ok(false),
         [flag] if flag == "--dry-run" => Ok(true),
-        [single] => Err(format!("unexpected argument: {single}")),
-        _ => Err(format!("unexpected arguments: {}", args.join(" "))),
+        [single] => Err(AppError::Usage(format!("unexpected argument: {single}"))),
+        _ => Err(AppError::Usage(format!(
+            "unexpected arguments: {}",
+            args.join(" ")
+        ))),
     }
 }
 
@@ -135,14 +182,16 @@ fn prune_is_dry_run(args: &[String]) -> Result<bool, String> {
 /// Date parsing accepts an unpadded field, which turns two plausible typos into a report for
 /// a day nobody asked for: `26-07-20` reads as the year 26, and the report is then headed with
 /// a date the reader has to notice is wrong.
-fn parse_day(value: &str) -> Result<NaiveDate, String> {
+fn parse_day(value: &str) -> Result<NaiveDate, AppError> {
     const EXPECTED_LENGTH: usize = "YYYY-MM-DD".len();
 
     if value.len() != EXPECTED_LENGTH {
-        return Err(format!("invalid date: {value}, expected YYYY-MM-DD"));
+        return Err(AppError::Usage(format!(
+            "invalid date: {value}, expected YYYY-MM-DD"
+        )));
     }
     NaiveDate::parse_from_str(value, "%Y-%m-%d")
-        .map_err(|_| format!("invalid date: {value}, expected YYYY-MM-DD"))
+        .map_err(|_| AppError::Usage(format!("invalid date: {value}, expected YYYY-MM-DD")))
 }
 
 fn run_daemon(config: Config) -> Result<(), String> {
@@ -395,8 +444,8 @@ fn segments(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once, prune_is_dry_run,
-        render_preview, render_prune, requested_day, run,
+        AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once,
+        prune_is_dry_run, render_preview, render_prune, requested_day, run,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
@@ -742,7 +791,9 @@ mod tests {
             vec!["--date".to_string(), "2026-7-2".to_string()],
             vec!["--date".to_string(), "26-07-20".to_string()],
         ] {
-            let error = requested_day(&argument).expect_err("should be rejected");
+            let error = requested_day(&argument)
+                .expect_err("should be rejected")
+                .to_string();
             assert!(
                 error.contains("YYYY-MM-DD"),
                 "{argument:?} was rejected without saying what was expected: {error}"
@@ -752,7 +803,9 @@ mod tests {
 
     #[test]
     fn an_argument_that_is_not_a_date_flag_is_named_in_the_error() {
-        let error = requested_day(&["yesterday".to_string()]).expect_err("should be rejected");
+        let error = requested_day(&["yesterday".to_string()])
+            .expect_err("should be rejected")
+            .to_string();
         assert_eq!(error, "unexpected argument: yesterday");
     }
 
@@ -774,7 +827,9 @@ mod tests {
             vec!["--dry-run=yes".to_string()],
             vec!["--older-than".to_string(), "7".to_string()],
         ] {
-            let error = prune_is_dry_run(&argument).expect_err("should be rejected");
+            let error = prune_is_dry_run(&argument)
+                .expect_err("should be rejected")
+                .to_string();
             assert!(
                 error.starts_with("unexpected argument"),
                 "{argument:?} was not named in its own rejection: {error}"
@@ -829,6 +884,9 @@ mod tests {
     #[test]
     fn rejects_unknown_commands() {
         let error = run(["capture".to_string()]).expect_err("unknown command should fail");
-        assert_eq!(error, "unknown command: capture");
+        assert_eq!(
+            error,
+            AppError::Usage("unknown command: capture".to_string())
+        );
     }
 }
