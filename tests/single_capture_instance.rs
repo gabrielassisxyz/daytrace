@@ -104,6 +104,14 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
             "a runtime failure must not leak any line of the usage block ({line:?}): {stderr}"
         );
     }
+    // Stderr alone does not settle it. The usage block reaches stdout on the path that prints
+    // help, since that path returns it as a successful result, so a runtime failure that printed
+    // it would leak it there rather than into the stream asserted above.
+    assert!(
+        output.stdout.is_empty(),
+        "a runtime failure must write nothing to stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
+    );
     // Worth stating what this last one is worth: it discriminates the two orderings only where
     // `InputActivity::start` fails, which is a machine with no readable input device. On a
     // desktop that has one, opening the devices succeeds silently and the refusal reads the same
@@ -142,6 +150,11 @@ fn a_configuration_failure_prints_only_the_error_and_exits_one() {
     assert_eq!(
         stderr, "DAYTRACE_IDLE_AFTER_SECONDS must be an integer number of seconds\n",
         "a runtime failure must print exactly the offending setting and nothing else"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a runtime failure must write nothing to stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
