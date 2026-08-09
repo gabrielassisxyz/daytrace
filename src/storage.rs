@@ -254,10 +254,13 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to start transaction: {error}"))?;
 
-        // The same floor a backdated observation obeys: a gap may not reach behind time already
-        // accounted for, or it overlaps a segment already written and the day adds up to more
-        // than it lasted. A clock stepped between two polls is what produces such a gap.
-        let begins_at = match last_accounted_instant(&tx)? {
+        // A gap may not reach behind time already accounted for, or it overlaps a segment
+        // already written and the day adds up to more than it lasted. A clock stepped between
+        // two polls is what produces such a gap. Unlike a backdated observation, a gap is an
+        // absence learned about after it ended, so the floor is the open segment's latest
+        // progress marker: the daemon demonstrably polled the machine then, and that time is
+        // not part of any absence.
+        let begins_at = match last_accounted_instant_for_gap(&tx)? {
             Some(floor) => started_at.max(floor),
             None => started_at,
         };
@@ -700,6 +703,21 @@ fn last_accounted_instant(conn: &Connection) -> Result<Option<i64>, String> {
         |row| row.get::<_, Option<i64>>(0),
     )
     .map_err(|error| format!("failed to read the last accounted instant: {error}"))
+}
+
+/// The latest instant a powered-down gap may be backdated to, or `None` on an empty store.
+///
+/// Unlike a backdated observation, a gap is an absence the daemon only learned about after it
+/// ended, so an open segment's progress marker is already time the daemon demonstrably observed.
+/// Flooring a gap at the marker would credit that time to an absence it is not part of, so the
+/// floor is the open segment's progress (`last_seen_at`) rather than its start.
+fn last_accounted_instant_for_gap(conn: &Connection) -> Result<Option<i64>, String> {
+    conn.query_row(
+        "SELECT MAX(COALESCE(ended_at, last_seen_at, started_at)) FROM activity_segments",
+        [],
+        |row| row.get::<_, Option<i64>>(0),
+    )
+    .map_err(|error| format!("failed to read the last accounted instant for a gap: {error}"))
 }
 
 /// Insert one segment. `ended_at` is `None` for a segment still in progress, which is what
@@ -1738,6 +1756,192 @@ mod tests {
         assert!(
             rows.iter().all(|row| row.ended_at >= row.started_at),
             "no segment may end before it starts: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_backdated_idle_start_still_displaces_the_time_it_was_dated_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store.record_observation(100, 100, &active).expect("insert");
+        for seen_at in [200, 300, 440] {
+            store
+                .record_observation(seen_at, seen_at, &active)
+                .expect("heartbeat");
+        }
+
+        // Idle is dated from the last input, so it reaches back over polls the daemon did make.
+        // That displacement is the point here and the opposite of what a gap wants: nothing was
+        // observed during an idle stretch, while a gap covers time the machine was not running at
+        // all and the marker proves it was. The two floors must stay apart, and this is the side
+        // that breaks if they are merged.
+        store
+            .record_observation(200, 500, &ActivitySnapshot::idle())
+            .expect("backdated idle");
+
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let window_ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'window'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the displaced segment back");
+        let idle_started_at: i64 = conn
+            .query_row(
+                "SELECT started_at FROM activity_segments WHERE kind = 'idle'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the idle segment back");
+
+        assert_eq!(
+            window_ended_at, 200,
+            "a backdated idle start floors at the open segment's start, so it still displaces \
+             the polls it was dated behind"
+        );
+        assert_eq!(
+            idle_started_at, 200,
+            "the idle segment opens where it was dated, not at the progress marker"
+        );
+    }
+
+    #[test]
+    fn a_powered_down_gap_floors_at_the_open_segments_progress_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // The daemon sees a window at t=100, then heartbeats on it through t=440, so the
+        // segment's progress marker records the full 340 seconds it demonstrably polled.
+        store.record_observation(100, 100, &active).expect("insert");
+        for seen_at in [200, 300, 440] {
+            store
+                .record_observation(seen_at, seen_at, &active)
+                .expect("heartbeat");
+        }
+
+        // A gap dated back to the open segment's start. With the old floor the open segment
+        // closed at t=100 and the whole polled stretch was reassigned to the absence.
+        store
+            .record_powered_down_gap(100, 5_000)
+            .expect("record the gap");
+
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let (open_started_at, open_ended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at FROM activity_segments WHERE kind = 'window'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the open segment back");
+        let (gap_started_at, gap_ended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at FROM activity_segments WHERE kind = 'suspended'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the gap back");
+        assert_eq!(
+            (open_started_at, open_ended_at),
+            (100, 440),
+            "the open segment must close at its progress marker, not at its start"
+        );
+        assert_eq!(
+            (gap_started_at, gap_ended_at),
+            (440, 5_000),
+            "the gap must begin where the segment's progress left off"
+        );
+    }
+
+    #[test]
+    fn a_powered_down_gap_dated_behind_a_backdated_idle_still_floors_at_the_idle_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store.record_observation(100, 100, &active).expect("insert");
+        // Idle is the case where displacing the open segment is the whole point, so the floor
+        // deliberately remains the open segment's start.
+        store
+            .record_observation(2_000, 2_000, &ActivitySnapshot::idle())
+            .expect("idle");
+
+        // A gap dated before the idle segment, which a large clock step could produce. The
+        // floor is now the idle segment's start, so the gap must not reach behind it.
+        store
+            .record_powered_down_gap(500, 5_000)
+            .expect("record the gap");
+
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let (gap_started_at, gap_ended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at FROM activity_segments WHERE kind = 'suspended'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the gap back");
+        assert_eq!(
+            (gap_started_at, gap_ended_at),
+            (2_000, 5_000),
+            "a gap dated behind a backdated idle segment still floors at the idle start"
+        );
+    }
+
+    #[test]
+    fn a_powered_down_gap_dated_before_the_open_segment_start_still_floors_at_that_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store
+            .record_observation(1_000, 1_000, &active)
+            .expect("insert");
+
+        // A gap offered entirely before the open segment's own start. The marker floor cannot
+        // fall below the segment's start, or it would overlap an already-closed segment.
+        store
+            .record_powered_down_gap(100, 5_000)
+            .expect("record the gap");
+
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let (gap_started_at, gap_ended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at FROM activity_segments WHERE kind = 'suspended'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read the gap back");
+        assert_eq!(
+            (gap_started_at, gap_ended_at),
+            (1_000, 5_000),
+            "a gap dated before the open segment's start must still floor at that start"
         );
     }
 
