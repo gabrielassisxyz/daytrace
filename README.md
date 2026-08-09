@@ -91,6 +91,8 @@ systemctl --user enable --now daytrace.service
 
 `ExecStart` carries the fully resolved path of the binary that printed the unit, which is what the running process reports about itself. A binary installed as a symlink therefore renders the link target rather than the link, so read the printed `ExecStart` before enabling the unit, and render it again after the binary moves.
 
+`daytrace` uses two exit codes. `2` means the invocation itself was bad: unknown command, mistyped flag, or invalid `--date` argument; stderr includes the usage block. `1` means the invocation was valid but failed while running: a duplicate `start`, no readable input device, an invalid environment value such as `DAYTRACE_IDLE_AFTER_SECONDS=abc`, or sustained capture failure. `0` means the command produced its output. Callers that need to distinguish a benign duplicate start from a bad invocation can branch on the code.
+
 Inspect it, follow its output, and stop it with:
 
 ```sh

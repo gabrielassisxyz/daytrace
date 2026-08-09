@@ -39,6 +39,26 @@ fn hold_capture_claim(db_path: &Path) -> File {
     file
 }
 
+/// Every non-empty line the usage block prints, read from the binary itself rather than
+/// copied by hand, so a runtime-failure test that checks for leaked usage lines stays correct
+/// even if the block's wording changes.
+fn usage_lines() -> Vec<String> {
+    let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
+        .arg("help")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daytrace help");
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        // The block opens with the bare program name as a heading. It carries no usage
+        // wording of its own and collides with unrelated output that happens to name a
+        // `daytrace.db` file, so checking for it produces false positives rather than
+        // catching a leaked usage block.
+        .filter(|line| !line.trim().is_empty() && line.trim() != "daytrace")
+        .map(str::to_string)
+        .collect()
+}
+
 #[test]
 fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
     let directory = tempfile::tempdir().expect("tempdir");
@@ -58,12 +78,39 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
         "a second daemon on a database already being captured must not start: {stderr}"
     );
     assert!(
-        stderr.contains("already running"),
-        "the refusal has to say capture is already running: {stderr}"
+        output.status.code() == Some(1),
+        "a duplicate-capture refusal is a runtime failure, so it must exit 1, not 2: {stderr}"
     );
+
+    // The only value in the message that is not fixed by the source is the pid of the holder,
+    // which is this test process itself, so the full message can be reconstructed and compared
+    // for exact equality instead of only asserting a handful of substrings are present.
+    let expected = format!(
+        "capture is already running as pid {} on {}\n\
+         a second capture process reads its own configuration, so the two would disagree about \
+         what may be recorded; stop the running one before starting another\n",
+        std::process::id(),
+        db_path.display(),
+    );
+    assert_eq!(
+        stderr, expected,
+        "a duplicate-capture refusal must print exactly this message and nothing else"
+    );
+    // A regression that appended the usage block after the real message would still contain
+    // every substring checked above; comparing full lines against the block itself catches that.
+    for line in usage_lines() {
+        assert!(
+            !stderr.contains(&line),
+            "a runtime failure must not leak any line of the usage block ({line:?}): {stderr}"
+        );
+    }
+    // Stderr alone does not settle it. The usage block reaches stdout on the path that prints
+    // help, since that path returns it as a successful result, so a runtime failure that printed
+    // it would leak it there rather than into the stream asserted above.
     assert!(
-        stderr.contains(&format!("pid {}", std::process::id())),
-        "the refusal has to name the process holding the claim: {stderr}"
+        output.stdout.is_empty(),
+        "a runtime failure must write nothing to stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
     // Worth stating what this last one is worth: it discriminates the two orderings only where
     // `InputActivity::start` fails, which is a machine with no readable input device. On a
@@ -73,6 +120,41 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
         !stderr.contains("/dev/input"),
         "the claim must be tested before the input devices are opened, or a duplicate acquires \
          that capability just to be refused afterwards: {stderr}"
+    );
+}
+
+#[test]
+fn a_configuration_failure_prints_only_the_error_and_exits_one() {
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = directory.path().join("daytrace.db");
+
+    let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
+        .arg("today")
+        .env("DAYTRACE_DB_PATH", &db_path)
+        .env("DAYTRACE_IDLE_AFTER_SECONDS", "abc")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daytrace today");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+
+    assert!(
+        !output.status.success(),
+        "a configuration failure must fail: {stderr}"
+    );
+    assert!(
+        output.status.code() == Some(1),
+        "a configuration failure is a runtime failure, so it must exit 1: {stderr}"
+    );
+    // The message is fixed by the source for this input, so nothing short of exact equality
+    // rules out a regression that prints the right error alongside a leaked usage block.
+    assert_eq!(
+        stderr, "DAYTRACE_IDLE_AFTER_SECONDS must be an integer number of seconds\n",
+        "a runtime failure must print exactly the offending setting and nothing else"
+    );
+    assert!(
+        output.stdout.is_empty(),
+        "a runtime failure must write nothing to stdout: {}",
+        String::from_utf8_lossy(&output.stdout)
     );
 }
 
