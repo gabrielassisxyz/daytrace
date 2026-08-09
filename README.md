@@ -4,13 +4,14 @@
 
 The first milestone is a small Rust CLI and daemon that records active-window changes on Hyprland plus idle periods, stores them locally, and prints a chronological daily timeline with durations.
 
-## Privacy Boundary
+## Privacy Controls
 
 - Local storage only.
 - No cloud sync.
 - No screenshots.
 - No clipboard capture.
 - No page-content capture.
+- No keystroke capture: an input device is read only for the timestamp of an event, to detect idle and AFK, never for a key, button, or pointer value.
 - Sensitive URLs and tokens are redacted before storage.
 - Browser window titles are redacted by default because they can contain page content.
 - Browser private and incognito windows are skipped when Hyprland exposes a recognizable private-mode title marker.
@@ -18,12 +19,14 @@ The first milestone is a small Rust CLI and daemon that records active-window ch
 - Stored activity has a retention window, the last `90` days by default, applied on demand by `daytrace prune` and never automatically.
 - Logs are easy to delete and export.
 
-## Initial Commands
+## Installing
+
+`daytrace` is not distributed as a package or a prebuilt binary; it is built from a checkout of this repository. `cargo build --release --locked` produces `target/release/daytrace`; put that binary, or a symlink to it, on `PATH`.
+
+## Running by Hand
 
 ```sh
 daytrace start
-daytrace today
-daytrace today --date 2026-07-20
 ```
 
 `daytrace start` runs the local capture loop. It polls Hyprland for the active window, watches `/dev/input/event*` for input activity timestamps, and stores segments in a local SQLite database.
@@ -32,53 +35,9 @@ AFK tracking requires read access to at least one `/dev/input/event*` device. If
 
 One capture process runs per database. A second `daytrace start` is refused and names the process already running, rather than doubling capture: each process reads its own configuration, so a blacklist set in one shell is invisible to the other, and the process without it would record what the other one exists to skip. The claim is a lock on `daytrace.db.lock`, held beside the database for as long as the daemon runs and released by the kernel when it exits, so an unclean shutdown leaves nothing to clean up. Two daemons on different databases are not duplicates and both run.
 
-`daytrace today` prints the chronological timeline with segment durations, then totals the day by application, so the report answers both what happened in order and what consumed the day:
+`daytrace` uses two exit codes. `2` means the invocation itself was bad: unknown command, mistyped flag, or invalid `--date` argument; stderr includes the usage block. `1` means the invocation was valid but failed while running: a duplicate `start`, no readable input device, an invalid environment value such as `DAYTRACE_IDLE_AFTER_SECONDS=abc`, or sustained capture failure. `0` means the command produced its output. Callers that need to distinguish a benign duplicate start from a bad invocation can branch on the code.
 
-```text
-Timeline for 2026-07-20
-09:10-09:34  24m     ghostty - tmux
-09:34-09:51  17m     firefox - [browser title redacted]
-09:51-09:52  12s     ghostty - tmux
-09:52-10:08  16m     AFK
-23:40-24:00  20m     ghostty - tmux
-
-Time per application
-   44m  ghostty
-   17m  firefox
-   16m  AFK
-```
-
-A span shorter than a minute reports the seconds it lasted. Rounding it to the nearest minute called it `0m`, and with one-second polling a stretch of rapid window switching became a column of identical zeroes crowding out the blocks that held the day. A segment that lasted no time at all reads as `0s`, which says what happened instead of looking like a duration lost to rounding: a focus change with no input during an idle wait closes the displaced window at the instant it opened, and startup recovery does the same to a segment the daemon only ever observed once, which is the last application focused before it died.
-
-A stretch the machine spent suspended is reported as `Suspended`, separately from `AFK`. The two are the same absence of input but not the same fact about the day, and merging them makes a laptop closed overnight read as eight hours away from a running desk. The stretch is recognized on the first poll after the machine comes back, and its length is the kernel's own count of suspended time, taken as the difference between the two clocks that measure time since boot: one of them counts time spent suspended and the other does not. The segment in focus when the machine stopped is closed there rather than credited with the whole gap, and the poll after the resume opens a segment of its own.
-
-The wall clock is used only to place that stretch on the timeline, never to decide that one happened or how long the machine was down. This is deliberate and it is the important part: the wall clock jumps as a matter of routine, since every boot starts it from a hardware clock that has drifted and the correction is applied as a step rather than eased in. Deriving an absence from that movement would invent segments on an ordinary morning, and an invented segment is worse than a missing one, because the report and the export state it as fact and nothing downstream can tell it from a real gap.
-
-What that leaves. Suspend and hibernate are not told apart, because the kernel counts both the same way and both mean the machine was not running. A stretch during which the daemon itself was not running stays an ordinary gap in the day, whether the machine was off or the daemon was merely stopped: the clocks restart at boot and a fresh process has nothing earlier to compare against. Each endpoint is placed by the wall clock at the poll that noticed the resume, so it carries up to a polling interval of error and, on a boot whose clock has not yet been corrected, whatever error that clock still holds: a stretch of the right length can land at the wrong time, or on the wrong day. A stored stretch can also come out shorter than the kernel counted, where it would otherwise reach back over activity the daemon had already observed, which is the right way to lose the argument. A suspend shorter than five seconds is left with whatever segment was open rather than breaking the day into three rows.
-
-Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute rather than inheriting each row's rounding. Absence is totalled as `AFK`, apart from any application.
-
-`--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
-
-The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
-
-By default the database is stored at:
-
-```sh
-${XDG_DATA_HOME:-~/.local/share}/daytrace/daytrace.db
-```
-
-Useful environment overrides:
-
-- `DAYTRACE_DB_PATH`: SQLite database path.
-- `DAYTRACE_IDLE_AFTER_SECONDS`: AFK threshold, default `300`.
-- `DAYTRACE_POLL_SECONDS`: desktop polling interval, default `1`.
-- `DAYTRACE_RETENTION_DAYS`: days before today that `daytrace prune` keeps, default `90`, so the default keeps 91 calendar days. An empty value reads as unset; `0` is refused rather than read as "keep only today", since the difference between those two is a whole history.
-- `DAYTRACE_BLACKLIST_APPS`: comma-separated application class substrings to skip. Matching is by substring so that a short entry such as `keepassxc` covers the reverse-DNS class `org.keepassxc.KeePassXC` that a compositor actually reports.
-- `DAYTRACE_BLACKLIST_TITLES`: comma-separated title substrings to skip.
-- `DAYTRACE_BLACKLIST_DOMAINS`: comma-separated URL or domain substrings to skip.
-
-## Running as a User Service
+## Running from the systemd User Unit
 
 Nothing is recorded while the daemon is not running, so a login that does not start it loses the day without saying so. `daytrace service unit` prints a systemd user unit for the current installation:
 
@@ -90,8 +49,6 @@ systemctl --user enable --now daytrace.service
 ```
 
 `ExecStart` carries the fully resolved path of the binary that printed the unit, which is what the running process reports about itself. A binary installed as a symlink therefore renders the link target rather than the link, so read the printed `ExecStart` before enabling the unit, and render it again after the binary moves.
-
-`daytrace` uses two exit codes. `2` means the invocation itself was bad: unknown command, mistyped flag, or invalid `--date` argument; stderr includes the usage block. `1` means the invocation was valid but failed while running: a duplicate `start`, no readable input device, an invalid environment value such as `DAYTRACE_IDLE_AFTER_SECONDS=abc`, or sustained capture failure. `0` means the command produced its output. Callers that need to distinguish a benign duplicate start from a bad invocation can branch on the code.
 
 Inspect it, follow its output, and stop it with:
 
@@ -124,7 +81,65 @@ systemctl --user edit daytrace.service
 Environment=DAYTRACE_IDLE_AFTER_SECONDS=180
 ```
 
-## Export and Deletion
+## Where the Database Lives
+
+By default the database is stored at:
+
+```sh
+${XDG_DATA_HOME:-~/.local/share}/daytrace/daytrace.db
+```
+
+- `DAYTRACE_DB_PATH`: SQLite database path.
+
+## Environment Variables
+
+Useful environment overrides:
+
+- `DAYTRACE_IDLE_AFTER_SECONDS`: AFK threshold, default `300`.
+- `DAYTRACE_POLL_SECONDS`: desktop polling interval, default `1`.
+- `DAYTRACE_RETENTION_DAYS`: days before today that `daytrace prune` keeps, default `90`, so the default keeps 91 calendar days. An empty value reads as unset; `0` is refused rather than read as "keep only today", since the difference between those two is a whole history.
+- `DAYTRACE_BLACKLIST_APPS`: comma-separated application class substrings to skip. Matching is by substring so that a short entry such as `keepassxc` covers the reverse-DNS class `org.keepassxc.KeePassXC` that a compositor actually reports.
+- `DAYTRACE_BLACKLIST_TITLES`: comma-separated title substrings to skip.
+- `DAYTRACE_BLACKLIST_DOMAINS`: comma-separated URL or domain substrings to skip.
+
+## Reading a Day
+
+```sh
+daytrace today
+daytrace today --date 2026-07-20
+```
+
+`daytrace today` prints the chronological timeline with segment durations, then totals the day by application, so the report answers both what happened in order and what consumed the day:
+
+```text
+Timeline for 2026-07-20
+09:10-09:34  24m     ghostty - tmux
+09:34-09:51  17m     firefox - [browser title redacted]
+09:51-09:52  12s     ghostty - tmux
+09:52-10:08  16m     AFK
+23:40-24:00  20m     ghostty - tmux
+
+Time per application
+   44m  ghostty
+   17m  firefox
+   16m  AFK
+```
+
+A span shorter than a minute reports the seconds it lasted. Rounding it to the nearest minute called it `0m`, and with one-second polling a stretch of rapid window switching became a column of identical zeroes crowding out the blocks that held the day. A segment that lasted no time at all reads as `0s`, which says what happened instead of looking like a duration lost to rounding: a focus change with no input during an idle wait closes the displaced window at the instant it opened, and startup recovery does the same to a segment the daemon only ever observed once, which is the last application focused before it died.
+
+A stretch the machine spent suspended is reported as `Suspended`, separately from `AFK`. The two are the same absence of input but not the same fact about the day, and merging them makes a laptop closed overnight read as eight hours away from a running desk. The stretch is recognized on the first poll after the machine comes back, and its length is the kernel's own count of suspended time, taken as the difference between the two clocks that measure time since boot: one of them counts time spent suspended and the other does not. The segment in focus when the machine stopped is closed there rather than credited with the whole gap, and the poll after the resume opens a segment of its own.
+
+The wall clock is used only to place that stretch on the timeline, never to decide that one happened or how long the machine was down. This is deliberate and it is the important part: the wall clock jumps as a matter of routine, since every boot starts it from a hardware clock that has drifted and the correction is applied as a step rather than eased in. Deriving an absence from that movement would invent segments on an ordinary morning, and an invented segment is worse than a missing one, because the report and the export state it as fact and nothing downstream can tell it from a real gap.
+
+What that leaves. Suspend and hibernate are not told apart, because the kernel counts both the same way and both mean the machine was not running. A stretch during which the daemon itself was not running stays an ordinary gap in the day, whether the machine was off or the daemon was merely stopped: the clocks restart at boot and a fresh process has nothing earlier to compare against. Each endpoint is placed by the wall clock at the poll that noticed the resume, so it carries up to a polling interval of error and, on a boot whose clock has not yet been corrected, whatever error that clock still holds: a stretch of the right length can land at the wrong time, or on the wrong day. A stored stretch can also come out shorter than the kernel counted, where it would otherwise reach back over activity the daemon had already observed, which is the right way to lose the argument. A suspend shorter than five seconds is left with whatever segment was open rather than breaking the day into three rows.
+
+Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute rather than inheriting each row's rounding. Absence is totalled as `AFK`, apart from any application.
+
+`--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
+
+The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
+
+## Exporting a Day
 
 ```sh
 daytrace export
@@ -154,6 +169,8 @@ daytrace export --date 2026-07-20 > 2026-07-20.json
 Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window`, `idle`, or `suspended`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
 
 A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
+
+## Deleting Data
 
 Deleting everything is removing the database, since nothing is kept anywhere else:
 
