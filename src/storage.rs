@@ -1817,4 +1817,84 @@ mod tests {
         assert_eq!(rows[0].snapshot.app_class, Some("ghostty".to_string()));
         assert_eq!(rows[1].snapshot, ActivitySnapshot::suspended());
     }
+
+    #[test]
+    fn widening_the_stored_kinds_copies_every_column_the_old_table_had() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+
+        // Every column the rebuild is supposed to copy, each set to a value that identifies
+        // itself in a failed assertion, so a column silently dropped from the copy list is not
+        // masked by another column happening to share its value.
+        let legacy = rusqlite::Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments
+                    (id, started_at, ended_at, kind, app_class, title, workspace, monitor,
+                     last_seen_at, created_at)
+                VALUES
+                    (42, 111, 222, 'window', 'app-class-marker', 'title-marker',
+                     'workspace-marker', 7, 333, 444);",
+            )
+            .expect("seed a fully populated legacy row");
+        drop(legacy);
+
+        let mut store = Store::open(&db, None).expect("migrate legacy database");
+
+        // A direct SELECT naming every column, because the public timeline query cannot see
+        // `id` or `created_at` and folds some NULLs through COALESCE, so it cannot tell a
+        // preserved column from a dropped one.
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let row = conn
+            .query_row(
+                "SELECT id, started_at, ended_at, kind, app_class, title, workspace, monitor,
+                        last_seen_at, created_at
+                 FROM activity_segments",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, i64>(9)?,
+                    ))
+                },
+            )
+            .expect("read the migrated row back");
+
+        assert_eq!(row.0, 42, "id");
+        assert_eq!(row.1, 111, "started_at");
+        assert_eq!(row.2, 222, "ended_at");
+        assert_eq!(row.3, "window", "kind");
+        assert_eq!(row.4, "app-class-marker", "app_class");
+        assert_eq!(row.5, "title-marker", "title");
+        assert_eq!(row.6, "workspace-marker", "workspace");
+        assert_eq!(row.7, 7, "monitor");
+        assert_eq!(row.8, 333, "last_seen_at");
+        assert_eq!(row.9, 444, "created_at");
+
+        // A green read-back could still mean the rebuild never ran. Proving the widened check
+        // constraint took effect rules that out.
+        store
+            .record_powered_down_gap(1_000, 5_000)
+            .expect("the widened constraint must accept a suspended row");
+    }
 }
