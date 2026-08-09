@@ -84,6 +84,15 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
         (Some(1), String::new(), expected),
         "a duplicate-capture refusal must produce exactly this and nothing else, on any stream"
     );
+    assert_eq!(
+        output.status.code(),
+        Some(1),
+        "a duplicate start is refused with the runtime failure code, not usage (2) and not success (0)"
+    );
+    assert!(
+        stderr.contains(&format!("pid {}", std::process::id())),
+        "the refusal must name the pid that holds capture on stderr: {stderr}"
+    );
     // Worth stating what this last one is worth: it discriminates the two orderings only where
     // `InputActivity::start` fails, which is a machine with no readable input device. On a
     // desktop that has one, opening the devices succeeds silently and the refusal reads the same

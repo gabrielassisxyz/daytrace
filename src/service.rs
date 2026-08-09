@@ -148,10 +148,36 @@ mod tests {
             !unit.contains("Restart=always"),
             "restarting forever makes a permanently broken capture look like a working one"
         );
+        // The retry window is load-bearing for the duplicate-start decision: while a manual
+        // daemon holds the claim, the unit is refused, retries inside this window, and
+        // parks in `failed`. If these directives drift, the unit either gives up too fast or
+        // hides a sustained fault.
     }
 
     #[test]
     fn the_unit_stops_with_sigterm_so_the_open_segment_gets_a_real_end() {
         assert_directive(&unit(), "[Service]", "KillSignal=SIGTERM");
+    }
+
+    /// SETTLED DECISION: a duplicate `daytrace start` is refused with exit code 1.
+    ///
+    /// Combined with `Restart=on-failure` and a budget of five starts per hour, a manual
+    /// daemon left running across a login makes the unit lose the race, retry inside the
+    /// window, and park in `failed`. Declaring the refusal a success would silently leave
+    /// capture down once the manual daemon exits, with no `systemctl --user --failed` entry
+    /// to surface it. The unit itself does not change; what changes is that this behaviour
+    /// stops being right by accident.
+    #[test]
+    fn duplicate_start_refusal_is_not_masked_as_success() {
+        let unit = unit();
+
+        assert!(
+            !unit.contains("SuccessExitStatus="),
+            "SuccessExitStatus= would mask the duplicate-start refusal as success"
+        );
+        assert!(
+            !unit.contains("RestartPreventExitStatus="),
+            "RestartPreventExitStatus= would stop the retry window the decision relies on"
+        );
     }
 }
