@@ -1643,7 +1643,8 @@ mod tests {
     #[test]
     fn a_powered_down_gap_never_ends_before_its_own_start() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
         let active = ActivitySnapshot::window(
             Some("ghostty".to_string()),
             Some("tmux".to_string()),
@@ -1667,17 +1668,22 @@ mod tests {
             .record_powered_down_gap(5_000, 2_000)
             .expect("record the gap");
 
-        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
-        let stretch = rows
-            .iter()
-            .find(|row| row.snapshot == ActivitySnapshot::suspended())
-            .unwrap_or_else(|| panic!("the gap must still be recorded, clamped: {rows:?}"));
+        // Read the stored row, not what the report made of it. `timeline_between` clamps both
+        // fields to the window it was asked for, so asserting through it would be asserting the
+        // renderer: give the renderer a guard of its own and this test goes green over a database
+        // still holding a segment that ends before it begins. The suspended kind belongs to
+        // `record_powered_down_gap` alone, so it identifies the row this call wrote.
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let (started_at, ended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at FROM activity_segments WHERE kind = 'suspended'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the gap must still be recorded, clamped");
+        assert_eq!(started_at, 5_000, "the start passes the floor unclamped");
         assert_eq!(
-            stretch.started_at, 5_000,
-            "the start passes the floor unclamped"
-        );
-        assert_eq!(
-            stretch.ended_at, 5_000,
+            ended_at, 5_000,
             "an end behind the gap's own start must be clamped to it, not stored as given"
         );
     }
