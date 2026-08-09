@@ -1760,6 +1760,61 @@ mod tests {
     }
 
     #[test]
+    fn a_backdated_idle_start_still_displaces_the_time_it_was_dated_behind() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store.record_observation(100, 100, &active).expect("insert");
+        for seen_at in [200, 300, 440] {
+            store
+                .record_observation(seen_at, seen_at, &active)
+                .expect("heartbeat");
+        }
+
+        // Idle is dated from the last input, so it reaches back over polls the daemon did make.
+        // That displacement is the point here and the opposite of what a gap wants: nothing was
+        // observed during an idle stretch, while a gap covers time the machine was not running at
+        // all and the marker proves it was. The two floors must stay apart, and this is the side
+        // that breaks if they are merged.
+        store
+            .record_observation(200, 500, &ActivitySnapshot::idle())
+            .expect("backdated idle");
+
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let window_ended_at: i64 = conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'window'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the displaced segment back");
+        let idle_started_at: i64 = conn
+            .query_row(
+                "SELECT started_at FROM activity_segments WHERE kind = 'idle'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the idle segment back");
+
+        assert_eq!(
+            window_ended_at, 200,
+            "a backdated idle start floors at the open segment's start, so it still displaces \
+             the polls it was dated behind"
+        );
+        assert_eq!(
+            idle_started_at, 200,
+            "the idle segment opens where it was dated, not at the progress marker"
+        );
+    }
+
+    #[test]
     fn a_powered_down_gap_floors_at_the_open_segments_progress_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
