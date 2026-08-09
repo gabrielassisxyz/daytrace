@@ -247,9 +247,13 @@ impl Store {
     }
 
     pub fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
+        // `unix_now` is wall clock, not monotonic: an NTP step backwards between observations
+        // would otherwise store an end that precedes the segment's start. `record_observation`
+        // and `insert_segment` already clamp their progress markers, so this path has to match.
         self.conn
             .execute(
-                "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE ended_at IS NULL",
+                "UPDATE activity_segments SET ended_at = MAX(?1, started_at), \
+                 last_seen_at = MAX(?1, started_at) WHERE ended_at IS NULL",
                 params![ended_at],
             )
             .map_err(|error| format!("failed to close open segments: {error}"))?;
@@ -723,6 +727,106 @@ mod tests {
                     snapshot: browser,
                 },
             ]
+        );
+    }
+
+    #[test]
+    fn close_open_clamps_a_backward_clock_step_to_the_segments_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store
+            .record_observation(1000, 1000, &active)
+            .expect("insert");
+        store
+            .close_open(900)
+            .expect("close with stepped-back clock");
+
+        let conn = rusqlite::Connection::open(dir.path().join("daytrace.db")).expect("readback");
+        let (started_at, ended_at, last_seen_at): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at, last_seen_at FROM activity_segments",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("row");
+        assert_eq!(started_at, 1000);
+        assert_eq!(ended_at, 1000, "ended_at must not precede started_at");
+        assert_eq!(
+            last_seen_at, 1000,
+            "last_seen_at must not precede started_at"
+        );
+    }
+
+    #[test]
+    fn close_open_leaves_an_ordinary_close_unchanged() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        store
+            .record_observation(1000, 1000, &active)
+            .expect("insert");
+        store.close_open(1500).expect("ordinary close");
+
+        let conn = rusqlite::Connection::open(dir.path().join("daytrace.db")).expect("readback");
+        let ended_at: i64 = conn
+            .query_row("SELECT ended_at FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("row");
+        assert_eq!(ended_at, 1500, "a normal close must keep the supplied end");
+    }
+
+    #[test]
+    fn no_write_path_stores_an_inverted_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        let idle = ActivitySnapshot::idle();
+
+        // A mixed sequence of observations, powered-down gaps, and closes with backward steps.
+        store
+            .record_observation(1000, 1000, &active)
+            .expect("insert");
+        store
+            .record_observation(1100, 1100, &active)
+            .expect("heartbeat");
+        store
+            .record_powered_down_gap(900, 1050)
+            .expect("backdated gap clamps to last boundary");
+        store
+            .record_observation(800, 800, &idle)
+            .expect("backdated start");
+        store.close_open(700).expect("stepped-back close");
+
+        let conn = rusqlite::Connection::open(dir.path().join("daytrace.db")).expect("readback");
+        let inverted: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM activity_segments WHERE ended_at < started_at",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count inverted");
+        assert_eq!(
+            inverted, 0,
+            "no stored segment may end before it starts after any sequence of writes"
         );
     }
 
