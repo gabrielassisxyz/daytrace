@@ -1,45 +1,62 @@
 # Roadmap
 
-## Current State
+The desktop layer is complete. Everything below it in this document is either what that layer already does, what a later layer would add, or something deliberately left undone with the reason it was left.
 
-- Rust CLI crate exists.
-- `daytrace start`, `daytrace today`, and `daytrace export` define the initial command surface.
-- `daytrace start` records Hyprland active-window segments and AFK segments.
-- A stretch the machine spent suspended is stored as its own kind of segment, so a powered-down gap is not reported as time spent away from a running machine.
-- Activity segments are stored locally in SQLite.
-- `daytrace today` prints a chronological daily timeline with durations, followed by per-application totals.
-- `daytrace today --date` and `daytrace export --date` report and export any past local day.
-- `daytrace export` emits one day of stored activity as JSON on standard output.
-- `daytrace service unit` prints a systemd user unit that runs the capture daemon for the desktop session.
+## What Exists
+
+### Capture
+
+- `daytrace start` records Hyprland active-window segments and AFK segments into a local SQLite database.
+- Idle is dated from the last input rather than from the moment it was detected, so the idle threshold is not credited to whichever window still held focus.
+- A stretch the machine spent suspended is stored as its own kind of segment, measured from the kernel's own count of suspended time rather than from the wall clock, so a powered-down gap is neither reported as time away from a running machine nor invented out of a clock correction at boot.
+- A segment survives a crash. Its progress marker advances on every observation, so an interrupted stretch keeps the length it was last seen with instead of collapsing to nothing.
+- A failed compositor query is a skipped sample rather than the end of the daemon. Only sustained failure stops capture, which keeps a permanently broken setup from looking like a working one.
 - One capture daemon runs per database. A second `daytrace start` is refused and names the process already running.
-- Stored activity has a documented retention window, and `daytrace prune` deletes the segments that ended outside it. Nothing prunes automatically.
-- Application, title, and domain blacklist environment variables exist.
-- Browser titles are redacted by default and private/incognito browser windows are skipped when Hyprland exposes a recognizable private-mode title marker.
-- Deterministic project gates exist for Rust CI, dependency audit, secret scanning, Markdown wrapping, and public prose hygiene.
+- `daytrace service unit` prints a systemd user unit that runs the daemon for the desktop session.
 
-## First Milestone
+### Reading it back
 
-- Harden daemon lifecycle around startup recovery and shutdown behavior.
-- Add a documented deletion command for local logs.
-- Add configuration file support if environment variables become insufficient.
-- Add focused integration coverage around Hyprland command failures.
-- Settle how screen lock and unlock are observed. Neither the compositor nor the logind locked hint reports them on a Hyprland session whose locker never publishes that hint, so the remaining source is a session-manager subscription and the dependency it costs.
-- Make browser private/incognito detection reliable through the browser extension milestone.
+- `daytrace today` prints a chronological timeline with durations, then totals the day by application.
+- `daytrace today --date` and `daytrace export --date` report and export any past local day. A day that a clock change shortens or lengthens still meets its neighbours exactly.
+- `daytrace export` emits one day as JSON on standard output, with a stable shape and instants carrying the local offset.
+- A usage error prints the usage block and exits 2; a failure while running prints only what went wrong and exits 1. A caller can tell a refused duplicate start from a mistyped flag.
 
-## Later Milestones
+### Privacy
 
-- Add MPRIS media playback capture after the desktop layer works.
-- Add browser tab capture through a browser extension and Native Messaging.
-- Add URL and token redaction before browser activity is stored.
-- Add domain and application blacklist configuration.
-- Add `daytrace eod-pack` to emit a compact activity package for an external end-of-day summarizer.
-- Integrate with external `llm-workflow` end-of-day tooling without making this repository depend on it.
+- Storage is local and nothing leaves the machine.
+- No screenshot, no clipboard content, no page content, and no keystroke: an input device is read for the timestamp of an event, never for a key, button or pointer value.
+- Browser window titles are redacted before storage, because a title can carry page content.
+- Private and incognito browser windows are skipped where Hyprland exposes a recognizable private-mode marker.
+- Application, title and domain blacklists are configurable, and a blacklisted class matches by substring so a short entry covers the reverse-DNS class a compositor reports.
+- Stored activity has a documented retention window, applied by `daytrace prune` and by nothing else. A prune makes the deleted activity unreadable rather than merely unlisted, which takes rebuilding the file and checkpointing the log, both measured rather than assumed.
+
+### Gates
+
+- Formatting, linting with warnings denied, the full test suite, a dependency audit, secret scanning, Markdown wrapping and public prose hygiene all run from one command.
+- Every command shown in a shell block in `README.md` is executed against a throwaway database and required to exit zero. Each command line is classified as runnable or skipped for a named reason, and an unclassified line fails the run, so a command added later cannot quietly go uncovered.
+- The `DAYTRACE_*` variables the source reads are compared against the ones `README.md` documents, so a variable cannot be added without being documented.
+
+## What Is Missing
+
+Four layers, none started, each usable on its own once it exists. None is queued: they are one-line intentions rather than specifications, and a task with no acceptance criteria is one an implementer and a reviewer can disagree about with both being defensible. Each needs a design pass before it becomes work.
+
+- **Media.** Capture what was playing, including in the background, from MPRIS over DBus. This is what separates having watched a video from having left a tab playing.
+- **Browser.** A light extension sending the active tab, tab switches, a normalized domain and per-tab media state to the daemon over Native Messaging, with blacklist and redaction for sensitive domains. Until it exists, browser titles are redacted wholesale, which makes the browser the least legible part of the day and probably its largest share. It is also what would make private-window detection reliable, rather than the best-effort title marker used today.
+- **Aggregation.** Merging adjacent events, computing durations, and resolving conflicts between active window, active tab, background media and idle, so a block can say that one application held focus while another played behind it. The timeline renders stored segments directly today, which holds only while the desktop is the single source. This layer is wanted once a second source describes the same instant, not before.
+- **End-of-day package.** A compact local activity package for an external summarizer to consume, keeping this repository independent of whatever consumes it.
+
+## Settled, And Not Being Done
+
+- **Screen lock and unlock are not captured.** Three sources were checked on the target desktop rather than assumed: the compositor exposes no lock state and a lock surface is neither a window nor a layer; a session query fails outright from a process that is not in a session cgroup, which is where the user unit runs; and the locked hint the remaining query would read is only set by a locker that publishes it, which the one in use does not, so it reads unlocked for the whole time the screen is locked. What is left is subscribing to session-manager signals over DBus, a large asynchronous dependency for a signal that says a lock was requested rather than that the screen is locked. Idle already records stepping away and a suspended stretch already records the machine being down, so the marginal fact is small. This is revisited if a locker that publishes the hint is adopted, or if aggregation turns out to need a locked desk told apart from an empty one.
+- **Nothing prunes automatically.** Irreversible deletion of activity nobody asked to lose, at a moment nobody was present for, is the class of surprise this project treats as privacy-sensitive. The accepted cost is that an installation where the command is never run keeps everything, which a user timer answers on a schedule its owner chose.
+- **No configuration file.** Environment variables carry the whole surface, and a file is added when they stop being enough rather than in anticipation.
+- **Capture polls rather than subscribes.** A poll is a sample the daemon can miss; a subscription is a stream it can fall behind on. The interval is configurable and the reasoning is recorded where the loop lives.
 
 ## Out of Scope
 
 - Dashboard UI.
-- Browser extension in the first milestone.
 - AI-generated narrative inside `daytrace`.
-- Multi-user or platform design.
+- Multi-user or multi-platform design.
 - Cloud sync.
 - Tracking beyond this desktop.
+- Screenshots, clipboard capture, page content, and keystroke capture, which are out of scope permanently rather than pending.
