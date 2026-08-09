@@ -10,6 +10,43 @@ pub struct Store {
     secure_data_dir: Option<PathBuf>,
 }
 
+/// The storage boundary a poll writes through.
+///
+/// A trait because a write that fails and later recovers cannot be staged against a live
+/// database on demand, and the retry that a failing write now needs to be exercised through
+/// something a test can be told to fail.
+pub trait CaptureStore {
+    fn record_observation(
+        &mut self,
+        starts_at: i64,
+        seen_at: i64,
+        snapshot: &ActivitySnapshot,
+    ) -> Result<(), String>;
+
+    fn record_powered_down_gap(&mut self, started_at: i64, ended_at: i64) -> Result<(), String>;
+
+    fn close_open(&mut self, ended_at: i64) -> Result<(), String>;
+}
+
+impl CaptureStore for Store {
+    fn record_observation(
+        &mut self,
+        starts_at: i64,
+        seen_at: i64,
+        snapshot: &ActivitySnapshot,
+    ) -> Result<(), String> {
+        Store::record_observation(self, starts_at, seen_at, snapshot)
+    }
+
+    fn record_powered_down_gap(&mut self, started_at: i64, ended_at: i64) -> Result<(), String> {
+        Store::record_powered_down_gap(self, started_at, ended_at)
+    }
+
+    fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
+        Store::close_open(self, ended_at)
+    }
+}
+
 #[derive(Debug)]
 struct OpenSegment {
     id: i64,

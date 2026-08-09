@@ -6,7 +6,7 @@ use crate::input::InputActivity;
 use crate::lock::CaptureLock;
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
-use crate::storage::{Pruned, Store};
+use crate::storage::{CaptureStore, Pruned, Store};
 use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
 use std::env;
@@ -213,6 +213,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
 
     let session_clock = SystemSessionClock;
     let mut power_gaps = PowerGapWatch::default();
+    let mut pending_gaps = PendingGaps::default();
     let mut streak = FailureStreak::default();
     while running.load(Ordering::Relaxed) {
         // The clock is read through the watch rather than separately, so the instant the poll
@@ -234,6 +235,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
             observed_at,
             idle_since,
             session.powered_down_gap,
+            &mut pending_gaps,
         ) {
             // Only a poll that actually reached the desktop is evidence that it is reachable.
             Ok(Observed::Desktop) => streak.record_success(),
@@ -296,24 +298,58 @@ enum Observed {
     Idle,
 }
 
+/// Powered-down stretches measured but not yet durably recorded.
+///
+/// `PowerGapWatch` reports a stretch exactly once, at the poll right after it ends; if that
+/// poll's write fails, the stretch has to survive here or it is gone for good, and the segment
+/// it interrupted is left to be silently credited to whichever window comes back into focus.
+/// A second stretch measured while one is still owed is queued behind it rather than merged
+/// or replaced: the poll that measured the second stretch is itself proof the machine ran in
+/// between, so folding the two into one segment would state an absence that never happened,
+/// and dropping the first to make room for the second would state that it never happened at
+/// all. Both are stretches that were really spent off, so both get a row.
+#[derive(Debug, Default)]
+struct PendingGaps(Vec<PoweredDownGap>);
+
+impl PendingGaps {
+    fn push(&mut self, gap: PoweredDownGap) {
+        self.0.push(gap);
+    }
+
+    /// Store every gap still owed, oldest first, stopping at the first failure so the rest stay
+    /// queued for the next attempt instead of being tried out of order.
+    fn flush(&mut self, store: &mut dyn CaptureStore) -> Result<(), String> {
+        while let Some(gap) = self.0.first().copied() {
+            store.record_powered_down_gap(gap.started_at, gap.ended_at)?;
+            self.0.remove(0);
+        }
+        Ok(())
+    }
+}
+
 /// Record one observation. `idle_since` carries the moment input stopped when the machine is
 /// idle, which is earlier than `observed_at` by at least the idle threshold.
 /// `powered_down_gap` carries a stretch the machine spent off, which is only ever known on the
-/// first poll after it ended.
+/// first poll after it ended; `pending_gaps` carries whatever earlier stretch is still owed
+/// because a previous poll could not write it.
 fn capture_once(
-    store: &mut Store,
+    store: &mut dyn CaptureStore,
     source: &dyn ActiveWindowSource,
     blacklist: &Blacklist,
     observed_at: i64,
     idle_since: Option<i64>,
     powered_down_gap: Option<PoweredDownGap>,
+    pending_gaps: &mut PendingGaps,
 ) -> Result<Observed, String> {
-    // Written before this poll's observation, so the segment that was open when the machine
-    // stopped ends there instead of swallowing the whole stretch, and so the observation below
-    // finds no open segment to continue and starts a fresh one at the resume.
+    // Queued rather than written directly, so a failure here leaves the stretch pending for
+    // the next poll instead of losing it. Flushed before this poll's own observation, so the
+    // segment that was open when the machine stopped ends there instead of swallowing the
+    // whole stretch, and so the observation below finds no open segment to continue and starts
+    // a fresh one at the resume.
     if let Some(gap) = powered_down_gap {
-        store.record_powered_down_gap(gap.started_at, gap.ended_at)?;
+        pending_gaps.push(gap);
     }
+    pending_gaps.flush(store)?;
 
     let (starts_at, snapshot, observed) = match idle_since {
         Some(idle_since) => (idle_since, Some(ActivitySnapshot::idle()), Observed::Idle),
@@ -444,13 +480,14 @@ fn segments(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, capture_once,
+        AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, PendingGaps, capture_once,
         prune_is_dry_run, render_preview, render_prune, requested_day, run,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
     use crate::session::PoweredDownGap;
+    use crate::storage::CaptureStore;
     use crate::storage::Pruned;
     use crate::storage::Store;
     use chrono::NaiveDate;
@@ -489,6 +526,50 @@ mod tests {
         }
     }
 
+    /// A storage boundary whose gap write fails a fixed number of times before it starts
+    /// delegating to a real store, so a busy database that later frees up can be staged
+    /// deterministically instead of waited for.
+    struct FlakyGapStore {
+        inner: Store,
+        remaining_failures: u32,
+    }
+
+    impl FlakyGapStore {
+        fn new(inner: Store, remaining_failures: u32) -> Self {
+            Self {
+                inner,
+                remaining_failures,
+            }
+        }
+    }
+
+    impl CaptureStore for FlakyGapStore {
+        fn record_observation(
+            &mut self,
+            starts_at: i64,
+            seen_at: i64,
+            snapshot: &ActivitySnapshot,
+        ) -> Result<(), String> {
+            self.inner.record_observation(starts_at, seen_at, snapshot)
+        }
+
+        fn record_powered_down_gap(
+            &mut self,
+            started_at: i64,
+            ended_at: i64,
+        ) -> Result<(), String> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err("database is busy".to_string());
+            }
+            self.inner.record_powered_down_gap(started_at, ended_at)
+        }
+
+        fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
+            self.inner.close_open(ended_at)
+        }
+    }
+
     #[test]
     fn a_failed_observation_does_not_stop_later_ones() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -505,11 +586,28 @@ mod tests {
             Err("hyprctl activewindow failed".to_string()),
         ]);
         let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
 
-        capture_once(&mut store, &source, &blacklist, 100, None, None)
-            .expect_err("the compositor query failed");
-        capture_once(&mut store, &source, &blacklist, 110, None, None)
-            .expect("the recovered query is recorded");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            100,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect_err("the compositor query failed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            110,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("the recovered query is recorded");
         store.close_open(120).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
@@ -530,12 +628,30 @@ mod tests {
         );
         let source = ScriptedWindowSource::new(vec![Ok(Some(window))]);
         let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
 
         // Input stops at 1000. Idle is only detected at 1300, once the 300 second threshold
         // has elapsed, and the five minutes in between belong to nobody but the absence.
-        capture_once(&mut store, &source, &blacklist, 1000, None, None).expect("window observed");
-        capture_once(&mut store, &source, &blacklist, 1300, Some(1000), None)
-            .expect("idle detected");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1000,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("window observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1300,
+            Some(1000),
+            None,
+            &mut pending_gaps,
+        )
+        .expect("idle detected");
         store.close_open(1400).expect("close");
 
         let rows = store.timeline_between(0, 2000, 2000).expect("timeline");
@@ -565,11 +681,38 @@ mod tests {
             Ok(Some(window)),
         ]);
         let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
 
-        capture_once(&mut store, &source, &blacklist, 900, None, None).expect("window observed");
-        capture_once(&mut store, &source, &blacklist, 1100, None, None).expect("window gone");
-        capture_once(&mut store, &source, &blacklist, 1300, Some(1000), None)
-            .expect("idle detected");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            900,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("window observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1100,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("window gone");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1300,
+            Some(1000),
+            None,
+            &mut pending_gaps,
+        )
+        .expect("idle detected");
 
         let rows = store.timeline_between(0, 2000, 2000).expect("timeline");
         for pair in rows.windows(2) {
@@ -602,9 +745,28 @@ mod tests {
             Ok(Some(window.clone())),
         ]);
         let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
 
-        capture_once(&mut store, &source, &blacklist, 1_000, None, None).expect("window observed");
-        capture_once(&mut store, &source, &blacklist, 1_010, None, None).expect("still observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1_000,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("window observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1_010,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("still observed");
         capture_once(
             &mut store,
             &source,
@@ -615,6 +777,7 @@ mod tests {
                 started_at: 1_010,
                 ended_at: 5_000,
             }),
+            &mut pending_gaps,
         )
         .expect("resume observed");
 
@@ -655,11 +818,21 @@ mod tests {
         );
         let source = ScriptedWindowSource::new(vec![Ok(Some(window))]);
         let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
 
         // Input stopped at 1000 and the machine went down at 1010. The input timestamps are
         // untouched by a suspend, so the first poll after the resume reports an idle stretch
         // dated hours before the machine came back.
-        capture_once(&mut store, &source, &blacklist, 1_000, None, None).expect("window observed");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            1_000,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect("window observed");
         capture_once(
             &mut store,
             &source,
@@ -670,6 +843,7 @@ mod tests {
                 started_at: 1_010,
                 ended_at: 5_000,
             }),
+            &mut pending_gaps,
         )
         .expect("resume observed");
 
@@ -697,6 +871,7 @@ mod tests {
         let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
         // An empty script panics if consulted, proving the idle path never reaches the source.
         let source = ScriptedWindowSource::new(Vec::new());
+        let mut pending_gaps = PendingGaps::default();
 
         let observed = capture_once(
             &mut store,
@@ -705,6 +880,7 @@ mod tests {
             1300,
             Some(1000),
             None,
+            &mut pending_gaps,
         )
         .expect("idle is recorded without the desktop");
 
@@ -713,6 +889,302 @@ mod tests {
             Observed::Idle,
             "an idle poll must not be reported as a reachable desktop, or a broken \
              compositor query would be forgiven by every quiet stretch of the day"
+        );
+    }
+
+    #[test]
+    fn a_gap_that_fails_to_store_is_retried_until_it_is() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, 1);
+        let source = ScriptedWindowSource::new(Vec::new());
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        let gap = PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 5_000,
+        };
+
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_000,
+            Some(4_999),
+            Some(gap),
+            &mut pending_gaps,
+        )
+        .expect_err("a busy database refuses the first write");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_010,
+            Some(5_009),
+            None,
+            &mut pending_gaps,
+        )
+        .expect("the retried write succeeds once the database is free");
+
+        let rows = store
+            .inner
+            .timeline_between(0, 10_000, 10_000)
+            .expect("timeline");
+        let suspended: Vec<_> = rows
+            .iter()
+            .filter(|row| row.snapshot == ActivitySnapshot::suspended())
+            .collect();
+        assert_eq!(
+            suspended.len(),
+            1,
+            "the stretch must survive the failed write and reach storage exactly once: {rows:?}"
+        );
+        assert_eq!(
+            (suspended[0].started_at, suspended[0].ended_at),
+            (1_010, 5_000),
+            "the stored gap must carry the boundaries it was measured with, not values \
+             re-derived from the poll that finally wrote it"
+        );
+    }
+
+    #[test]
+    fn a_gap_survives_two_consecutive_failures_before_a_recovery() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, 2);
+        let source = ScriptedWindowSource::new(Vec::new());
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        let gap = PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 5_000,
+        };
+
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_000,
+            Some(4_999),
+            Some(gap),
+            &mut pending_gaps,
+        )
+        .expect_err("the first write fails");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_010,
+            Some(5_009),
+            None,
+            &mut pending_gaps,
+        )
+        .expect_err("the retry fails too");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_020,
+            Some(5_019),
+            None,
+            &mut pending_gaps,
+        )
+        .expect("the second retry succeeds");
+
+        let rows = store
+            .inner
+            .timeline_between(0, 10_000, 10_000)
+            .expect("timeline");
+        let suspended: Vec<_> = rows
+            .iter()
+            .filter(|row| row.snapshot == ActivitySnapshot::suspended())
+            .collect();
+        assert_eq!(
+            suspended.len(),
+            1,
+            "the gap is owed until it is written, not until it is merely offered: {rows:?}"
+        );
+        assert_eq!(
+            (suspended[0].started_at, suspended[0].ended_at),
+            (1_010, 5_000)
+        );
+    }
+
+    #[test]
+    fn a_stored_gap_is_never_offered_to_the_store_again() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, 0);
+        let source = ScriptedWindowSource::new(Vec::new());
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        let gap = PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 5_000,
+        };
+
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_000,
+            Some(4_999),
+            Some(gap),
+            &mut pending_gaps,
+        )
+        .expect("the write succeeds");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_010,
+            Some(5_009),
+            None,
+            &mut pending_gaps,
+        )
+        .expect("a poll with nothing new to report still succeeds");
+
+        let rows = store
+            .inner
+            .timeline_between(0, 10_000, 10_000)
+            .expect("timeline");
+        let suspended = rows
+            .iter()
+            .filter(|row| row.snapshot == ActivitySnapshot::suspended())
+            .count();
+        assert_eq!(
+            suspended, 1,
+            "a poll that measured no new suspend must not write a second row: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn a_second_stretch_measured_before_the_first_is_stored_gets_its_own_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, 1);
+        let source = ScriptedWindowSource::new(Vec::new());
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        // The gap between them is exactly the poll that measured the second stretch: proof
+        // the machine was running there, which is what rules out folding the two into one.
+        let first = PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 4_610,
+        };
+        let second = PoweredDownGap {
+            started_at: 4_620,
+            ended_at: 8_220,
+        };
+
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            4_610,
+            Some(4_609),
+            Some(first),
+            &mut pending_gaps,
+        )
+        .expect_err("the first stretch's write fails");
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            8_220,
+            Some(8_219),
+            Some(second),
+            &mut pending_gaps,
+        )
+        .expect("both the owed stretch and the newly measured one are now written");
+
+        let rows = store
+            .inner
+            .timeline_between(0, 10_000, 10_000)
+            .expect("timeline");
+        let suspended: Vec<_> = rows
+            .iter()
+            .filter(|row| row.snapshot == ActivitySnapshot::suspended())
+            .collect();
+        assert_eq!(
+            suspended.len(),
+            2,
+            "neither stretch may be merged into the other or replace it: {rows:?}"
+        );
+        assert_eq!(
+            (suspended[0].started_at, suspended[0].ended_at),
+            (1_010, 4_610)
+        );
+        assert_eq!(
+            (suspended[1].started_at, suspended[1].ended_at),
+            (4_620, 8_220)
+        );
+
+        let total_suspended: i64 = suspended
+            .iter()
+            .map(|row| row.ended_at - row.started_at)
+            .sum();
+        assert_eq!(
+            total_suspended,
+            (4_610 - 1_010) + (8_220 - 4_620),
+            "the total suspended time written must equal the total the clock reported"
+        );
+    }
+
+    #[test]
+    fn a_store_that_never_recovers_still_exhausts_the_failure_streak() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, u32::MAX);
+        let source = ScriptedWindowSource::new(Vec::new());
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        let mut streak = FailureStreak::default();
+        let gap = PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 5_000,
+        };
+
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            5_000,
+            Some(4_999),
+            Some(gap),
+            &mut pending_gaps,
+        )
+        .expect_err("the database never frees up in this test");
+        assert_eq!(streak.record_failure(), Some(1));
+
+        for expected in 2..MAX_CONSECUTIVE_FAILURES {
+            capture_once(
+                &mut store,
+                &source,
+                &blacklist,
+                5_000 + expected as i64,
+                Some(4_999 + expected as i64),
+                None,
+                &mut pending_gaps,
+            )
+            .expect_err("a gap still owed keeps failing while the database refuses it");
+            assert_eq!(streak.record_failure(), Some(expected));
+        }
+
+        capture_once(
+            &mut store,
+            &source,
+            &blacklist,
+            9_999,
+            Some(9_998),
+            None,
+            &mut pending_gaps,
+        )
+        .expect_err("still refusing");
+        assert_eq!(
+            streak.record_failure(),
+            None,
+            "a store that never recovers must end the daemon rather than loop silently"
         );
     }
 
