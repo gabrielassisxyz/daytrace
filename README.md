@@ -2,7 +2,7 @@
 
 `daytrace` is a local-first personal activity logger for reconstructing where time went during the day.
 
-The first milestone is a small Rust CLI and daemon that records active-window changes on Hyprland plus idle periods, stores them locally, and prints a chronological daily timeline with durations.
+It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, and stretches the machine spent suspended, stores them locally, and prints a chronological daily timeline with durations. That is the whole of it today: the desktop is the only source, so what the day says about a browser is what a window title says about it, and nothing reports what was playing behind the window in focus.
 
 ## Privacy Controls
 
@@ -137,7 +137,7 @@ Totals sum seconds and round once, so a minute spread over several short visits 
 
 `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
 
-The first milestone does not use a browser extension, so browser private/incognito detection is best-effort from the Hyprland window title. Browser titles are still redacted before storage.
+There is no browser extension, so browser private and incognito detection is best-effort from the Hyprland window title alone, and a browser that does not mark a private window in its title is not detected at all. Browser titles are redacted before storage either way, which is what keeps a missed detection from costing anything beyond a row that reads as an ordinary browser block.
 
 ## Exporting a Day
 
