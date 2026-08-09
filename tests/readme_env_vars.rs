@@ -24,8 +24,26 @@ fn code_declared_env_vars() -> BTreeSet<String> {
     let src_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
 
     let mut vars = BTreeSet::new();
-    for entry in fs::read_dir(&src_dir).expect("read the src directory") {
+    collect_env_vars(&src_dir, &pattern, &mut vars);
+    vars
+}
+
+/// Walk into subdirectories rather than reading only the top level.
+///
+/// `src` is flat today, so a listing of it would find every variable. It is not required to stay
+/// flat: a module that grows past what one file should hold becomes a directory, and a scan that
+/// stopped at the top level would go on passing while every name inside it went undocumented.
+/// A gate whose coverage silently depends on the shape of the tree is the kind that reports green
+/// for the wrong reason.
+fn collect_env_vars(directory: &Path, pattern: &Regex, vars: &mut BTreeSet<String>) {
+    let entries = fs::read_dir(directory)
+        .unwrap_or_else(|error| panic!("read {}: {error}", directory.display()));
+    for entry in entries {
         let path = entry.expect("directory entry").path();
+        if path.is_dir() {
+            collect_env_vars(&path, pattern, vars);
+            continue;
+        }
         if path.extension().and_then(|ext| ext.to_str()) != Some("rs") {
             continue;
         }
@@ -35,7 +53,6 @@ fn code_declared_env_vars() -> BTreeSet<String> {
             vars.insert(capture[1].to_string());
         }
     }
-    vars
 }
 
 /// Every `DAYTRACE_*` name mentioned anywhere in README.md.
