@@ -1641,6 +1641,54 @@ mod tests {
     }
 
     #[test]
+    fn a_powered_down_gap_never_ends_before_its_own_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // Two observations put the floor at exactly 5000: the first segment is closed there by
+        // the snapshot change, and the second opens there. The gap's offered start (5000) is
+        // then at the floor rather than behind it, so `begins_at` passes through unclamped and
+        // the case under test is isolated to the end, not entangled with the start floor already
+        // covered above.
+        store.record_observation(0, 0, &active).expect("insert");
+        store
+            .record_observation(5_000, 5_000, &ActivitySnapshot::idle())
+            .expect("idle");
+
+        // Offered with its end behind its own start, which a clock stepped back between two
+        // polls can produce.
+        store
+            .record_powered_down_gap(5_000, 2_000)
+            .expect("record the gap");
+
+        // Read the stored row, not what the report made of it. `timeline_between` clamps both
+        // fields to the window it was asked for, so asserting through it would be asserting the
+        // renderer: give the renderer a guard of its own and this test goes green over a database
+        // still holding a segment that ends before it begins. The suspended kind belongs to
+        // `record_powered_down_gap` alone, so it identifies the row this call wrote.
+        let conn = rusqlite::Connection::open(&db).expect("connection");
+        let (started_at, ended_at): (i64, i64) = conn
+            .query_row(
+                "SELECT started_at, ended_at FROM activity_segments WHERE kind = 'suspended'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("the gap must still be recorded, clamped");
+        assert_eq!(started_at, 5_000, "the start passes the floor unclamped");
+        assert_eq!(
+            ended_at, 5_000,
+            "an end behind the gap's own start must be clamped to it, not stored as given"
+        );
+    }
+
+    #[test]
     fn a_database_written_before_powered_down_gaps_accepts_one_after_migration() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
