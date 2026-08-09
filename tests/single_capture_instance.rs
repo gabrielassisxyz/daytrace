@@ -69,9 +69,12 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
 
     // The only value in the message that is not fixed by the source is the pid of the holder,
     // which is this test process itself, so the whole run can be reconstructed and compared.
-    // Exit 1 rather than 2: a duplicate is a runtime failure, not a bad invocation. Empty stdout
-    // is not a formality either, since the usage block reaches stdout on the path that prints
-    // help, which returns it as a successful result.
+    // Exit 1 rather than 2: a duplicate is a runtime failure, not a bad invocation, and the unit
+    // needs it to stay one, since a refusal declared successful removes the retry window a manual
+    // daemon's exit relies on. Empty stdout is not a formality either, since the usage block
+    // reaches stdout on the path that prints help, which returns it as a successful result.
+    // Naming the holder's pid is part of the same comparison rather than a check of its own: the
+    // expected message is built from it, so an exact match is what pins it.
     let expected = format!(
         "capture is already running as pid {} on {}\n\
          a second capture process reads its own configuration, so the two would disagree about \
@@ -83,15 +86,6 @@ fn a_second_capture_daemon_is_refused_and_names_the_running_one() {
         observable(&output),
         (Some(1), String::new(), expected),
         "a duplicate-capture refusal must produce exactly this and nothing else, on any stream"
-    );
-    assert_eq!(
-        output.status.code(),
-        Some(1),
-        "a duplicate start is refused with the runtime failure code, not usage (2) and not success (0)"
-    );
-    assert!(
-        stderr.contains(&format!("pid {}", std::process::id())),
-        "the refusal must name the pid that holds capture on stderr: {stderr}"
     );
     // Worth stating what this last one is worth: it discriminates the two orderings only where
     // `InputActivity::start` fails, which is a machine with no readable input device. On a

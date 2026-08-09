@@ -137,6 +137,10 @@ mod tests {
         assert_directive(&unit, "[Install]", "WantedBy=graphical-session.target");
     }
 
+    /// These three directives are also the retry window the duplicate-start decision rests on:
+    /// while a manual daemon holds the claim the unit is refused, retries inside the window, and
+    /// parks in `failed` only once the budget is spent. Drift here and the unit either gives up
+    /// before that daemon can exit, or stops surfacing a sustained fault.
     #[test]
     fn a_transient_failure_is_recovered_but_a_sustained_one_is_not() {
         let unit = unit();
@@ -148,10 +152,6 @@ mod tests {
             !unit.contains("Restart=always"),
             "restarting forever makes a permanently broken capture look like a working one"
         );
-        // The retry window is load-bearing for the duplicate-start decision: while a manual
-        // daemon holds the claim, the unit is refused, retries inside this window, and
-        // parks in `failed`. If these directives drift, the unit either gives up too fast or
-        // hides a sustained fault.
     }
 
     #[test]
