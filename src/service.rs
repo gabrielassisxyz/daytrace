@@ -137,6 +137,10 @@ mod tests {
         assert_directive(&unit, "[Install]", "WantedBy=graphical-session.target");
     }
 
+    /// These three directives are also the retry window the duplicate-start decision rests on:
+    /// while a manual daemon holds the claim the unit is refused, retries inside the window, and
+    /// parks in `failed` only once the budget is spent. Drift here and the unit either gives up
+    /// before that daemon can exit, or stops surfacing a sustained fault.
     #[test]
     fn a_transient_failure_is_recovered_but_a_sustained_one_is_not() {
         let unit = unit();
@@ -153,5 +157,27 @@ mod tests {
     #[test]
     fn the_unit_stops_with_sigterm_so_the_open_segment_gets_a_real_end() {
         assert_directive(&unit(), "[Service]", "KillSignal=SIGTERM");
+    }
+
+    /// SETTLED DECISION: a duplicate `daytrace start` is refused with exit code 1.
+    ///
+    /// Combined with `Restart=on-failure` and a budget of five starts per hour, a manual
+    /// daemon left running across a login makes the unit lose the race, retry inside the
+    /// window, and park in `failed`. Declaring the refusal a success would silently leave
+    /// capture down once the manual daemon exits, with no `systemctl --user --failed` entry
+    /// to surface it. The unit itself does not change; what changes is that this behaviour
+    /// stops being right by accident.
+    #[test]
+    fn duplicate_start_refusal_is_not_masked_as_success() {
+        let unit = unit();
+
+        assert!(
+            !unit.contains("SuccessExitStatus="),
+            "SuccessExitStatus= would mask the duplicate-start refusal as success"
+        );
+        assert!(
+            !unit.contains("RestartPreventExitStatus="),
+            "RestartPreventExitStatus= would stop the retry window the decision relies on"
+        );
     }
 }
