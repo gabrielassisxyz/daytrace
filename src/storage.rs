@@ -1641,6 +1641,48 @@ mod tests {
     }
 
     #[test]
+    fn a_powered_down_gap_never_ends_before_its_own_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let active = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+
+        // Two observations put the floor at exactly 5000: the first segment is closed there by
+        // the snapshot change, and the second opens there. The gap's offered start (5000) is
+        // then at the floor rather than behind it, so `begins_at` passes through unclamped and
+        // the case under test is isolated to the end, not entangled with the start floor already
+        // covered above.
+        store.record_observation(0, 0, &active).expect("insert");
+        store
+            .record_observation(5_000, 5_000, &ActivitySnapshot::idle())
+            .expect("idle");
+
+        // Offered with its end behind its own start, which a clock stepped back between two
+        // polls can produce.
+        store
+            .record_powered_down_gap(5_000, 2_000)
+            .expect("record the gap");
+
+        let rows = store.timeline_between(0, 10_000, 10_000).expect("timeline");
+        let stretch = rows
+            .iter()
+            .find(|row| row.snapshot == ActivitySnapshot::suspended())
+            .unwrap_or_else(|| panic!("the gap must still be recorded, clamped: {rows:?}"));
+        assert_eq!(
+            stretch.started_at, 5_000,
+            "the start passes the floor unclamped"
+        );
+        assert_eq!(
+            stretch.ended_at, 5_000,
+            "an end behind the gap's own start must be clamped to it, not stored as given"
+        );
+    }
+
+    #[test]
     fn a_database_written_before_powered_down_gaps_accepts_one_after_migration() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
