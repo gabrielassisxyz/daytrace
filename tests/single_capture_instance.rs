@@ -158,11 +158,6 @@ fn a_configuration_failure_prints_only_the_error_and_exits_one() {
     );
 }
 
-/// Reading the day must not wait on capture, or a report would block whenever the daemon runs.
-///
-/// The claim is deliberately a file beside the database rather than the database itself, and
-/// `today` and `export` never open it. Moving the claim onto the store would break both while
-/// still passing every test above.
 /// Pruning must not wait on capture either, and for a sharper reason than reading does.
 ///
 /// The command is meant to be run from a timer beside a daemon that runs all day, so a prune that
@@ -189,6 +184,11 @@ fn pruning_does_not_wait_on_the_capture_claim() {
     );
 }
 
+/// Reading the day must not wait on capture, or a report would block whenever the daemon runs.
+///
+/// The claim is deliberately a file beside the database rather than the database itself, and
+/// `today` and `export` never open it. Moving the claim onto the store would break both while
+/// still passing every test above.
 #[test]
 fn reporting_a_day_does_not_wait_on_the_capture_claim() {
     let directory = tempfile::tempdir().expect("tempdir");
