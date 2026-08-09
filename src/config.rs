@@ -116,7 +116,11 @@ struct DbLocation {
 }
 
 fn db_path_from_env() -> Result<DbLocation, String> {
-    if let Ok(path) = env::var("DAYTRACE_DB_PATH") {
+    // `var_os` rather than `var`: a path is bytes on this platform, and a value that fails
+    // UTF-8 decoding is still a real, usable path. Reading it with `var` would treat a
+    // non-UTF-8 override the same as an unset one and silently open the default store
+    // instead, which is the one outcome this override exists to prevent.
+    if let Some(path) = env::var_os("DAYTRACE_DB_PATH") {
         return Ok(DbLocation {
             path: PathBuf::from(path),
             secure_data_dir: None,

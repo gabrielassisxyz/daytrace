@@ -635,6 +635,25 @@ fn scratch_directory_beside(db_path: &Path) -> Option<&str> {
         .filter(|directory| !directory.is_empty())
 }
 
+#[cfg(unix)]
+fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
+    // Building the suffix through `display()` loses a path that fails UTF-8 decoding: the
+    // reconstructed name no longer matches the file SQLite actually wrote beside the
+    // database, so the `exists()` check below silently skips it. Appending the suffix to
+    // the raw bytes keeps the sibling paths byte-identical to what SQLite created.
+    use std::ffi::OsString;
+    use std::os::unix::ffi::{OsStrExt, OsStringExt};
+
+    let sibling = |suffix: &str| {
+        let mut bytes = db_path.as_os_str().as_bytes().to_vec();
+        bytes.extend_from_slice(suffix.as_bytes());
+        PathBuf::from(OsString::from_vec(bytes))
+    };
+
+    [db_path.to_path_buf(), sibling("-wal"), sibling("-shm")]
+}
+
+#[cfg(not(unix))]
 fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
     [
         db_path.to_path_buf(),
@@ -1593,6 +1612,51 @@ mod tests {
 
         assert_eq!(parent_mode, 0o755);
         assert_eq!(db_mode, 0o600);
+    }
+
+    /// `-wal`/`-shm` only exist while a connection holds the database open in WAL mode, so
+    /// they are read back here before `store` is dropped rather than after the run. These
+    /// are the same siblings the whole-binary tests cannot inspect, because by the time a
+    /// spawned process exits, SQLite has already checkpointed and removed them.
+    #[cfg(unix)]
+    #[test]
+    fn wal_and_shm_siblings_of_a_non_utf8_database_path_are_secured_while_open() {
+        use std::ffi::OsString;
+        use std::os::unix::ffi::{OsStrExt, OsStringExt};
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut bytes = dir.path().as_os_str().as_bytes().to_vec();
+        bytes.push(b'/');
+        bytes.extend_from_slice(b"daytrace-\xFF-store.db");
+        let db_path = PathBuf::from(OsString::from_vec(bytes.clone()));
+
+        let store = Store::open(&db_path, None).expect("store");
+
+        // Computed independently of `sqlite_artifact_paths`, from the same raw bytes SQLite
+        // itself appends the suffix to, so a regression in that function cannot mark its own
+        // homework: it has to match what is actually on disk.
+        let sibling = |suffix: &[u8]| {
+            let mut sibling_bytes = bytes.clone();
+            sibling_bytes.extend_from_slice(suffix);
+            PathBuf::from(OsString::from_vec(sibling_bytes))
+        };
+
+        for (label, path) in [("wal", sibling(b"-wal")), ("shm", sibling(b"-shm"))] {
+            let mode = fs::metadata(&path)
+                .unwrap_or_else(|error| {
+                    panic!("the {label} sibling of a non-UTF-8 database path must exist: {error}")
+                })
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(
+                mode, 0o600,
+                "the {label} sibling of a non-UTF-8 database path must be secured"
+            );
+        }
+
+        drop(store);
     }
 
     #[test]
