@@ -91,7 +91,7 @@
 
 ## Code style (baseline)
 
-- Functions: 4–40 lines, one thing each (SRP). Files: under ~500 lines, split by responsibility.
+- Functions: 4–40 lines, one thing each (SRP). Files: under ~500-750 lines of production code, split by responsibility. Rust keeps unit tests in the file they test, inside `#[cfg(test)] mod tests`, because a child module is what can reach the parent's private items without making them public for a test's sake. Those lines do not count against the guideline, or it would price a language convention as a defect and push tests away from what they test. Moving them is not even available here: a binary crate has no lib target, so nothing under `tests/` can import this crate, and the files there drive the built executable instead. A test module that becomes hard to scroll past moves to a sibling file with `#[cfg(test)] mod tests;`, which keeps the same access.
 - Names specific and unique — avoid `data`, `handler`, `Manager`, `util`.
 - Explicit types. Early returns over nested ifs; max ~2 levels of indentation.
 - Inject dependencies; wrap third-party libs behind a thin interface this project owns.
