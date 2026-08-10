@@ -25,17 +25,28 @@ fi
 # produced a green run for code that was never built, and a conclusion that the default branch was
 # failing when it was not.
 #
-# WHY under /tmp rather than beside the crate: a target directory per worktree was deliberately
-# configured away, because one project across many worktrees wrote tens of gigabytes of build
-# artifacts to a DRAM-less SSD through btrfs and dm-crypt and stalled the desktop for seconds at a
-# time. On tmpfs those writes never reach the disk, so the gate stops lying without reintroducing
-# what the shared directory exists to prevent. Measured for this crate: 268 MB and a little over
-# eight seconds from cold, against a machine with tens of gigabytes free.
+# WHY off the source disk rather than beside the crate: a target directory per worktree was
+# deliberately configured away, because one project across many worktrees wrote tens of gigabytes
+# of build artifacts to a DRAM-less SSD through btrfs and dm-crypt and stalled the desktop for
+# seconds at a time. A build disk carries neither layer, so a per-worktree directory there keeps
+# the gate honest without reintroducing what the shared directory exists to prevent.
 #
-# The path is derived from the checkout, so repeated runs in one worktree reuse their build, and
-# an explicit CARGO_TARGET_DIR still wins for anyone who wants a different arrangement.
+# WHY not the temp directory, which is where this pointed until 2026-08-10: on a system where /tmp
+# is a tmpfs, that put every build in RAM. The choice was measured as 268 MB for one worktree
+# against a machine with tens of gigabytes free, and both halves of that premise expired together.
+# Eight worktrees accumulated 3.7 GB, and holding it resident is part of why the machine no longer
+# had the headroom. A tmpfs path grows with the number of checkouts, is never evicted, and
+# is only reclaimed on reboot, so the cost is unbounded in exactly the dimension this repo's
+# worktree convention scales.
+#
+# The fallback keeps the gate portable: the build disk is one machine's arrangement, and CI runners
+# have no such mount. The path is derived from the checkout either way, so repeated runs in one
+# worktree reuse their build, and an explicit CARGO_TARGET_DIR still wins for anyone who wants a
+# different arrangement.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
-    CARGO_TARGET_DIR="${TMPDIR:-/tmp}/cargo-target/$(basename "$PWD")"
+    build_root=/mnt/build
+    [ -d "$build_root" ] || build_root="${TMPDIR:-/tmp}"
+    CARGO_TARGET_DIR="$build_root/cargo-target/$(basename "$PWD")"
     export CARGO_TARGET_DIR
 fi
 echo "==> building in $CARGO_TARGET_DIR"
