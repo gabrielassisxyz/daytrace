@@ -16,15 +16,15 @@
 
 ## Scope (current)
 
-- **Current scope:** local Hyprland desktop activity capture plus idle periods, stored locally in SQLite and printed as a daily timeline. Browser window titles are redacted by default because titles can contain page content. Browser private/incognito detection is best-effort until a browser extension provides a structured signal. Do not add cloud sync, screenshots, clipboard capture, browser content capture, dashboard UI, AI narrative generation, multi-user design, or non-desktop tracking without a present need and explicit decision.
+- **Current scope:** local Hyprland desktop activity capture plus idle periods, stored locally in SQLite and printed as a daily timeline. Browser window titles are still replaced wholesale before storage. That is a faithful implementation of the rule that used to stand where the Privacy section below now states its reversal, so it is queued to be undone rather than defended, and it is not a defect to be fixed on sight. Browser private/incognito detection is best-effort until a browser extension provides a structured signal. Do not add cloud sync, screenshots, clipboard capture, page-body capture, dashboard UI, AI narrative generation, multi-user design, or non-desktop tracking without a present need and explicit decision.
 
 ## Privacy & Security
 
 - Store data locally only.
-- Do not capture screenshots, clipboard content, or page content.
-- Redact sensitive URLs and tokens before storing browser-derived activity.
-- Redact browser window titles unless a later browser extension provides a safer structured source.
-- Keep blacklist support for domains and applications in the first capture milestone.
+- Never capture screenshots, clipboard content, keystrokes, or the body of a page. These are out of scope permanently, not pending.
+- Record what held the attention **by name**: window titles, media track titles and artists, and the address of what was playing. A tool that cannot say what consumed the largest block of the day does not answer the question it exists for, and for an ordinary window the same facts already sit in the browser's own history in more detail. They do not for a private window that best-effort detection failed to skip, and that residual is accepted rather than unnoticed.
+- Two scans, one per kind of field, and they are not interchangeable. **Free text** (a title, an artist) keeps the existing one: an address inside it is replaced whole, and a `keyword=value` secret loses its value, prefixed spellings included. A field that **is** an address keeps the address and loses only the sensitive parameters (`token`, `key`, `secret`, `password`, `code`), in the query or the fragment. Running the free-text scan over an address would replace the whole value and refuse to say what was played, which is the point of storing it.
+- Keep blacklist support for domains and applications. It is the mechanism that answers "not this one", open by default and closed case by case, and it is what a user reaches for instead of a redaction rule nobody can opt out of.
 - Make logs easy to delete and export.
 - When touching capture, storage, redaction, filesystem paths, or browser/native messaging, flag the security risk and add a testable guard.
 
