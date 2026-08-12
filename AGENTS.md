@@ -16,7 +16,7 @@
 
 ## Scope (current)
 
-- **Current scope:** local Hyprland desktop activity capture plus idle periods, stored locally in SQLite and printed as a daily timeline. Browser window titles are still replaced wholesale before storage. That is a faithful implementation of the rule that used to stand where the Privacy section below now states its reversal, so it is queued to be undone rather than defended, and it is not a defect to be fixed on sight. Browser private/incognito detection is best-effort until a browser extension provides a structured signal. Do not add cloud sync, screenshots, clipboard capture, page-body capture, dashboard UI, AI narrative generation, multi-user design, or non-desktop tracking without a present need and explicit decision.
+- **Current scope:** local Hyprland desktop activity capture plus idle periods, stored locally in SQLite and printed as a daily timeline. Browser window titles are stored by name, using the same free-text redaction scan as every other title; private/incognito detection is best-effort until a browser extension provides a structured signal. Do not add cloud sync, screenshots, clipboard capture, page-body capture, dashboard UI, AI narrative generation, multi-user design, or non-desktop tracking without a present need and explicit decision.
 
 ## Privacy & Security
 

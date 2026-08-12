@@ -77,7 +77,7 @@ pub fn parse_active_window(
         return Ok(None);
     }
 
-    let title = recordable_title(window.app_class.as_deref(), window.title.as_deref());
+    let title = window.title.as_deref().map(redact_title);
 
     Ok(Some(ActivitySnapshot::window(
         window.app_class,
@@ -85,15 +85,6 @@ pub fn parse_active_window(
         window.workspace.map(|workspace| workspace.name),
         window.monitor,
     )))
-}
-
-fn recordable_title(app_class: Option<&str>, title: Option<&str>) -> Option<String> {
-    let title = title?;
-    if is_browser_class(app_class) {
-        return Some("[browser title redacted]".to_string());
-    }
-
-    Some(redact_title(title))
 }
 
 fn is_private_browser_window(app_class: Option<&str>, title: Option<&str>) -> bool {
@@ -182,7 +173,7 @@ mod tests {
     }
 
     #[test]
-    fn redacts_browser_titles_by_default() {
+    fn stores_browser_titles_through_the_same_scan_as_other_titles() {
         let json = r#"{
             "address": "0xabc",
             "mapped": true,
@@ -195,7 +186,7 @@ mod tests {
         let snapshot = parse_active_window(json, &Blacklist::default())
             .expect("valid window")
             .expect("recordable browser");
-        assert_eq!(snapshot.title, Some("[browser title redacted]".to_string()));
+        assert_eq!(snapshot.title, Some("Inbox - Brave".to_string()));
     }
 
     #[test]
@@ -216,7 +207,7 @@ mod tests {
     }
 
     #[test]
-    fn redacts_common_non_default_browser_titles() {
+    fn stores_titles_for_various_browser_classes() {
         for app_class in [
             "LibreWolf",
             "zen-browser",
@@ -237,7 +228,7 @@ mod tests {
             let snapshot = parse_active_window(&json, &Blacklist::default())
                 .expect("valid window")
                 .expect("recordable browser");
-            assert_eq!(snapshot.title, Some("[browser title redacted]".to_string()));
+            assert_eq!(snapshot.title, Some("Sensitive Page".to_string()));
         }
     }
 
@@ -254,6 +245,62 @@ mod tests {
 
         assert_eq!(
             parse_active_window(json, &Blacklist::default()).expect("valid window"),
+            None
+        );
+    }
+
+    #[test]
+    fn redacts_addresses_and_secrets_from_browser_titles() {
+        let json = r#"{
+            "address": "0xabc",
+            "mapped": true,
+            "class": "firefox",
+            "title": "Dashboard https://example.test/path?token=abc access_token=secret",
+            "workspace": { "id": 2, "name": "2" },
+            "monitor": 1
+        }"#;
+
+        let snapshot = parse_active_window(json, &Blacklist::default())
+            .expect("valid window")
+            .expect("recordable browser");
+        assert_eq!(
+            snapshot.title,
+            Some("Dashboard [redacted-url] access_token=[redacted]".to_string())
+        );
+    }
+
+    #[test]
+    fn skips_blacklisted_domains_in_browser_titles() {
+        let json = r#"{
+            "address": "0xabc",
+            "mapped": true,
+            "class": "firefox",
+            "title": "https://bank.test/session",
+            "workspace": { "id": 2, "name": "2" },
+            "monitor": 1
+        }"#;
+        let blacklist = Blacklist::new(Vec::new(), Vec::new(), vec!["bank.test".to_string()]);
+
+        assert_eq!(
+            parse_active_window(json, &blacklist).expect("valid window"),
+            None
+        );
+    }
+
+    #[test]
+    fn skips_blacklisted_title_terms_in_browser_windows() {
+        let json = r#"{
+            "address": "0xabc",
+            "mapped": true,
+            "class": "firefox",
+            "title": "confidential report",
+            "workspace": { "id": 2, "name": "2" },
+            "monitor": 1
+        }"#;
+        let blacklist = Blacklist::new(Vec::new(), vec!["confidential".to_string()], Vec::new());
+
+        assert_eq!(
+            parse_active_window(json, &blacklist).expect("valid window"),
             None
         );
     }
