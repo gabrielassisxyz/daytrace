@@ -15,41 +15,43 @@ if [ "$fail" -ne 0 ]; then
     exit 1
 fi
 
+# >>> repo-harness:cargo-build-root >>>
 # Build somewhere no other checkout of this package can reach.
 #
-# WHY: where cargo's `build.target-dir` points every checkout at one directory, two worktrees of
-# this package write the same artifact paths and the fingerprints do not tell them apart. The gate
-# then judges the units fresh from another branch's build and passes without compiling the current
-# sources: new tests never appear in the output, and `CARGO_BIN_EXE_daytrace` starts a binary from
-# another branch, so a whole-binary case exercises code that is not under test. That has already
-# produced a green run for code that was never built, and a conclusion that the default branch was
+# WHY a directory per worktree: where cargo's `build.target-dir` points every checkout at
+# one directory, two worktrees of the same package write the same artifact paths and the
+# fingerprints do not tell them apart. The gate then judges units another branch built and
+# passes without compiling the current sources: new tests never appear in the output, and
+# `CARGO_BIN_EXE_<name>` starts a binary from another branch. That has already produced a
+# green run for code that was never built, and a conclusion that the default branch was
 # failing when it was not.
 #
-# WHY off the source disk rather than beside the crate: a target directory per worktree was
-# deliberately configured away, because one project across many worktrees wrote tens of gigabytes
-# of build artifacts to a DRAM-less SSD through btrfs and dm-crypt and stalled the desktop for
-# seconds at a time. A build disk carries neither layer, so a per-worktree directory there keeps
-# the gate honest without reintroducing what the shared directory exists to prevent.
+# WHY on the build disk and not in tmpfs: this block used to point at /tmp, because the
+# alternative at the time was a DRAM-less SSD behind btrfs and dm-crypt whose write volume
+# stalled the whole desktop for seconds at a time. /mnt/build is a different disk — plain
+# ext4, no COW, no cryptography — added on 2026-08-09 to carry exactly this traffic, so the
+# reason to spend RAM instead is gone. It was spending real RAM: three worktrees of one
+# crate held 1.3 GB of tmpfs against the 268 MB a single cold build was measured at, because
+# incremental artifacts (dep-graph, query-cache, test binaries) accumulate across runs. And
+# tmpfs is not free memory even when it looks idle — under pressure those pages go to zram,
+# which is still RAM, only compressed.
 #
-# WHY not the temp directory, which is where this pointed until 2026-08-10: on a system where /tmp
-# is a tmpfs, that put every build in RAM. The choice was measured as 268 MB for one worktree
-# against a machine with tens of gigabytes free, and both halves of that premise expired together.
-# Eight worktrees accumulated 3.7 GB, and holding it resident is part of why the machine no longer
-# had the headroom. A tmpfs path grows with the number of checkouts, is never evicted, and
-# is only reclaimed on reboot, so the cost is unbounded in exactly the dimension this repo's
-# worktree convention scales.
+# WHY a sibling of cargo-target rather than a child: ~/.cargo/config.toml points
+# `build.target-dir` at /mnt/build/cargo-target for ordinary builds. Nesting the per-worktree
+# directories inside it would make a `cargo clean` in any main checkout wipe them all.
 #
-# The fallback keeps the gate portable: the build disk is one machine's arrangement, and CI runners
-# have no such mount. The path is derived from the checkout either way, so repeated runs in one
-# worktree reuse their build, and an explicit CARGO_TARGET_DIR still wins for anyone who wants a
-# different arrangement.
+# The tmpfs fallback is what keeps the gate portable, and it is not a leftover: the build disk
+# is one machine's arrangement, and a CI runner has no such mount. An explicit CARGO_TARGET_DIR
+# still wins for anyone who wants a different arrangement, and the path is derived from the
+# checkout either way, so repeated runs in one worktree reuse their build.
 if [ -z "${CARGO_TARGET_DIR:-}" ]; then
     build_root=/mnt/build
     [ -d "$build_root" ] || build_root="${TMPDIR:-/tmp}"
-    CARGO_TARGET_DIR="$build_root/cargo-target/$(basename "$PWD")"
+    CARGO_TARGET_DIR="$build_root/cargo-target-worktrees/$(basename "$PWD")"
     export CARGO_TARGET_DIR
 fi
 echo "==> building in $CARGO_TARGET_DIR"
+# <<< repo-harness:cargo-build-root <<<
 
 echo "==> format check"
 cargo fmt --check || fail=1
