@@ -49,6 +49,7 @@ Environment:
   DAYTRACE_BLACKLIST_APPS          Comma-separated app class substrings to skip.
   DAYTRACE_BLACKLIST_TITLES        Comma-separated title substrings to skip.
   DAYTRACE_BLACKLIST_DOMAINS       Comma-separated URL/domain substrings to skip.
+  DAYTRACE_POLL_SECONDS            Desktop polling interval, default 1.
 ";
 
 /// The two ways dispatch can fail.
