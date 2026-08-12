@@ -130,6 +130,7 @@ mod tests {
     use super::parse_active_window;
     use crate::activity::{ActivityKind, ActivitySnapshot};
     use crate::config::Blacklist;
+    use crate::storage::Store;
 
     #[test]
     fn parses_active_hyprland_window() {
@@ -302,6 +303,53 @@ mod tests {
         assert_eq!(
             parse_active_window(json, &blacklist).expect("valid window"),
             None
+        );
+    }
+
+    #[test]
+    fn stores_browser_titles_in_sqlite_through_the_common_redaction_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        let clean_json = r#"{
+            "address": "0xabc",
+            "mapped": true,
+            "class": "brave-browser",
+            "title": "Inbox - Brave",
+            "workspace": { "id": 2, "name": "2" },
+            "monitor": 1
+        }"#;
+        let clean_snapshot = parse_active_window(clean_json, &Blacklist::default())
+            .expect("valid window")
+            .expect("recordable browser");
+
+        store
+            .record_observation(100, 100, &clean_snapshot)
+            .expect("record clean browser title");
+
+        let sensitive_json = r#"{
+            "address": "0xabc",
+            "mapped": true,
+            "class": "firefox",
+            "title": "Dashboard https://example.test/path?token=abc access_token=secret",
+            "workspace": { "id": 3, "name": "3" },
+            "monitor": 0
+        }"#;
+        let sensitive_snapshot = parse_active_window(sensitive_json, &Blacklist::default())
+            .expect("valid window")
+            .expect("recordable browser");
+
+        store
+            .record_observation(120, 120, &sensitive_snapshot)
+            .expect("record sensitive browser title");
+        store.close_open(150).expect("close");
+
+        let rows = store.timeline_between(0, 200, 200).expect("timeline");
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].snapshot.title, Some("Inbox - Brave".to_string()));
+        assert_eq!(
+            rows[1].snapshot.title,
+            Some("Dashboard [redacted-url] access_token=[redacted]".to_string())
         );
     }
 
