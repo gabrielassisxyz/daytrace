@@ -89,8 +89,9 @@ impl Blacklist {
 }
 
 /// The suffixes that mark a query or fragment parameter as carrying a secret. Shared by the
-/// free-text scan (`redact_title`) and the address scan (`redact_address`) so the two cannot
-/// drift apart.
+/// free-text scan (`redact_title`) and the address scan (`redact_address`) so the two agree
+/// on which names carry a secret: both match a name that ends in one of these,
+/// case-insensitively.
 const SENSITIVE_KEYWORD_SUFFIXES: [&str; 5] = ["token", "secret", "key", "code", "password"];
 
 pub fn redact_title(title: &str) -> String {
@@ -105,7 +106,13 @@ pub fn redact_title(title: &str) -> String {
     // most common real spellings passed through unredacted. Over-matching a word that merely
     // ends in a keyword is the safe direction for a guard like this.
     let secret_re = SECRET_RE.get_or_init(|| {
-        let keywords = SENSITIVE_KEYWORD_SUFFIXES.join("|");
+        // Escape each keyword: a future keyword carrying a regex metacharacter must be
+        // matched literally, not change the pattern's meaning.
+        let keywords = SENSITIVE_KEYWORD_SUFFIXES
+            .iter()
+            .map(|suffix| regex::escape(suffix))
+            .collect::<Vec<_>>()
+            .join("|");
         Regex::new(&format!(r"(?i)([A-Za-z0-9_-]*(?:{keywords}))=([^\s&]+)"))
             .expect("secret regex should compile")
     });
@@ -162,14 +169,20 @@ fn redact_query(part: &str) -> String {
     }
 }
 
-/// Redacts a fragment. A fragment is either a flat parameter list (`#access_token=abc`) or a
-/// routed path carrying a query of its own (`#/callback?access_token=abc`), so the part after
-/// the first `?` is scanned when one is present and the whole fragment otherwise.
+/// Redacts a fragment. A fragment is a sequence of parameter zones separated by `?` (a routed
+/// query) or `#` (a nested fragment); each zone is scanned as a parameter list, so a sensitive
+/// parameter before a later separator is not left standing.
 fn redact_fragment(fragment: &str) -> String {
-    match fragment.split_once('?') {
-        Some((prefix, query)) => format!("{prefix}?{}", redact_parameters(query)),
-        None => redact_parameters(fragment),
+    let mut redacted = String::with_capacity(fragment.len());
+    let mut rest = fragment;
+    while let Some(index) = rest.find(['?', '#']) {
+        let (zone, tail) = rest.split_at(index);
+        redacted.push_str(&redact_parameters(zone));
+        redacted.push(rest.as_bytes()[index] as char);
+        rest = &tail[1..];
     }
+    redacted.push_str(&redact_parameters(rest));
+    redacted
 }
 
 fn redact_parameters(parameters: &str) -> String {
@@ -190,12 +203,9 @@ fn redact_parameter(parameter: &str) -> String {
 fn is_sensitive_parameter_name(name: &str) -> bool {
     let decoded = percent_decode(name);
     let lower = decoded.to_ascii_lowercase();
-    SENSITIVE_KEYWORD_SUFFIXES.iter().any(|suffix| {
-        lower.ends_with(suffix)
-            && lower[..lower.len() - suffix.len()]
-                .chars()
-                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
-    })
+    SENSITIVE_KEYWORD_SUFFIXES
+        .iter()
+        .any(|suffix| lower.ends_with(suffix))
 }
 
 /// Decodes `%XX` escapes in a parameter name, for the comparison only. The stored address
@@ -427,6 +437,18 @@ mod tests {
                 "spotify:track:abc?token=xyz#frag?code=123",
                 "spotify:track:abc?token=[redacted]#frag?code=[redacted]",
             ),
+            (
+                "https://host.test/cb#access_token=abc&next=/home?tab=1",
+                "https://host.test/cb#access_token=[redacted]&next=/home?tab=1",
+            ),
+            (
+                "https://host.test/cb?a=1#token=x&next=/p?q=1",
+                "https://host.test/cb?a=1#token=[redacted]&next=/p?q=1",
+            ),
+            (
+                "https://host.test/cb#a=1#access_token=abc",
+                "https://host.test/cb#a=1#access_token=[redacted]",
+            ),
         ];
         for (input, expected) in cases {
             assert_eq!(redact_address(input), expected);
@@ -466,6 +488,19 @@ mod tests {
     }
 
     #[test]
+    fn redact_address_matches_dotted_names_like_the_free_text_scan() {
+        // The free-text regex is unanchored, so a dotted name like `auth.token` matches by
+        // its suffix. The address scan must agree, or the two scans drift apart.
+        for name in ["auth.token", "ns.access_token", "oauth.token"] {
+            let input = format!("https://host.test/cb?{name}=abc");
+            assert_eq!(
+                redact_address(&input),
+                format!("https://host.test/cb?{name}=[redacted]")
+            );
+        }
+    }
+
+    #[test]
     fn redact_address_leaves_relative_or_malformed_values_unchanged() {
         for value in [
             "relative/path?token=abc",
@@ -496,27 +531,40 @@ mod tests {
             "auth_code",
         ];
         let benign = ["list", "v", "t", "id"];
+        // Both fragment shapes, plus the flat list with a later `?` that used to leave the
+        // sensitive parameter standing. Each pair is (input fragment, fragment with the
+        // sensitive value emptied).
+        let fragments = [
+            ("frag?{s}=leak", "frag?{s}="),
+            ("{s}=leak", "{s}="),
+            ("{s}=leak&next=/home?tab=1", "{s}=&next=/home?tab=1"),
+        ];
 
         for scheme in schemes {
             for path in paths {
                 for sensitive_name in sensitive {
                     for benign_name in benign {
-                        let input = format!(
-                            "{scheme}{path}?{benign_name}=keep&{sensitive_name}=drop#frag?{sensitive_name}=drop2"
-                        );
-                        let output = redact_address(&input);
+                        for (fragment, emptied) in fragments {
+                            let fragment = fragment.replace("{s}", sensitive_name);
+                            let emptied = emptied.replace("{s}", sensitive_name);
+                            let input = format!(
+                                "{scheme}{path}?{benign_name}=keep&{sensitive_name}=drop#{fragment}"
+                            );
+                            let output = redact_address(&input);
 
-                        // The sensitive values are gone, replaced by the marker.
-                        assert!(!output.contains("=drop"), "value leaked: {output}");
-                        assert!(!output.contains("=drop2"), "value leaked: {output}");
-                        assert_eq!(output.matches("[redacted]").count(), 2, "{output}");
+                            // The sensitive values are gone, replaced by the marker.
+                            assert!(!output.contains("=drop"), "value leaked: {output}");
+                            assert!(!output.contains("=leak"), "value leaked: {output}");
+                            assert_eq!(output.matches("[redacted]").count(), 2, "{output}");
 
-                        // Every byte outside a sensitive value survives, in order: removing
-                        // the markers leaves the input with the sensitive values emptied.
-                        let expected = format!(
-                            "{scheme}{path}?{benign_name}=keep&{sensitive_name}=#frag?{sensitive_name}="
-                        );
-                        assert_eq!(output.replace("[redacted]", ""), expected, "{output}");
+                            // Every byte outside a sensitive value survives, in order:
+                            // removing the markers leaves the input with the sensitive values
+                            // emptied.
+                            let expected = format!(
+                                "{scheme}{path}?{benign_name}=keep&{sensitive_name}=#{emptied}"
+                            );
+                            assert_eq!(output.replace("[redacted]", ""), expected, "{output}");
+                        }
                     }
                 }
             }
