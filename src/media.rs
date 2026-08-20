@@ -77,20 +77,20 @@ struct BusName {
 /// The real client, reading the user bus through `busctl`.
 #[allow(dead_code)]
 pub struct BusctlClient {
-    command: String,
+    command: Vec<String>,
 }
 
 #[allow(dead_code)]
 impl BusctlClient {
     pub fn new() -> Self {
         Self {
-            command: "busctl".to_string(),
+            command: vec!["busctl".to_string()],
         }
     }
 
     /// A client that runs a different command, so a test can stage a fake `busctl`.
     #[cfg(test)]
-    fn with_command(command: String) -> Self {
+    fn with_command(command: Vec<String>) -> Self {
         Self { command }
     }
 }
@@ -122,15 +122,17 @@ impl MediaSource for BusctlClient {
 }
 
 /// The `busctl` invocation that lists the bus.
-fn discovery_command(command: &str) -> Command {
-    let mut cmd = Command::new(command);
+fn discovery_command(command: &[String]) -> Command {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
     cmd.args(["--user", "list", "--no-pager", "--no-legend", "--full"]);
     cmd
 }
 
 /// The `busctl` invocation that reads one player's status and metadata.
-fn property_command(command: &str, bus_name: &str) -> Command {
-    let mut cmd = Command::new(command);
+fn property_command(command: &[String], bus_name: &str) -> Command {
+    let mut cmd = Command::new(&command[0]);
+    cmd.args(&command[1..]);
     cmd.args([
         "--user",
         "--json=short",
@@ -356,22 +358,11 @@ fn join_artists(artists: &[String]) -> Option<String> {
 /// buffer a larger writer could fill and block on.
 fn run_bounded(command: &mut Command, deadline: Instant) -> Result<Vec<u8>, String> {
     let program = command.get_program().to_string_lossy().into_owned();
-    command.stdout(Stdio::piped()).stderr(Stdio::piped());
-    let mut child = loop {
-        match command.spawn() {
-            Ok(child) => break child,
-            // A freshly written executable can be briefly busy (ETXTBSY) while its writeback
-            // lands, so retry until the deadline rather than failing a poll over a transient
-            // condition.
-            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
-                if Instant::now() >= deadline {
-                    return Err(format!("failed to run {program}: {error}"));
-                }
-                thread::sleep(Duration::from_millis(5));
-            }
-            Err(error) => return Err(format!("failed to run {program}: {error}")),
-        }
-    };
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .map_err(|error| format!("failed to run {program}: {error}"))?;
 
     loop {
         match child.try_wait() {
@@ -440,7 +431,6 @@ mod tests {
         normalize_bus_name, parse_discovery, parse_properties, property_command, run_bounded,
     };
     use crate::config::Blacklist;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::Command;
     use std::time::{Duration, Instant};
 
@@ -741,7 +731,7 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
 
     #[test]
     fn discovery_invokes_busctl_with_the_full_listing_flags() {
-        let args: Vec<String> = discovery_command("busctl")
+        let args: Vec<String> = discovery_command(&["busctl".to_string()])
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
             .collect();
@@ -753,10 +743,11 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
 
     #[test]
     fn property_query_invokes_busctl_with_json_short_and_both_properties() {
-        let args: Vec<String> = property_command("busctl", "org.mpris.MediaPlayer2.spotify")
-            .get_args()
-            .map(|arg| arg.to_string_lossy().into_owned())
-            .collect();
+        let args: Vec<String> =
+            property_command(&["busctl".to_string()], "org.mpris.MediaPlayer2.spotify")
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect();
         assert_eq!(
             args,
             vec![
@@ -811,12 +802,18 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
         }
     }
 
-    fn fake_busctl(script: &str) -> (tempfile::TempDir, String) {
+    fn fake_busctl(script: &str) -> (tempfile::TempDir, Vec<String>) {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("busctl");
         std::fs::write(&path, script).expect("write script");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
-        (dir, path.to_str().expect("utf8 path").to_string())
+        // Run the script as an argument to `sh` rather than exec-ing it: exec-ing a freshly
+        // written file can race another test thread's fork and fail with ETXTBSY, while `sh`
+        // reads the file as data, never as an executable image.
+        let command = vec![
+            "sh".to_string(),
+            path.to_str().expect("utf8 path").to_string(),
+        ];
+        (dir, command)
     }
 
     #[test]
@@ -834,8 +831,8 @@ else
     echo '{\"type\":\"a{sv}\",\"data\":{}}'
 fi
 ";
-        let (_dir, path) = fake_busctl(script);
-        let client = BusctlClient::with_command(path);
+        let (_dir, command) = fake_busctl(script);
+        let client = BusctlClient::with_command(command);
         let start = Instant::now();
         let result = client.poll(&Blacklist::default());
         let elapsed = start.elapsed();
@@ -848,8 +845,8 @@ fi
 
     #[test]
     fn a_list_failure_is_a_whole_source_error() {
-        let (_dir, path) = fake_busctl("#!/bin/sh\nexit 1\n");
-        let client = BusctlClient::with_command(path);
+        let (_dir, command) = fake_busctl("#!/bin/sh\nexit 1\n");
+        let client = BusctlClient::with_command(command);
         assert!(client.poll(&Blacklist::default()).is_err());
     }
 
@@ -867,8 +864,8 @@ else
     exit 1
 fi
 ";
-        let (_dir, path) = fake_busctl(script);
-        let client = BusctlClient::with_command(path);
+        let (_dir, command) = fake_busctl(script);
+        let client = BusctlClient::with_command(command);
         let result = client.poll(&Blacklist::default()).expect("list succeeded");
         assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], PlayerOutcome::Playing(_)));
