@@ -41,6 +41,12 @@
 - Closed work is committed before switching tasks; flag it if it has not been.
 - Before push or PR, run the standard review gate: one fresh-context subagent reviews the full branch diff once.
 
+## Parallel Work
+
+- **One bead, one worktree, one branch, one pull request.** Create the worktree with `bin/worktree new <type>/<desc>`, never with a bare `git worktree add`: only the tool links the git-ignored paths a worktree needs, `.beads` among them, and `br` does not search upwards, so a worktree made by hand carries no bead database and every command in the next bullet fails inside it. The branch is still named the Conventional Branch way, with the bead id riding in the description (`feature/daytrace-42-idle-gap`). The basename has to be unique across the machine, because `bin/ci` derives `CARGO_TARGET_DIR` from `basename "$PWD"` whenever the environment has not already set it: two worktrees that share a basename share a build directory, which reintroduces the cross-branch contamination that block exists to prevent.
+- **Claim the bead before the first write.** `br coordination status` shows which beads are already held and which claims are stale; `br update <id> --claim` takes one atomically, setting assignee and `in_progress` in a single step. The atomic form is also the only one that checks: it refuses a bead another session holds, with `claim: issue <id> already assigned to <name>` and exit 4, while the same thing spelled as an `--assignee` and `--status` pair reassigns the bead out from under that session, reports it as an ordinary update and exits 0. The claim is attributed to the configured actor, so pass `br --actor <name> update <id> --claim` while more than one session is open, or every claim comes back under the same name. What the next session needs to know goes in `br comments` on the bead, never in a file in the tree.
+- **Merges are serial, and the gate is re-run after the rebase.** A green `bin/ci` proves the branch against the default branch as it stood, so another branch landing in between invalidates it. Rebase onto the current default branch and run `bin/ci` again before merging.
+
 ## Public Text
 
 - This repo is public from day one. Published files, commit messages, PR text, comments, and docs stay impersonal and do not name a person outside git author metadata.
@@ -102,5 +108,7 @@
 ## Common Hurdles
 
 - **A shared cargo target directory makes one branch's build answer for another's.** Where `build.target-dir` points every checkout at one directory, two worktrees of this package write the same artifact paths and the fingerprints do not tell them apart, so `cargo test` can pass without compiling the current sources and `CARGO_BIN_EXE_daytrace` can start a binary another branch built. `bin/ci` now builds under its own path, so the gate is safe. Anything run by hand is not: pass `CARGO_TARGET_DIR` yourself before trusting a bare `cargo test`, `cargo run`, or a binary out of `target/`.
+
+- **`.beads` is one shared database, not per-branch state.** Every worktree reaches it through a symlink chain that ends in `local/`, so a claim, a comment or a close made inside a worktree is visible to every other session the moment it happens, and that immediacy is what makes it usable as the coordination channel. It is git-ignored, so none of it travels in the branch: nothing has to be merged, and equally a bead closed on a branch that never lands stays closed. It also means a checkout without `local/`, which is a normal checkout, has no database at all, so the claim protocol is maintainer-side and the project does not depend on it.
 
 When a gotcha appears, add it here only if no deterministic gate already catches it. A hurdle promoted to a gate is deleted from this section, not duplicated.
