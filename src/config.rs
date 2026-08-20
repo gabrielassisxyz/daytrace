@@ -86,6 +86,49 @@ impl Blacklist {
                     .any(|blocked| value.contains(blocked))
         })
     }
+
+    /// Whether a playing media item is excluded, matching each category against its own field.
+    ///
+    /// The desktop `should_skip` tests title terms AND domain terms against one text argument,
+    /// which is right for a window title but wrong for media: a domain entry that excludes a
+    /// bank would start matching an artist, and a title entry would start matching an address.
+    /// Media checks by category instead: application entries against the normalized key, title
+    /// entries against the title, each artist and the album, and domain entries against the
+    /// address alone.
+    pub fn should_skip_media(
+        &self,
+        player_key: &str,
+        title: Option<&str>,
+        artists: &[String],
+        album: Option<&str>,
+        item_url: Option<&str>,
+    ) -> bool {
+        let key = player_key.to_ascii_lowercase();
+        if self.app_classes.iter().any(|blocked| key.contains(blocked)) {
+            return true;
+        }
+
+        let title_matches = |text: &str| {
+            let text = text.to_ascii_lowercase();
+            self.title_terms
+                .iter()
+                .any(|blocked| text.contains(blocked))
+        };
+
+        if title.is_some_and(&title_matches)
+            || artists.iter().any(|artist| title_matches(artist))
+            || album.is_some_and(&title_matches)
+        {
+            return true;
+        }
+
+        item_url.is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            self.domain_terms
+                .iter()
+                .any(|blocked| value.contains(blocked))
+        })
+    }
 }
 
 /// The suffixes that mark a query or fragment parameter as carrying a secret. Shared by the
@@ -591,5 +634,53 @@ mod tests {
         assert!(blacklist.should_skip(None, Some("Private Browsing")));
         assert!(blacklist.should_skip(None, Some("https://bank.test/session")));
         assert!(!blacklist.should_skip(Some("Ghostty"), Some("tmux")));
+    }
+
+    #[test]
+    fn media_blacklists_match_by_category() {
+        let blacklist = Blacklist::new(
+            vec!["spotify".to_string()],
+            vec!["secret".to_string()],
+            vec!["bank.test".to_string()],
+        );
+
+        // Application entries match the normalized key.
+        assert!(blacklist.should_skip_media("spotify", None, &[], None, None));
+        // Title entries match the title, each artist and the album.
+        assert!(blacklist.should_skip_media("vlc", Some("secret track"), &[], None, None));
+        assert!(blacklist.should_skip_media(
+            "vlc",
+            None,
+            &["secret artist".to_string()],
+            None,
+            None
+        ));
+        assert!(blacklist.should_skip_media("vlc", None, &[], Some("secret album"), None));
+        // Domain entries match the address alone.
+        assert!(blacklist.should_skip_media("vlc", None, &[], None, Some("https://bank.test/x")));
+        // A domain term appearing only in an artist does not skip the player.
+        assert!(!blacklist.should_skip_media("vlc", None, &["bank.test".to_string()], None, None));
+        // A title term appearing only in the address does not skip the player.
+        assert!(!blacklist.should_skip_media(
+            "vlc",
+            None,
+            &[],
+            None,
+            Some("https://open.spotify.com/secret")
+        ));
+    }
+
+    #[test]
+    fn a_term_matching_across_fields_does_not_skip() {
+        let blacklist = Blacklist::new(Vec::new(), vec!["x y".to_string()], Vec::new());
+        // The title ends in x and the artist begins with y, so "x y" spans the boundary between
+        // two fields and must not match either one.
+        assert!(!blacklist.should_skip_media(
+            "vlc",
+            Some("foo x"),
+            &["y bar".to_string()],
+            None,
+            None,
+        ));
     }
 }
