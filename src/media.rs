@@ -356,11 +356,22 @@ fn join_artists(artists: &[String]) -> Option<String> {
 /// buffer a larger writer could fill and block on.
 fn run_bounded(command: &mut Command, deadline: Instant) -> Result<Vec<u8>, String> {
     let program = command.get_program().to_string_lossy().into_owned();
-    let mut child = command
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .map_err(|error| format!("failed to run {program}: {error}"))?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = loop {
+        match command.spawn() {
+            Ok(child) => break child,
+            // A freshly written executable can be briefly busy (ETXTBSY) while its writeback
+            // lands, so retry until the deadline rather than failing a poll over a transient
+            // condition.
+            Err(error) if error.kind() == std::io::ErrorKind::ExecutableFileBusy => {
+                if Instant::now() >= deadline {
+                    return Err(format!("failed to run {program}: {error}"));
+                }
+                thread::sleep(Duration::from_millis(5));
+            }
+            Err(error) => return Err(format!("failed to run {program}: {error}")),
+        }
+    };
 
     loop {
         match child.try_wait() {
