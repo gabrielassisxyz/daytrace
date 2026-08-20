@@ -88,6 +88,11 @@ impl Blacklist {
     }
 }
 
+/// The suffixes that mark a query or fragment parameter as carrying a secret. Shared by the
+/// free-text scan (`redact_title`) and the address scan (`redact_address`) so the two cannot
+/// drift apart.
+const SENSITIVE_KEYWORD_SUFFIXES: [&str; 5] = ["token", "secret", "key", "code", "password"];
+
 pub fn redact_title(title: &str) -> String {
     static URL_RE: OnceLock<Regex> = OnceLock::new();
     static SECRET_RE: OnceLock<Regex> = OnceLock::new();
@@ -100,7 +105,8 @@ pub fn redact_title(title: &str) -> String {
     // most common real spellings passed through unredacted. Over-matching a word that merely
     // ends in a keyword is the safe direction for a guard like this.
     let secret_re = SECRET_RE.get_or_init(|| {
-        Regex::new(r"(?i)([A-Za-z0-9_-]*(?:token|secret|key|code|password))=([^\s&]+)")
+        let keywords = SENSITIVE_KEYWORD_SUFFIXES.join("|");
+        Regex::new(&format!(r"(?i)([A-Za-z0-9_-]*(?:{keywords}))=([^\s&]+)"))
             .expect("secret regex should compile")
     });
 
@@ -108,6 +114,119 @@ pub fn redact_title(title: &str) -> String {
     secret_re
         .replace_all(&without_urls, "$1=[redacted]")
         .to_string()
+}
+
+/// Redacts the values of sensitive query and fragment parameters in an address, keeping
+/// everything else byte for byte.
+///
+/// `redact_title` cannot serve here: its URL regex replaces a whole address with
+/// `[redacted-url]`, which on a field whose entire value is the address would say a track
+/// was played and refuse to say which. This scan keeps the address and replaces only the
+/// values of parameters whose name says they carry a secret, so the stored string still
+/// names what was played.
+#[allow(dead_code)] // not yet called: the media capture path will use it once media is polled
+pub fn redact_address(address: &str) -> String {
+    if !has_uri_scheme(address) {
+        return address.to_string();
+    }
+    match address.split_once('#') {
+        Some((main, fragment)) => format!("{}#{}", redact_query(main), redact_fragment(fragment)),
+        None => redact_query(address),
+    }
+}
+
+/// Whether the value is an absolute URI: a scheme (`[A-Za-z][A-Za-z0-9+.-]*:`) followed by
+/// anything. A relative or malformed value is not an address and is left alone rather than
+/// having its `?`-suffixed text read as a query.
+fn has_uri_scheme(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
+        return false;
+    }
+    for &byte in &bytes[1..] {
+        if byte == b':' {
+            return true;
+        }
+        if !(byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'-' || byte == b'.') {
+            return false;
+        }
+    }
+    false
+}
+
+/// Redacts the query of a URI part: everything after the first `?`, if any.
+fn redact_query(part: &str) -> String {
+    match part.split_once('?') {
+        Some((base, query)) => format!("{base}?{}", redact_parameters(query)),
+        None => part.to_string(),
+    }
+}
+
+/// Redacts a fragment. A fragment is either a flat parameter list (`#access_token=abc`) or a
+/// routed path carrying a query of its own (`#/callback?access_token=abc`), so the part after
+/// the first `?` is scanned when one is present and the whole fragment otherwise.
+fn redact_fragment(fragment: &str) -> String {
+    match fragment.split_once('?') {
+        Some((prefix, query)) => format!("{prefix}?{}", redact_parameters(query)),
+        None => redact_parameters(fragment),
+    }
+}
+
+fn redact_parameters(parameters: &str) -> String {
+    parameters
+        .split('&')
+        .map(redact_parameter)
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
+fn redact_parameter(parameter: &str) -> String {
+    match parameter.split_once('=') {
+        Some((name, _)) if is_sensitive_parameter_name(name) => format!("{name}=[redacted]"),
+        _ => parameter.to_string(),
+    }
+}
+
+fn is_sensitive_parameter_name(name: &str) -> bool {
+    let decoded = percent_decode(name);
+    let lower = decoded.to_ascii_lowercase();
+    SENSITIVE_KEYWORD_SUFFIXES.iter().any(|suffix| {
+        lower.ends_with(suffix)
+            && lower[..lower.len() - suffix.len()]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    })
+}
+
+/// Decodes `%XX` escapes in a parameter name, for the comparison only. The stored address
+/// keeps its original spelling, because the address that gets stored has to stay the address
+/// that was played.
+fn percent_decode(input: &str) -> String {
+    let mut decoded = Vec::with_capacity(input.len());
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%'
+            && i + 2 < bytes.len()
+            && let (Some(high), Some(low)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2]))
+        {
+            decoded.push(high << 4 | low);
+            i += 3;
+            continue;
+        }
+        decoded.push(bytes[i]);
+        i += 1;
+    }
+    String::from_utf8_lossy(&decoded).into_owned()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 struct DbLocation {
@@ -192,7 +311,7 @@ fn normalize_list(values: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blacklist, DEFAULT_RETENTION_DAYS, redact_title, retention_days};
+    use super::{Blacklist, DEFAULT_RETENTION_DAYS, redact_address, redact_title, retention_days};
 
     #[test]
     fn an_unset_retention_window_falls_back_to_the_documented_default() {
@@ -263,6 +382,144 @@ mod tests {
                 redacted.ends_with("=[redacted]"),
                 "expected {title} to be redacted, got {redacted}"
             );
+        }
+    }
+
+    #[test]
+    fn redact_address_keeps_an_address_without_sensitive_parameters_unchanged() {
+        for address in [
+            "https://open.spotify.com/track/6IgfQZGOB4ZdlzG19MvYtX",
+            "file:///home/user/Videos/talk.mkv",
+            "spotify:track:6IgfQZGOB4ZdlzG19MvYtX",
+        ] {
+            assert_eq!(redact_address(address), address);
+        }
+    }
+
+    #[test]
+    fn redact_address_strips_only_the_sensitive_parameter_values() {
+        let cases = [
+            (
+                "https://host.test/cb?access_token=abc&list=RD123",
+                "https://host.test/cb?access_token=[redacted]&list=RD123",
+            ),
+            (
+                "https://host.test/cb?a=1#access_token=abc",
+                "https://host.test/cb?a=1#access_token=[redacted]",
+            ),
+            (
+                "https://host.test/#/callback?access_token=abc",
+                "https://host.test/#/callback?access_token=[redacted]",
+            ),
+            (
+                "https://host.test/cb?access_token=abc&api_key=xyz&list=RD123",
+                "https://host.test/cb?access_token=[redacted]&api_key=[redacted]&list=RD123",
+            ),
+            (
+                "https://host.test/cb?access%5Ftoken=abc",
+                "https://host.test/cb?access%5Ftoken=[redacted]",
+            ),
+            (
+                "file:///home/user/Videos/talk.mkv?key=abc",
+                "file:///home/user/Videos/talk.mkv?key=[redacted]",
+            ),
+            (
+                "spotify:track:abc?token=xyz#frag?code=123",
+                "spotify:track:abc?token=[redacted]#frag?code=[redacted]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_address(input), expected);
+        }
+    }
+
+    #[test]
+    fn redact_address_matches_exact_spellings_case_insensitively() {
+        for name in [
+            "token", "key", "secret", "password", "code", "TOKEN", "Secret", "CODE",
+        ] {
+            let input = format!("https://host.test/cb?{name}=abc");
+            assert_eq!(
+                redact_address(&input),
+                format!("https://host.test/cb?{name}=[redacted]")
+            );
+        }
+    }
+
+    #[test]
+    fn redact_address_matches_prefixed_spellings() {
+        // A word boundary cannot follow an underscore, so the prefixed spellings are the
+        // ones a naive guard misses.
+        for name in [
+            "access_token",
+            "api_key",
+            "client_secret",
+            "user_password",
+            "auth_code",
+        ] {
+            let input = format!("https://host.test/cb?{name}=abc");
+            assert_eq!(
+                redact_address(&input),
+                format!("https://host.test/cb?{name}=[redacted]")
+            );
+        }
+    }
+
+    #[test]
+    fn redact_address_leaves_relative_or_malformed_values_unchanged() {
+        for value in [
+            "relative/path?token=abc",
+            "not an address",
+            "//host.test/path?token=abc",
+            "",
+        ] {
+            assert_eq!(redact_address(value), value);
+        }
+    }
+
+    #[test]
+    fn redact_address_preserves_every_byte_outside_sensitive_values() {
+        // Generated addresses: every combination of scheme, path, query and fragment, with a
+        // sensitive and a benign parameter interleaved. The invariant is that the output
+        // differs from the input only where a sensitive value stood.
+        let schemes = ["https://", "spotify:", "file:///"];
+        let paths = [
+            "host.test/cb",
+            "open.spotify.com/track/abc",
+            "home/user/Videos/talk.mkv",
+        ];
+        let sensitive = [
+            "access_token",
+            "api_key",
+            "client_secret",
+            "user_password",
+            "auth_code",
+        ];
+        let benign = ["list", "v", "t", "id"];
+
+        for scheme in schemes {
+            for path in paths {
+                for sensitive_name in sensitive {
+                    for benign_name in benign {
+                        let input = format!(
+                            "{scheme}{path}?{benign_name}=keep&{sensitive_name}=drop#frag?{sensitive_name}=drop2"
+                        );
+                        let output = redact_address(&input);
+
+                        // The sensitive values are gone, replaced by the marker.
+                        assert!(!output.contains("=drop"), "value leaked: {output}");
+                        assert!(!output.contains("=drop2"), "value leaked: {output}");
+                        assert_eq!(output.matches("[redacted]").count(), 2, "{output}");
+
+                        // Every byte outside a sensitive value survives, in order: removing
+                        // the markers leaves the input with the sensitive values emptied.
+                        let expected = format!(
+                            "{scheme}{path}?{benign_name}=keep&{sensitive_name}=#frag?{sensitive_name}="
+                        );
+                        assert_eq!(output.replace("[redacted]", ""), expected, "{output}");
+                    }
+                }
+            }
         }
     }
 
