@@ -5,6 +5,7 @@ mod desktop;
 mod export;
 mod input;
 mod lock;
+mod media;
 mod service;
 mod session;
 mod storage;

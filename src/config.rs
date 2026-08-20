@@ -86,6 +86,49 @@ impl Blacklist {
                     .any(|blocked| value.contains(blocked))
         })
     }
+
+    /// Whether a playing media item is excluded, matching each category against its own field.
+    ///
+    /// The desktop `should_skip` tests title terms AND domain terms against one text argument,
+    /// which is right for a window title but wrong for media: a domain entry that excludes a
+    /// bank would start matching an artist, and a title entry would start matching an address.
+    /// Media checks by category instead: application entries against the normalized key, title
+    /// entries against the title, each artist and the album, and domain entries against the
+    /// address alone.
+    pub fn should_skip_media(
+        &self,
+        player_key: &str,
+        title: Option<&str>,
+        artists: &[String],
+        album: Option<&str>,
+        item_url: Option<&str>,
+    ) -> bool {
+        let key = player_key.to_ascii_lowercase();
+        if self.app_classes.iter().any(|blocked| key.contains(blocked)) {
+            return true;
+        }
+
+        let title_matches = |text: &str| {
+            let text = text.to_ascii_lowercase();
+            self.title_terms
+                .iter()
+                .any(|blocked| text.contains(blocked))
+        };
+
+        if title.is_some_and(&title_matches)
+            || artists.iter().any(|artist| title_matches(artist))
+            || album.is_some_and(&title_matches)
+        {
+            return true;
+        }
+
+        item_url.is_some_and(|value| {
+            let value = value.to_ascii_lowercase();
+            self.domain_terms
+                .iter()
+                .any(|blocked| value.contains(blocked))
+        })
+    }
 }
 
 pub fn redact_title(title: &str) -> String {
