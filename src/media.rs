@@ -80,8 +80,8 @@ pub struct BusctlClient {
     command: Vec<String>,
 }
 
-#[allow(dead_code)]
 impl BusctlClient {
+    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             command: vec!["busctl".to_string()],
