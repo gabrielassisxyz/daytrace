@@ -68,7 +68,22 @@ const SEGMENTS_TABLE: &str = "activity_segments";
 const REBUILT_SEGMENTS_TABLE: &str = "activity_segments_rebuilt";
 
 const SEGMENT_COLUMNS: &str = "id, started_at, ended_at, kind, app_class, title, workspace, \
-                               monitor, last_seen_at, created_at";
+                               monitor, last_seen_at, lane, artist, album, item_url, created_at";
+
+/// The partial unique index that enforces one open row per lane.
+const OPEN_LANE_INDEX: &str = "idx_activity_segments_open_lane";
+
+/// The columns a media row needs that no existing column holds, in the order they are added.
+///
+/// The order is the order a crash can leave them in: each prefix of this list is a state the
+/// next open has to finish from, so the migration adds them one at a time rather than in one
+/// statement.
+const MEDIA_COLUMNS: [(&str, &str); 4] = [
+    ("lane", "lane TEXT NOT NULL DEFAULT 'desktop'"),
+    ("artist", "artist TEXT"),
+    ("album", "album TEXT"),
+    ("item_url", "item_url TEXT"),
+];
 
 /// The table as it is written today, for whichever name it is being created under.
 ///
@@ -80,22 +95,39 @@ fn segments_table_ddl(table: &str) -> String {
             id INTEGER PRIMARY KEY,
             started_at INTEGER NOT NULL,
             ended_at INTEGER,
-            kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+            kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown', 'media')),
             app_class TEXT,
             title TEXT,
             workspace TEXT,
             monitor INTEGER,
             last_seen_at INTEGER,
-            created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            lane TEXT NOT NULL DEFAULT 'desktop',
+            artist TEXT,
+            album TEXT,
+            item_url TEXT,
+            created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+            CHECK (
+                (kind = 'media' AND lane GLOB 'media:?*')
+                OR
+                (kind IN ('window', 'idle', 'suspended', 'unknown') AND lane = 'desktop')
+            )
         );"
     )
 }
 
-/// Whether the stored table already accepts a powered-down segment.
+/// The kind literals the current schema declares, in the order the check constraint lists them.
+///
+/// The rebuild guard tests for the complete set rather than for any one value. A database
+/// already widened for `suspended` would otherwise read as done and never gain `media`, and
+/// testing for `media` alone would let a fixture that gained `media` but never `suspended`
+/// skip the rebuild and keep a constraint that rejects a powered-down gap.
+const REQUIRED_KINDS: [&str; 5] = ["'window'", "'idle'", "'suspended'", "'unknown'", "'media'"];
+
+/// Whether the stored table already declares every kind the current schema requires.
 ///
 /// Read back from the schema rather than tracked in a version number, so the test for "has this
 /// migration run" cannot disagree with the migration's actual effect.
-fn stored_kinds_include_suspended(conn: &Connection) -> Result<bool, String> {
+fn stored_kinds_are_complete(conn: &Connection) -> Result<bool, String> {
     let ddl: Option<String> = conn
         .query_row(
             "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -107,7 +139,7 @@ fn stored_kinds_include_suspended(conn: &Connection) -> Result<bool, String> {
 
     // A table that does not exist yet will be created in its current shape, so there is
     // nothing to widen.
-    Ok(ddl.is_none_or(|sql| sql.contains("'suspended'")))
+    Ok(ddl.is_none_or(|sql| REQUIRED_KINDS.iter().all(|kind| sql.contains(kind))))
 }
 /// What a prune deleted, and what it could not finish once the deletion had committed.
 ///
@@ -491,16 +523,28 @@ impl Store {
             .map_err(|error| format!("failed to migrate DB: {error}"))?;
 
         self.add_last_seen_column_if_missing()?;
-        // After the column above, because widening the kind check means rebuilding the table
+        // After the columns above, because widening the kind check means rebuilding the table
         // and the rebuild copies every column by name. Before the index below, because the
         // rebuild drops the indexes that belonged to the old table.
+        self.add_media_columns_if_missing()?;
         self.widen_stored_kinds_if_needed()?;
+        // Before the open-lane index below: a store written before lanes existed can hold
+        // more than one open row, and every one of them lands in the default `desktop` lane,
+        // so the index that enforces one open row per lane would refuse to be created against
+        // them.
+        self.close_legacy_open_rows_if_needed()?;
         self.conn
             .execute_batch(
                 "CREATE INDEX IF NOT EXISTS idx_activity_segments_time
                  ON activity_segments(started_at, ended_at);",
             )
-            .map_err(|error| format!("failed to create the timeline index: {error}"))
+            .map_err(|error| format!("failed to create the timeline index: {error}"))?;
+        self.conn
+            .execute_batch(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_activity_segments_open_lane
+                 ON activity_segments(lane) WHERE ended_at IS NULL;",
+            )
+            .map_err(|error| format!("failed to create the open-lane index: {error}"))
     }
 
     /// A database written before segment progress was tracked has no `last_seen_at`. Adding it
@@ -536,10 +580,44 @@ impl Store {
         }
     }
 
-    /// A database written before powered-down gaps existed constrains `kind` to the three
-    /// values it knew about, and SQLite cannot alter a check constraint in place. Accepting a
-    /// new value therefore means rebuilding the table around a new constraint and copying the
-    /// rows across, which is the documented way to change one.
+    /// Add each media column the stored table lacks, one at a time.
+    ///
+    /// The rebuild copies every column by name, so a column named in the copy list but absent
+    /// from the old table fails the whole migration. Adding them here, the way
+    /// `add_last_seen_column_if_missing` adds its one, means the rebuild always finds them.
+    fn add_media_columns_if_missing(&self) -> Result<(), String> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT name FROM pragma_table_info('activity_segments')")
+            .map_err(|error| format!("failed to inspect schema: {error}"))?;
+        let existing = stmt
+            .query_map([], |row| row.get::<_, String>(0))
+            .map_err(|error| format!("failed to read schema columns: {error}"))?
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| format!("failed to materialize schema columns: {error}"))?;
+
+        for (name, definition) in MEDIA_COLUMNS {
+            if existing.iter().any(|column| column == name) {
+                continue;
+            }
+            match self.conn.execute(
+                &format!("ALTER TABLE activity_segments ADD COLUMN {definition}"),
+                [],
+            ) {
+                Ok(_) => {}
+                // Two processes can both read the pre-migration schema and both try to add
+                // the column. The loser's ALTER is redundant, not a failure.
+                Err(error) if error.to_string().contains("duplicate column name") => {}
+                Err(error) => return Err(format!("failed to add {name} column: {error}")),
+            }
+        }
+        Ok(())
+    }
+
+    /// A database written before powered-down gaps existed constrains `kind` to fewer
+    /// values, and SQLite cannot alter a check constraint in place. Accepting a new value
+    /// therefore means rebuilding the table around a new constraint and copying the rows
+    /// across, which is the documented way to change one.
     ///
     /// The rows are copied column by name rather than with `SELECT *`, which is not symmetric: a
     /// column the copy names and the old table lacks fails the whole migration loudly, while a
@@ -551,7 +629,7 @@ impl Store {
     /// if it is a reporting command. That is the same reach the column migration above already
     /// has, and it is a schema change rather than a change to what the day says happened.
     fn widen_stored_kinds_if_needed(&mut self) -> Result<(), String> {
-        if stored_kinds_include_suspended(&self.conn)? {
+        if stored_kinds_are_complete(&self.conn)? {
             return Ok(());
         }
 
@@ -564,7 +642,7 @@ impl Store {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to start the schema transaction: {error}"))?;
 
-        if stored_kinds_include_suspended(&tx)? {
+        if stored_kinds_are_complete(&tx)? {
             return Ok(());
         }
 
@@ -590,6 +668,58 @@ impl Store {
 
         tx.commit()
             .map_err(|error| format!("failed to commit the widened activity kinds: {error}"))
+    }
+
+    /// Close open rows that would stop the open-lane index from being created.
+    ///
+    /// A store written before lanes existed can hold more than one open row, and every one of
+    /// them lands in the default `desktop` lane, so the unique index that enforces one open
+    /// row per lane would refuse to be created against them. Closing them at each row's own
+    /// last observation is the same value recovery writes at the next daemon start, so
+    /// nothing is lost and no activity is deleted. A single open row is the ordinary crash
+    /// case and is left alone: closing it here would change what a report shows for a row
+    /// written before progress tracking existed, which still reads as reaching the present.
+    /// The step runs only while the index is absent: once it exists, an open row is the
+    /// daemon's own, and a reporting command must not close it.
+    fn close_legacy_open_rows_if_needed(&self) -> Result<(), String> {
+        if self.open_lane_index_exists()? {
+            return Ok(());
+        }
+        let conflicting: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM (
+                     SELECT lane FROM activity_segments WHERE ended_at IS NULL
+                     GROUP BY lane HAVING COUNT(*) > 1
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to count conflicting open segments: {error}"))?;
+        if conflicting == 0 {
+            return Ok(());
+        }
+        self.conn
+            .execute(
+                "UPDATE activity_segments
+                 SET ended_at = COALESCE(last_seen_at, started_at)
+                 WHERE ended_at IS NULL",
+                [],
+            )
+            .map(|_| ())
+            .map_err(|error| format!("failed to close legacy open segments: {error}"))
+    }
+
+    fn open_lane_index_exists(&self) -> Result<bool, String> {
+        let count: i64 = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                params![OPEN_LANE_INDEX],
+                |row| row.get(0),
+            )
+            .map_err(|error| format!("failed to inspect the open-lane index: {error}"))?;
+        Ok(count > 0)
     }
 
     fn secure_permissions(&self) -> Result<(), String> {
@@ -2249,5 +2379,532 @@ mod tests {
         store
             .record_powered_down_gap(1_000, 5_000)
             .expect("the widened constraint must accept a suspended row");
+    }
+
+    /// The schema exactly as it ships today, before the media columns and the `media` kind.
+    fn seed_current_schema(db: &Path) {
+        let conn = Connection::open(db).expect("seed connection");
+        conn.execute_batch(
+            "CREATE TABLE activity_segments (
+                id INTEGER PRIMARY KEY,
+                started_at INTEGER NOT NULL,
+                ended_at INTEGER,
+                kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+                app_class TEXT,
+                title TEXT,
+                workspace TEXT,
+                monitor INTEGER,
+                last_seen_at INTEGER,
+                created_at INTEGER NOT NULL DEFAULT (unixepoch())
+            );",
+        )
+        .expect("seed current schema");
+    }
+
+    /// Create the current schema, then add a subset of the media columns the way a crash
+    /// mid-migration would leave them, with a non-null sentinel in each added nullable column.
+    fn seed_partial_media_columns(db: &Path, added: &[&str]) {
+        seed_current_schema(db);
+        let conn = Connection::open(db).expect("seed connection");
+        for column in added {
+            let definition = super::MEDIA_COLUMNS
+                .iter()
+                .find(|(name, _)| *name == *column)
+                .map(|(_, definition)| *definition)
+                .expect("known media column");
+            conn.execute_batch(&format!(
+                "ALTER TABLE activity_segments ADD COLUMN {definition};"
+            ))
+            .expect("add media column");
+        }
+        conn.execute_batch(
+            "INSERT INTO activity_segments
+                (id, started_at, ended_at, kind, app_class, title, workspace, monitor,
+                 last_seen_at, created_at)
+             VALUES (1, 100, 200, 'window', 'app', 'title', 'ws', 3, 150, 400);",
+        )
+        .expect("seed a window row");
+        let assignments: Vec<String> = added
+            .iter()
+            .filter(|column| **column != "lane")
+            .map(|column| format!("{column} = '{column}-sentinel'"))
+            .collect();
+        if !assignments.is_empty() {
+            conn.execute_batch(&format!(
+                "UPDATE activity_segments SET {};",
+                assignments.join(", ")
+            ))
+            .expect("set sentinels");
+        }
+    }
+
+    #[test]
+    fn a_current_schema_database_migrates_in_place_with_every_row_marked_desktop() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments
+                    (id, started_at, ended_at, kind, app_class, title, workspace, monitor,
+                     last_seen_at, created_at)
+                VALUES
+                    (42, 111, 222, 'window', 'app-class-marker', 'title-marker',
+                     'workspace-marker', 7, 333, 444);",
+            )
+            .expect("seed the exact current schema");
+        drop(legacy);
+
+        Store::open(&db, None).expect("migrate the current database");
+
+        let conn = Connection::open(&db).expect("connection");
+        let row = conn
+            .query_row(
+                "SELECT id, started_at, ended_at, kind, app_class, title, workspace, monitor,
+                        last_seen_at, lane, artist, album, item_url, created_at
+                 FROM activity_segments",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, i64>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, String>(5)?,
+                        row.get::<_, String>(6)?,
+                        row.get::<_, i64>(7)?,
+                        row.get::<_, i64>(8)?,
+                        row.get::<_, String>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<String>>(11)?,
+                        row.get::<_, Option<String>>(12)?,
+                        row.get::<_, i64>(13)?,
+                    ))
+                },
+            )
+            .expect("read the migrated row back");
+
+        assert_eq!(row.0, 42, "id");
+        assert_eq!(row.1, 111, "started_at");
+        assert_eq!(row.2, 222, "ended_at");
+        assert_eq!(row.3, "window", "kind");
+        assert_eq!(row.4, "app-class-marker", "app_class");
+        assert_eq!(row.5, "title-marker", "title");
+        assert_eq!(row.6, "workspace-marker", "workspace");
+        assert_eq!(row.7, 7, "monitor");
+        assert_eq!(row.8, 333, "last_seen_at");
+        assert_eq!(row.9, "desktop", "lane");
+        assert_eq!(row.10, None, "artist");
+        assert_eq!(row.11, None, "album");
+        assert_eq!(row.12, None, "item_url");
+        assert_eq!(row.13, 444, "created_at");
+    }
+
+    #[test]
+    fn a_schema_with_media_but_without_suspended_still_rebuilds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'unknown', 'media')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );",
+            )
+            .expect("seed a schema with media but no suspended");
+        drop(legacy);
+
+        let mut store = Store::open(&db, None).expect("migrate");
+        store
+            .record_powered_down_gap(1_000, 5_000)
+            .expect("the rebuilt constraint must accept a suspended row");
+    }
+
+    #[test]
+    fn the_rebuild_preserves_non_null_media_columns_from_a_partially_upgraded_table() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    lane TEXT NOT NULL DEFAULT 'desktop',
+                    artist TEXT,
+                    album TEXT,
+                    item_url TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments
+                    (id, started_at, ended_at, kind, app_class, title, workspace, monitor,
+                     last_seen_at, lane, artist, album, item_url, created_at)
+                VALUES
+                    (1, 100, 200, 'window', 'app', 'title', 'ws', 3, 150, 'desktop',
+                     'artist-sentinel', 'album-sentinel', 'item-url-sentinel', 400);",
+            )
+            .expect("seed a partially upgraded table");
+        drop(legacy);
+
+        Store::open(&db, None).expect("migrate");
+
+        let conn = Connection::open(&db).expect("connection");
+        let (artist, album, item_url): (Option<String>, Option<String>, Option<String>) = conn
+            .query_row(
+                "SELECT artist, album, item_url FROM activity_segments",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read back");
+        assert_eq!(artist.as_deref(), Some("artist-sentinel"));
+        assert_eq!(album.as_deref(), Some("album-sentinel"));
+        assert_eq!(item_url.as_deref(), Some("item-url-sentinel"));
+    }
+
+    #[test]
+    fn every_partial_media_column_state_finishes_on_the_next_open() {
+        // Each prefix of the ALTER order, plus one non-prefix subset.
+        let states: [&[&str]; 5] = [
+            &["lane"],
+            &["lane", "artist"],
+            &["lane", "artist", "album"],
+            &["lane", "artist", "album", "item_url"],
+            &["artist", "item_url"],
+        ];
+        for added in states {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = dir.path().join("daytrace.db");
+            seed_partial_media_columns(&db, added);
+
+            Store::open(&db, None).expect("migrate a partial state");
+
+            let conn = Connection::open(&db).expect("connection");
+            conn.execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane, artist, album, item_url)
+                 VALUES (1, 2, 'media', 'spotify', 'Track', 'media:spotify', 'Artist', 'Album', 'https://x.test')",
+                [],
+            )
+            .expect("the widened constraint must accept a media row");
+            for column in added {
+                if *column == "lane" {
+                    continue;
+                }
+                let value: Option<String> = conn
+                    .query_row(
+                        &format!("SELECT {column} FROM activity_segments WHERE kind = 'window'"),
+                        [],
+                        |row| row.get(0),
+                    )
+                    .expect("read sentinel back");
+                let expected = format!("{column}-sentinel");
+                assert_eq!(
+                    value.as_deref(),
+                    Some(expected.as_str()),
+                    "the {column} sentinel must survive the rebuild"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn two_connections_migrating_a_pre_media_database_at_once_both_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        let db_a = db.clone();
+        let db_b = db.clone();
+        let a = std::thread::spawn(move || Store::open(&db_a, None));
+        let b = std::thread::spawn(move || Store::open(&db_b, None));
+        let store_a = a.join().expect("thread a").expect("open a");
+        let store_b = b.join().expect("thread b").expect("open b");
+
+        let ddl: String = store_a
+            .conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'activity_segments'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read ddl");
+        assert!(
+            ddl.contains("'media'"),
+            "the schema must be complete: {ddl}"
+        );
+        drop(store_b);
+    }
+
+    #[test]
+    fn a_direct_insert_naming_no_lane_produces_a_desktop_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let store = Store::open(&db, None).expect("store");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title)
+                 VALUES (100, 200, 'window', 'app', 'title')",
+                [],
+            )
+            .expect("insert without a lane");
+
+        let lane: String = store
+            .conn
+            .query_row("SELECT lane FROM activity_segments", [], |row| row.get(0))
+            .expect("read lane");
+        assert_eq!(lane, "desktop");
+    }
+
+    #[test]
+    fn the_schema_refuses_a_kind_and_lane_that_disagree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let store = Store::open(&db, None).expect("store");
+
+        let media_in_desktop = store.conn.execute(
+            "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title)
+             VALUES (100, 200, 'media', 'spotify', 'Track')",
+            [],
+        );
+        assert!(
+            media_in_desktop.is_err(),
+            "a media row must not land in the desktop lane"
+        );
+
+        let empty_suffix = store.conn.execute(
+            "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+             VALUES (100, 200, 'media', 'spotify', 'Track', 'media:')",
+            [],
+        );
+        assert!(empty_suffix.is_err(), "a media lane must name a player");
+
+        let desktop_in_media = store.conn.execute(
+            "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+             VALUES (100, 200, 'window', 'app', 'title', 'media:spotify')",
+            [],
+        );
+        assert!(
+            desktop_in_media.is_err(),
+            "a desktop kind must not land in a media lane"
+        );
+    }
+
+    #[test]
+    fn a_media_row_round_trips_all_five_facts_and_a_desktop_row_keeps_them_null() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let store = Store::open(&db, None).expect("store");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane, artist, album, item_url)
+                 VALUES (100, 200, 'media', 'spotify', 'Track Title',
+                         'media:org.mpris.MediaPlayer2.spotify', 'Artist', 'Album',
+                         'https://open.spotify.com/track/abc')",
+                [],
+            )
+            .expect("insert media row");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title)
+                 VALUES (300, 400, 'window', 'app', 'title')",
+                [],
+            )
+            .expect("insert desktop row");
+
+        let media: (String, String, String, String, String) = store
+            .conn
+            .query_row(
+                "SELECT app_class, title, artist, album, item_url
+                 FROM activity_segments WHERE kind = 'media'",
+                [],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .expect("read media row");
+        assert_eq!(
+            media,
+            (
+                "spotify".to_string(),
+                "Track Title".to_string(),
+                "Artist".to_string(),
+                "Album".to_string(),
+                "https://open.spotify.com/track/abc".to_string(),
+            )
+        );
+
+        let desktop: (Option<String>, Option<String>, Option<String>) = store
+            .conn
+            .query_row(
+                "SELECT artist, album, item_url FROM activity_segments WHERE kind = 'window'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read desktop row");
+        assert_eq!(desktop, (None, None, None));
+    }
+
+    #[test]
+    fn two_open_rows_in_different_lanes_are_accepted_and_a_second_in_one_lane_is_refused() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let store = Store::open(&db, None).expect("store");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, kind, app_class, title, lane)
+                 VALUES (100, 'media', 'spotify', 'Track', 'media:spotify')",
+                [],
+            )
+            .expect("open media row");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, kind, app_class, title)
+                 VALUES (100, 'window', 'app', 'title')",
+                [],
+            )
+            .expect("open desktop row");
+
+        let second_desktop = store.conn.execute(
+            "INSERT INTO activity_segments (started_at, kind, app_class, title)
+             VALUES (100, 'window', 'other', 'other title')",
+            [],
+        );
+        assert!(
+            second_desktop.is_err(),
+            "a second open desktop row must be refused by the database"
+        );
+    }
+
+    #[test]
+    fn a_current_schema_with_two_legacy_open_rows_migrates_by_closing_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch())
+                );
+                INSERT INTO activity_segments (id, started_at, ended_at, kind, app_class, last_seen_at)
+                VALUES (1, 100, NULL, 'window', 'app-a', 150),
+                       (2, 200, NULL, 'window', 'app-b', 250);",
+            )
+            .expect("seed two legacy open rows");
+        drop(legacy);
+
+        Store::open(&db, None).expect("migrate must not fail against two open rows");
+
+        let conn = Connection::open(&db).expect("connection");
+        let rows: Vec<(i64, i64)> = conn
+            .prepare("SELECT id, ended_at FROM activity_segments ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![(1, 150), (2, 250)],
+            "each open row closes at its own last observation"
+        );
+    }
+
+    #[test]
+    fn both_indexes_survive_the_rebuild_and_a_second_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        Store::open(&db, None).expect("migrate");
+        Store::open(&db, None).expect("reopen");
+
+        let conn = Connection::open(&db).expect("connection");
+        let indexes: Vec<(String, String)> = conn
+            .prepare(
+                "SELECT name, sql FROM sqlite_master
+                 WHERE type = 'index'
+                   AND name IN ('idx_activity_segments_time', 'idx_activity_segments_open_lane')
+                 ORDER BY name",
+            )
+            .expect("prepare")
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+
+        assert_eq!(indexes.len(), 2, "both indexes must exist: {indexes:?}");
+        let time = indexes
+            .iter()
+            .find(|(name, _)| name == "idx_activity_segments_time")
+            .expect("time index");
+        assert!(
+            time.1.contains("started_at") && time.1.contains("ended_at"),
+            "the time index must keep its definition: {}",
+            time.1
+        );
+        let lane = indexes
+            .iter()
+            .find(|(name, _)| name == "idx_activity_segments_open_lane")
+            .expect("lane index");
+        assert!(
+            lane.1.contains("UNIQUE") && lane.1.contains("WHERE ended_at IS NULL"),
+            "the lane index must stay a partial unique index: {}",
+            lane.1
+        );
     }
 }
