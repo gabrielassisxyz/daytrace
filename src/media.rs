@@ -447,7 +447,7 @@ mod tests {
         normalize_bus_name, parse_discovery, parse_properties, property_command, run_bounded,
     };
     use crate::config::Blacklist;
-    use std::process::Command;
+    use std::process::{Command, Stdio};
     use std::time::{Duration, Instant};
 
     /// The discovery listing as `busctl --user list --no-pager --no-legend --full` printed it,
@@ -857,6 +857,9 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
         assert!(result.unwrap_err().contains("timed out"));
 
         // The child was killed AND reaped: its pid is no longer alive, not even as a zombie.
+        // `expect` rather than `unwrap_or(false)`, so a failure to spawn the probe fails the
+        // test instead of reading as "not alive"; stderr is dropped because "No such process"
+        // is the expected output of a successful reap.
         let pid: i32 = std::fs::read_to_string(&pid_file)
             .expect("pid file")
             .trim()
@@ -864,9 +867,10 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
             .expect("pid");
         let alive = Command::new("kill")
             .args(["-0", &pid.to_string()])
+            .stderr(Stdio::null())
             .status()
-            .map(|status| status.success())
-            .unwrap_or(false);
+            .expect("spawn kill")
+            .success();
         assert!(!alive, "child {pid} was not reaped after the timeout");
     }
 
