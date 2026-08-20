@@ -461,11 +461,11 @@ org.mpris.MediaPlayer2.playerctld                                     100201 pla
     const CHROMIUM_PLAYING: &str = r#"{"type":"s","data":"Playing"}
 {"type":"a{sv}","data":{"mpris:length":{"type":"x","data":2596991999},"mpris:trackid":{"type":"o","data":"/com/brave/MediaPlayer2/TrackList/TrackFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"},"xesam:album":{"type":"s","data":""},"xesam:artist":{"type":"as","data":[""]},"xesam:title":{"type":"s","data":"Example Video Title"}}}"#;
 
-    /// A Spotify property query, built from the plan's prose description of the second player's
-    /// shape: an `s`-typed trackid, a populated artist array, an `xesam:url` and an `artUrl`.
-    /// The real capture is still pending, so every value here is fictional.
+    /// A Spotify property query, the sanitized capture of a real player: eleven keys, with the
+    /// `t`, `d` and `i` typings a constructed fixture never carried. Every value is fictional;
+    /// the structure and type tags are byte-for-byte what the player emitted.
     const SPOTIFY_PLAYING: &str = r#"{"type":"s","data":"Playing"}
-{"type":"a{sv}","data":{"mpris:length":{"type":"x","data":180000000},"mpris:artUrl":{"type":"s","data":"https://i.scdn.co/image/ab67616d0000b273000000000000000000000000"},"mpris:trackid":{"type":"s","data":"spotify:track:6IgfQZGOB4ZdlzG19MvYtX"},"xesam:album":{"type":"s","data":"Example Album"},"xesam:artist":{"type":"as","data":["Example Artist"]},"xesam:title":{"type":"s","data":"Example Track"},"xesam:url":{"type":"s","data":"https://open.spotify.com/track/6IgfQZGOB4ZdlzG19MvYtX"}}}"#;
+{"type":"a{sv}","data":{"mpris:trackid":{"type":"s","data":"spotify:track:0000000000000000000000"},"mpris:length":{"type":"t","data":213000000},"mpris:artUrl":{"type":"s","data":"https://i.scdn.co/image/0000000000000000000000000000000000000000"},"xesam:album":{"type":"s","data":"A Fictional Album"},"xesam:albumArtist":{"type":"as","data":["A Fictional Artist","A Second Artist"]},"xesam:artist":{"type":"as","data":["A Fictional Artist","A Second Artist"]},"xesam:autoRating":{"type":"d","data":0.5},"xesam:discNumber":{"type":"i","data":1},"xesam:title":{"type":"s","data":"A Fictional Title"},"xesam:trackNumber":{"type":"i","data":1},"xesam:url":{"type":"s","data":"https://open.spotify.com/track/0000000000000000000000"}}}"#;
 
     fn parse(output: &str, full: &str, key: &str) -> PlayerOutcome {
         parse_properties(
@@ -721,15 +721,20 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
         // The Spotify fixture carries an `s`-typed trackid and an artUrl; the Chromium one an
         // `o`-typed trackid. Neither field exists on PlayingMedia, so the whole returned value is
         // asserted to prove both are dropped.
+        //
+        // The same assertion also proves the parser survives the real player's `t`, `d` and `i`
+        // typings (a uint64 length, a double rating, int32 disc and track numbers) and skips the
+        // fields this feature has no use for: autoRating, discNumber, trackNumber, length and
+        // the second `as` field albumArtist, rather than failing on them.
         assert_eq!(
             parse(SPOTIFY_PLAYING, "org.mpris.MediaPlayer2.spotify", "spotify"),
             playing(
                 "spotify",
                 "org.mpris.MediaPlayer2.spotify",
-                Some("Example Track"),
-                Some("Example Artist"),
-                Some("Example Album"),
-                Some("https://open.spotify.com/track/6IgfQZGOB4ZdlzG19MvYtX"),
+                Some("A Fictional Title"),
+                Some("A Fictional Artist, A Second Artist"),
+                Some("A Fictional Album"),
+                Some("https://open.spotify.com/track/0000000000000000000000"),
             )
         );
     }
