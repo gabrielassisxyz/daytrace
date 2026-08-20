@@ -85,17 +85,30 @@ const MEDIA_COLUMNS: [(&str, &str); 4] = [
     ("item_url", "item_url TEXT"),
 ];
 
+/// The kinds a segment can be, in the order the check constraint lists them.
+///
+/// The single source of truth for the kind set. The `kind IN (...)` list and the rebuild
+/// guard both derive from this, so a kind added here cannot be missing from either. The
+/// lane-agreement CHECK below does not list kinds at all: it only tells `media` apart from
+/// everything else, so it cannot drift either.
+const KINDS: [&str; 5] = ["window", "idle", "suspended", "unknown", "media"];
+
 /// The table as it is written today, for whichever name it is being created under.
 ///
 /// One definition shared by the initial creation and by the rebuild that widens `kind`, so the
 /// two cannot drift into two different shapes of the same table.
 fn segments_table_ddl(table: &str) -> String {
+    let kinds = KINDS
+        .iter()
+        .map(|kind| format!("'{kind}'"))
+        .collect::<Vec<_>>()
+        .join(", ");
     format!(
         "CREATE TABLE IF NOT EXISTS {table} (
             id INTEGER PRIMARY KEY,
             started_at INTEGER NOT NULL,
             ended_at INTEGER,
-            kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown', 'media')),
+            kind TEXT NOT NULL CHECK (kind IN ({kinds})),
             app_class TEXT,
             title TEXT,
             workspace TEXT,
@@ -109,19 +122,11 @@ fn segments_table_ddl(table: &str) -> String {
             CHECK (
                 (kind = 'media' AND lane GLOB 'media:?*')
                 OR
-                (kind IN ('window', 'idle', 'suspended', 'unknown') AND lane = 'desktop')
+                (kind != 'media' AND lane = 'desktop')
             )
         );"
     )
 }
-
-/// The kind literals the current schema declares, in the order the check constraint lists them.
-///
-/// The rebuild guard tests for the complete set rather than for any one value. A database
-/// already widened for `suspended` would otherwise read as done and never gain `media`, and
-/// testing for `media` alone would let a fixture that gained `media` but never `suspended`
-/// skip the rebuild and keep a constraint that rejects a powered-down gap.
-const REQUIRED_KINDS: [&str; 5] = ["'window'", "'idle'", "'suspended'", "'unknown'", "'media'"];
 
 /// Whether the stored table already declares every kind the current schema requires.
 ///
@@ -139,7 +144,20 @@ fn stored_kinds_are_complete(conn: &Connection) -> Result<bool, String> {
 
     // A table that does not exist yet will be created in its current shape, so there is
     // nothing to widen.
-    Ok(ddl.is_none_or(|sql| REQUIRED_KINDS.iter().all(|kind| sql.contains(kind))))
+    Ok(ddl.is_none_or(|sql| {
+        // The lane-agreement CHECK below the kind column spells out `media` a second time, so
+        // searching the whole DDL would let that literal satisfy the guard while the
+        // `kind IN (...)` list itself has not been widened. Scope the search to that list.
+        let kind_list = sql
+            .split_once("kind IN (")
+            .and_then(|(_, rest)| rest.split_once(')'))
+            .map(|(list, _)| list)
+            .unwrap_or("");
+        KINDS
+            .iter()
+            .copied()
+            .all(|kind| kind_list.contains(&format!("'{kind}'")))
+    }))
 }
 /// What a prune deleted, and what it could not finish once the deletion had committed.
 ///
@@ -676,11 +694,14 @@ impl Store {
     /// them lands in the default `desktop` lane, so the unique index that enforces one open
     /// row per lane would refuse to be created against them. Closing them at each row's own
     /// last observation is the same value recovery writes at the next daemon start, so
-    /// nothing is lost and no activity is deleted. A single open row is the ordinary crash
-    /// case and is left alone: closing it here would change what a report shows for a row
-    /// written before progress tracking existed, which still reads as reaching the present.
-    /// The step runs only while the index is absent: once it exists, an open row is the
-    /// daemon's own, and a reporting command must not close it.
+    /// nothing is lost and no activity is deleted.
+    ///
+    /// The guard is the conflict count, not the index's absence: the next kind widening drops
+    /// the index again, so "the index is absent" is true on a database that already has live
+    /// media lanes. Only a lane holding two or more open rows is closed, so a single open row
+    /// (the ordinary crash case, or the daemon's own) is left alone. Closing a lone row here
+    /// would change what a report shows for a row written before progress tracking existed,
+    /// which still reads as reaching the present.
     fn close_legacy_open_rows_if_needed(&self) -> Result<(), String> {
         if self.open_lane_index_exists()? {
             return Ok(());
@@ -2543,6 +2564,50 @@ mod tests {
     }
 
     #[test]
+    fn a_short_kind_list_with_the_lane_check_present_still_rebuilds() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let legacy = Connection::open(&db).expect("legacy connection");
+        legacy
+            .execute_batch(
+                "CREATE TABLE activity_segments (
+                    id INTEGER PRIMARY KEY,
+                    started_at INTEGER NOT NULL,
+                    ended_at INTEGER,
+                    kind TEXT NOT NULL CHECK (kind IN ('window', 'idle', 'suspended', 'unknown')),
+                    app_class TEXT,
+                    title TEXT,
+                    workspace TEXT,
+                    monitor INTEGER,
+                    last_seen_at INTEGER,
+                    lane TEXT NOT NULL DEFAULT 'desktop',
+                    artist TEXT,
+                    album TEXT,
+                    item_url TEXT,
+                    created_at INTEGER NOT NULL DEFAULT (unixepoch()),
+                    CHECK (
+                        (kind = 'media' AND lane GLOB 'media:?*')
+                        OR
+                        (kind IN ('window', 'idle', 'suspended', 'unknown') AND lane = 'desktop')
+                    )
+                );",
+            )
+            .expect("seed a short kind list with the lane check present");
+        drop(legacy);
+
+        let store = Store::open(&db, None).expect("migrate");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (1, 2, 'media', 'spotify', 'Track', 'media:spotify')",
+                [],
+            )
+            .expect("the widened constraint must accept a media row");
+    }
+
+    #[test]
     fn the_rebuild_preserves_non_null_media_columns_from_a_partially_upgraded_table() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
@@ -2642,10 +2707,22 @@ mod tests {
         let db = dir.path().join("daytrace.db");
         seed_current_schema(&db);
 
+        // A barrier so the two migrations actually overlap rather than running one after the
+        // other, which would pass without exercising the race the IMMEDIATE transaction and
+        // the duplicate-column tolerance exist to settle.
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
         let db_a = db.clone();
         let db_b = db.clone();
-        let a = std::thread::spawn(move || Store::open(&db_a, None));
-        let b = std::thread::spawn(move || Store::open(&db_b, None));
+        let barrier_a = std::sync::Arc::clone(&barrier);
+        let barrier_b = std::sync::Arc::clone(&barrier);
+        let a = std::thread::spawn(move || {
+            barrier_a.wait();
+            Store::open(&db_a, None)
+        });
+        let b = std::thread::spawn(move || {
+            barrier_b.wait();
+            Store::open(&db_b, None)
+        });
         let store_a = a.join().expect("thread a").expect("open a");
         let store_b = b.join().expect("thread b").expect("open b");
 
@@ -2686,37 +2763,50 @@ mod tests {
         assert_eq!(lane, "desktop");
     }
 
+    /// Assert that an insert was refused by a CHECK constraint, not by some other failure.
+    ///
+    /// `is_err()` alone would pass the moment any NOT NULL column without a default is added,
+    /// since that also refuses the insert but for a reason that has nothing to do with the
+    /// kind/lane agreement this test exists to pin.
+    fn assert_check_constraint_failed(result: rusqlite::Result<usize>, context: &str) {
+        let error = result.expect_err(context);
+        assert!(
+            error.to_string().contains("CHECK constraint failed"),
+            "{context}: expected a CHECK constraint failure, got: {error}"
+        );
+    }
+
     #[test]
     fn the_schema_refuses_a_kind_and_lane_that_disagree() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
         let store = Store::open(&db, None).expect("store");
 
-        let media_in_desktop = store.conn.execute(
-            "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title)
-             VALUES (100, 200, 'media', 'spotify', 'Track')",
-            [],
-        );
-        assert!(
-            media_in_desktop.is_err(),
-            "a media row must not land in the desktop lane"
+        assert_check_constraint_failed(
+            store.conn.execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title)
+                 VALUES (100, 200, 'media', 'spotify', 'Track')",
+                [],
+            ),
+            "a media row must not land in the desktop lane",
         );
 
-        let empty_suffix = store.conn.execute(
-            "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
-             VALUES (100, 200, 'media', 'spotify', 'Track', 'media:')",
-            [],
+        assert_check_constraint_failed(
+            store.conn.execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (100, 200, 'media', 'spotify', 'Track', 'media:')",
+                [],
+            ),
+            "a media lane must name a player",
         );
-        assert!(empty_suffix.is_err(), "a media lane must name a player");
 
-        let desktop_in_media = store.conn.execute(
-            "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
-             VALUES (100, 200, 'window', 'app', 'title', 'media:spotify')",
-            [],
-        );
-        assert!(
-            desktop_in_media.is_err(),
-            "a desktop kind must not land in a media lane"
+        assert_check_constraint_failed(
+            store.conn.execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (100, 200, 'window', 'app', 'title', 'media:spotify')",
+                [],
+            ),
+            "a desktop kind must not land in a media lane",
         );
     }
 
