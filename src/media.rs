@@ -399,3 +399,513 @@ fn run_bounded(command: &mut Command, deadline: Instant) -> Result<Vec<u8>, Stri
         }
     }
 }
+
+#[cfg(test)]
+pub mod fakes {
+    use super::{MediaSource, PlayerOutcome};
+    use crate::config::Blacklist;
+    use std::cell::RefCell;
+
+    /// A media boundary that replays a fixed script of outcomes.
+    ///
+    /// Responses are popped from the back, so the last listed response is served first, matching
+    /// the desktop fake. This is what later beads drive the capture loop with.
+    pub struct ScriptedMediaSource {
+        remaining: RefCell<Vec<Result<Vec<PlayerOutcome>, String>>>,
+    }
+
+    impl ScriptedMediaSource {
+        pub fn new(responses: Vec<Result<Vec<PlayerOutcome>, String>>) -> Self {
+            Self {
+                remaining: RefCell::new(responses),
+            }
+        }
+    }
+
+    impl MediaSource for ScriptedMediaSource {
+        fn poll(&self, _blacklist: &Blacklist) -> Result<Vec<PlayerOutcome>, String> {
+            self.remaining
+                .borrow_mut()
+                .pop()
+                .expect("script ran out of responses")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::fakes;
+    use super::{
+        BusName, BusctlClient, MediaSource, PlayerOutcome, PlayingMedia, discovery_command,
+        normalize_bus_name, parse_discovery, parse_properties, property_command, run_bounded,
+    };
+    use crate::config::Blacklist;
+    use std::os::unix::fs::PermissionsExt;
+    use std::process::Command;
+    use std::time::{Duration, Instant};
+
+    /// The discovery listing as `busctl --user list --no-pager --no-legend --full` printed it,
+    /// with the pid and process names replaced by fictional values.
+    const DISCOVERY: &str = "\
+org.mpris.MediaPlayer2.brave.instance100200                           100200 brave           user :1.1993       user@1000.service - -
+org.mpris.MediaPlayer2.playerctld                                     100201 playerctld      user :1.10162      user@1000.service - -
+";
+
+    /// A Chromium-family property query, byte-for-byte the shape `busctl --json=short` printed,
+    /// with the title and track id replaced by fictional values. Note the `o`-typed trackid, the
+    /// artist array holding one empty string, and the absent `xesam:url`.
+    const CHROMIUM_PAUSED: &str = r#"{"type":"s","data":"Paused"}
+{"type":"a{sv}","data":{"mpris:length":{"type":"x","data":2596991999},"mpris:trackid":{"type":"o","data":"/com/brave/MediaPlayer2/TrackList/TrackFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"},"xesam:album":{"type":"s","data":""},"xesam:artist":{"type":"as","data":[""]},"xesam:title":{"type":"s","data":"Example Video Title"}}}"#;
+
+    /// The same Chromium shape at `Playing`.
+    const CHROMIUM_PLAYING: &str = r#"{"type":"s","data":"Playing"}
+{"type":"a{sv}","data":{"mpris:length":{"type":"x","data":2596991999},"mpris:trackid":{"type":"o","data":"/com/brave/MediaPlayer2/TrackList/TrackFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF"},"xesam:album":{"type":"s","data":""},"xesam:artist":{"type":"as","data":[""]},"xesam:title":{"type":"s","data":"Example Video Title"}}}"#;
+
+    /// A Spotify property query, built from the plan's prose description of the second player's
+    /// shape: an `s`-typed trackid, a populated artist array, an `xesam:url` and an `artUrl`.
+    /// The real capture is still pending, so every value here is fictional.
+    const SPOTIFY_PLAYING: &str = r#"{"type":"s","data":"Playing"}
+{"type":"a{sv}","data":{"mpris:length":{"type":"x","data":180000000},"mpris:artUrl":{"type":"s","data":"https://i.scdn.co/image/ab67616d0000b273000000000000000000000000"},"mpris:trackid":{"type":"s","data":"spotify:track:6IgfQZGOB4ZdlzG19MvYtX"},"xesam:album":{"type":"s","data":"Example Album"},"xesam:artist":{"type":"as","data":["Example Artist"]},"xesam:title":{"type":"s","data":"Example Track"},"xesam:url":{"type":"s","data":"https://open.spotify.com/track/6IgfQZGOB4ZdlzG19MvYtX"}}}"#;
+
+    fn parse(output: &str, full: &str, key: &str) -> PlayerOutcome {
+        parse_properties(
+            output,
+            &BusName {
+                full: full.to_string(),
+                key: key.to_string(),
+            },
+            &Blacklist::default(),
+        )
+    }
+
+    fn playing(
+        key: &str,
+        full: &str,
+        title: Option<&str>,
+        artist: Option<&str>,
+        album: Option<&str>,
+        url: Option<&str>,
+    ) -> PlayerOutcome {
+        PlayerOutcome::Playing(PlayingMedia {
+            player_key: key.to_string(),
+            bus_name: full.to_string(),
+            title: title.map(str::to_string),
+            artist: artist.map(str::to_string),
+            album: album.map(str::to_string),
+            item_url: url.map(str::to_string),
+        })
+    }
+
+    #[test]
+    fn discovery_selects_the_mpris_names_and_their_keys() {
+        assert_eq!(
+            parse_discovery(DISCOVERY),
+            vec![BusName {
+                full: "org.mpris.MediaPlayer2.brave.instance100200".to_string(),
+                key: "brave".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn discovery_reads_only_the_first_column_and_the_exact_prefix() {
+        let listing = "\
+org.mpris.MediaPlayer20.fake 100 fake user :1.1 user@1000.service - -
+:1.42 101 some user :1.2 user@1000.service - -
+org.mpris.MediaPlayer2.spotify 102 spotify user :1.3 user@1000.service - -
+some.service 103 org.mpris.MediaPlayer2.later user :1.4 user@1000.service - -
+";
+        assert_eq!(
+            parse_discovery(listing),
+            vec![BusName {
+                full: "org.mpris.MediaPlayer2.spotify".to_string(),
+                key: "spotify".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn playerctld_is_excluded_by_bus_name_not_by_payload() {
+        // The measured fixture: playerctld republished the browser's metadata byte-for-byte under
+        // its own bus name, so a dedup by identity or metadata cannot see it. The exclusion has
+        // to be by bus name, at discovery, before any property query runs.
+        let names = parse_discovery(DISCOVERY);
+        assert_eq!(names.len(), 1);
+        assert_eq!(names[0].key, "brave");
+    }
+
+    #[test]
+    fn an_empty_bus_is_an_empty_result() {
+        assert!(parse_discovery("").is_empty());
+        assert!(parse_discovery("   \n\t\n").is_empty());
+    }
+
+    #[test]
+    fn a_bus_with_only_playerctld_is_an_empty_result() {
+        let listing =
+            "org.mpris.MediaPlayer2.playerctld 100 playerctld user :1.1 user@1000.service - -\n";
+        assert!(parse_discovery(listing).is_empty());
+    }
+
+    #[test]
+    fn normalization_strips_the_prefix_and_the_instance_suffix() {
+        assert_eq!(
+            normalize_bus_name("org.mpris.MediaPlayer2.spotify"),
+            Some("spotify".to_string())
+        );
+        assert_eq!(
+            normalize_bus_name("org.mpris.MediaPlayer2.brave.instance834645"),
+            Some("brave".to_string())
+        );
+        // A stable name containing dots keeps them.
+        assert_eq!(
+            normalize_bus_name("org.mpris.MediaPlayer2.com.example.player"),
+            Some("com.example.player".to_string())
+        );
+        // A name with no instance suffix is kept whole.
+        assert_eq!(
+            normalize_bus_name("org.mpris.MediaPlayer2.vlc"),
+            Some("vlc".to_string())
+        );
+        assert_eq!(normalize_bus_name(":1.42"), None);
+        assert_eq!(normalize_bus_name("org.mpris.MediaPlayer20.fake"), None);
+    }
+
+    #[test]
+    fn two_brave_instances_yield_two_entries_with_the_same_key() {
+        let listing = "\
+org.mpris.MediaPlayer2.brave.instance1 100 brave user :1.1 user@1000.service - -
+org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
+";
+        let names = parse_discovery(listing);
+        assert_eq!(names.len(), 2);
+        assert_eq!(names[0].key, "brave");
+        assert_eq!(names[1].key, "brave");
+        assert_ne!(names[0].full, names[1].full);
+    }
+
+    #[test]
+    fn a_paused_player_yields_no_segment() {
+        assert_eq!(
+            parse(
+                CHROMIUM_PAUSED,
+                "org.mpris.MediaPlayer2.brave.instance100200",
+                "brave"
+            ),
+            PlayerOutcome::NotPlaying
+        );
+    }
+
+    #[test]
+    fn a_stopped_player_yields_no_segment() {
+        let stopped = "{\"type\":\"s\",\"data\":\"Stopped\"}\n{\"type\":\"a{sv}\",\"data\":{}}";
+        assert_eq!(
+            parse(stopped, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            PlayerOutcome::NotPlaying
+        );
+    }
+
+    #[test]
+    fn a_missing_playback_status_is_a_failure() {
+        assert!(matches!(
+            parse("", "org.mpris.MediaPlayer2.spotify", "spotify"),
+            PlayerOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn a_wrongly_typed_playback_status_is_a_failure() {
+        let wrong = "{\"type\":\"x\",\"data\":123}\n{\"type\":\"a{sv}\",\"data\":{}}";
+        assert!(matches!(
+            parse(wrong, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            PlayerOutcome::Failed(_)
+        ));
+    }
+
+    #[test]
+    fn unknown_metadata_keys_are_ignored() {
+        let output = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{\"mpris:length\":{\"type\":\"x\",\"data\":123},\"some:unknown\":{\"type\":\"s\",\"data\":\"ignored\"},\"xesam:title\":{\"type\":\"s\",\"data\":\"Track\"}}}";
+        assert_eq!(
+            parse(output, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            playing(
+                "spotify",
+                "org.mpris.MediaPlayer2.spotify",
+                Some("Track"),
+                None,
+                None,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn a_wrongly_typed_known_field_is_dropped_alone() {
+        let output = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{\"xesam:title\":{\"type\":\"x\",\"data\":123},\"xesam:album\":{\"type\":\"s\",\"data\":\"Album\"}}}";
+        assert_eq!(
+            parse(output, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            playing(
+                "spotify",
+                "org.mpris.MediaPlayer2.spotify",
+                None,
+                None,
+                Some("Album"),
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn artists_join_in_order_and_empty_normalizes_to_absent() {
+        // The measured Chromium capture publishes [""] and an empty album: the ordinary case.
+        assert_eq!(
+            parse(
+                CHROMIUM_PLAYING,
+                "org.mpris.MediaPlayer2.brave.instance100200",
+                "brave"
+            ),
+            playing(
+                "brave",
+                "org.mpris.MediaPlayer2.brave.instance100200",
+                Some("Example Video Title"),
+                None,
+                None,
+                None
+            )
+        );
+
+        let two = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{\"xesam:artist\":{\"type\":\"as\",\"data\":[\"First\",\"Second\"]}}}";
+        assert_eq!(
+            parse(two, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            playing(
+                "spotify",
+                "org.mpris.MediaPlayer2.spotify",
+                None,
+                Some("First, Second"),
+                None,
+                None
+            )
+        );
+
+        let empty = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{\"xesam:artist\":{\"type\":\"as\",\"data\":[]}}}";
+        assert_eq!(
+            parse(empty, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            playing(
+                "spotify",
+                "org.mpris.MediaPlayer2.spotify",
+                None,
+                None,
+                None,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn a_playing_player_with_no_metadata_is_returned_by_name() {
+        let output = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{}}";
+        assert_eq!(
+            parse(output, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            playing(
+                "spotify",
+                "org.mpris.MediaPlayer2.spotify",
+                None,
+                None,
+                None,
+                None
+            )
+        );
+    }
+
+    #[test]
+    fn arturl_and_trackid_never_reach_the_result() {
+        // The Spotify fixture carries an `s`-typed trackid and an artUrl; the Chromium one an
+        // `o`-typed trackid. Neither field exists on PlayingMedia, so the whole returned value is
+        // asserted to prove both are dropped.
+        assert_eq!(
+            parse(SPOTIFY_PLAYING, "org.mpris.MediaPlayer2.spotify", "spotify"),
+            playing(
+                "spotify",
+                "org.mpris.MediaPlayer2.spotify",
+                Some("Example Track"),
+                Some("Example Artist"),
+                Some("Example Album"),
+                Some("https://open.spotify.com/track/6IgfQZGOB4ZdlzG19MvYtX"),
+            )
+        );
+    }
+
+    #[test]
+    fn discovery_invokes_busctl_with_the_full_listing_flags() {
+        let args: Vec<String> = discovery_command("busctl")
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec!["--user", "list", "--no-pager", "--no-legend", "--full"]
+        );
+    }
+
+    #[test]
+    fn property_query_invokes_busctl_with_json_short_and_both_properties() {
+        let args: Vec<String> = property_command("busctl", "org.mpris.MediaPlayer2.spotify")
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(
+            args,
+            vec![
+                "--user",
+                "--json=short",
+                "get-property",
+                "org.mpris.MediaPlayer2.spotify",
+                "/org/mpris/MediaPlayer2",
+                "org.mpris.MediaPlayer2.Player",
+                "PlaybackStatus",
+                "Metadata",
+            ]
+        );
+    }
+
+    fn assert_hung_command_is_killed_and_reaped() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pid_file = dir.path().join("pid");
+        let pid_path = pid_file.to_str().expect("utf8 path");
+        let mut command = Command::new("sh");
+        command.args(["-c", &format!("echo $$ > {pid_path}; exec sleep 60")]);
+        let result = run_bounded(&mut command, Instant::now() + Duration::from_millis(50));
+        assert!(
+            result.is_err(),
+            "a hung command must be reported as a failure"
+        );
+        assert!(result.unwrap_err().contains("timed out"));
+
+        // The child was killed AND reaped: its pid is no longer alive, not even as a zombie.
+        let pid: i32 = std::fs::read_to_string(&pid_file)
+            .expect("pid file")
+            .trim()
+            .parse()
+            .expect("pid");
+        let alive = Command::new("kill")
+            .args(["-0", &pid.to_string()])
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        assert!(!alive, "child {pid} was not reaped after the timeout");
+    }
+
+    #[test]
+    fn a_command_that_never_exits_is_killed_and_reaped() {
+        assert_hung_command_is_killed_and_reaped();
+    }
+
+    #[test]
+    fn repeated_timeouts_leave_no_unreaped_child() {
+        for _ in 0..3 {
+            assert_hung_command_is_killed_and_reaped();
+        }
+    }
+
+    fn fake_busctl(script: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("busctl");
+        std::fs::write(&path, script).expect("write script");
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        (dir, path.to_str().expect("utf8 path").to_string())
+    }
+
+    #[test]
+    fn the_poll_budget_is_shared_across_discovery_and_every_player() {
+        let script = "\
+#!/bin/sh
+if [ \"$2\" = \"list\" ]; then
+    sleep 0.4
+    echo 'org.mpris.MediaPlayer2.spotify 100 spotify user :1.1 user@1000.service - -'
+    echo 'org.mpris.MediaPlayer2.brave.instance1 101 brave user :1.2 user@1000.service - -'
+    echo 'org.mpris.MediaPlayer2.brave.instance2 102 brave user :1.3 user@1000.service - -'
+else
+    sleep 0.4
+    echo '{\"type\":\"s\",\"data\":\"Playing\"}'
+    echo '{\"type\":\"a{sv}\",\"data\":{}}'
+fi
+";
+        let (_dir, path) = fake_busctl(script);
+        let client = BusctlClient::with_command(path);
+        let start = Instant::now();
+        let result = client.poll(&Blacklist::default());
+        let elapsed = start.elapsed();
+        assert!(result.is_ok(), "the poll should complete: {result:?}");
+        assert!(
+            elapsed < Duration::from_millis(1300),
+            "the poll took {elapsed:?}; a deadline per invocation would take ~1.6s"
+        );
+    }
+
+    #[test]
+    fn a_list_failure_is_a_whole_source_error() {
+        let (_dir, path) = fake_busctl("#!/bin/sh\nexit 1\n");
+        let client = BusctlClient::with_command(path);
+        assert!(client.poll(&Blacklist::default()).is_err());
+    }
+
+    #[test]
+    fn a_property_failure_costs_one_player_and_leaves_the_others() {
+        let script = "\
+#!/bin/sh
+if [ \"$2\" = \"list\" ]; then
+    echo 'org.mpris.MediaPlayer2.spotify 100 spotify user :1.1 user@1000.service - -'
+    echo 'org.mpris.MediaPlayer2.brave.instance1 101 brave user :1.2 user@1000.service - -'
+elif [ \"$4\" = \"org.mpris.MediaPlayer2.spotify\" ]; then
+    echo '{\"type\":\"s\",\"data\":\"Playing\"}'
+    echo '{\"type\":\"a{sv}\",\"data\":{\"xesam:title\":{\"type\":\"s\",\"data\":\"Track\"}}}'
+else
+    exit 1
+fi
+";
+        let (_dir, path) = fake_busctl(script);
+        let client = BusctlClient::with_command(path);
+        let result = client.poll(&Blacklist::default()).expect("list succeeded");
+        assert_eq!(result.len(), 2);
+        assert!(matches!(&result[0], PlayerOutcome::Playing(_)));
+        assert!(matches!(&result[1], PlayerOutcome::Failed(_)));
+    }
+
+    #[test]
+    fn two_items_differing_in_address_are_two_identities() {
+        let a = PlayingMedia {
+            player_key: "spotify".to_string(),
+            bus_name: "org.mpris.MediaPlayer2.spotify".to_string(),
+            title: Some("Episode".to_string()),
+            artist: Some("Podcast".to_string()),
+            album: Some("Show".to_string()),
+            item_url: Some("https://open.spotify.com/episode/1".to_string()),
+        };
+        let b = PlayingMedia {
+            item_url: Some("https://open.spotify.com/episode/2".to_string()),
+            ..a.clone()
+        };
+        assert_ne!(a, b, "a different address is a different item");
+    }
+
+    #[test]
+    fn the_scripted_media_source_replays_its_responses() {
+        let playing = PlayerOutcome::Playing(PlayingMedia {
+            player_key: "spotify".to_string(),
+            bus_name: "org.mpris.MediaPlayer2.spotify".to_string(),
+            title: Some("Track".to_string()),
+            artist: None,
+            album: None,
+            item_url: None,
+        });
+        // Popped from the back, so the error is served first.
+        let source = fakes::ScriptedMediaSource::new(vec![
+            Ok(vec![playing.clone()]),
+            Err("busctl list failed".to_string()),
+        ]);
+        assert_eq!(
+            source.poll(&Blacklist::default()),
+            Err("busctl list failed".to_string())
+        );
+        assert_eq!(source.poll(&Blacklist::default()), Ok(vec![playing]));
+    }
+}

@@ -330,4 +330,52 @@ mod tests {
         assert!(blacklist.should_skip(None, Some("https://bank.test/session")));
         assert!(!blacklist.should_skip(Some("Ghostty"), Some("tmux")));
     }
+
+    #[test]
+    fn media_blacklists_match_by_category() {
+        let blacklist = Blacklist::new(
+            vec!["spotify".to_string()],
+            vec!["secret".to_string()],
+            vec!["bank.test".to_string()],
+        );
+
+        // Application entries match the normalized key.
+        assert!(blacklist.should_skip_media("spotify", None, &[], None, None));
+        // Title entries match the title, each artist and the album.
+        assert!(blacklist.should_skip_media("vlc", Some("secret track"), &[], None, None));
+        assert!(blacklist.should_skip_media(
+            "vlc",
+            None,
+            &["secret artist".to_string()],
+            None,
+            None
+        ));
+        assert!(blacklist.should_skip_media("vlc", None, &[], Some("secret album"), None));
+        // Domain entries match the address alone.
+        assert!(blacklist.should_skip_media("vlc", None, &[], None, Some("https://bank.test/x")));
+        // A domain term appearing only in an artist does not skip the player.
+        assert!(!blacklist.should_skip_media("vlc", None, &["bank.test".to_string()], None, None));
+        // A title term appearing only in the address does not skip the player.
+        assert!(!blacklist.should_skip_media(
+            "vlc",
+            None,
+            &[],
+            None,
+            Some("https://open.spotify.com/secret")
+        ));
+    }
+
+    #[test]
+    fn a_term_matching_across_fields_does_not_skip() {
+        let blacklist = Blacklist::new(Vec::new(), vec!["x y".to_string()], Vec::new());
+        // The title ends in x and the artist begins with y, so "x y" spans the boundary between
+        // two fields and must not match either one.
+        assert!(!blacklist.should_skip_media(
+            "vlc",
+            Some("foo x"),
+            &["y bar".to_string()],
+            None,
+            None,
+        ));
+    }
 }
