@@ -29,3 +29,12 @@
 
 # bv (beads viewer) local config and caches
 .bv/
+
+# ntm session state, written into the project directory whenever a multi-pane agent
+# session is launched against this repo: pane logs and pid files for one machine's
+# session, which are worthless to a cloner and are not the project's to carry.
+# Ignored wholesale rather than per subdirectory because nothing else lives here today.
+# The cost, should that change: a pipeline or recipe definition authored under .ntm/ is
+# meant to be versioned, and this pattern would hide it without saying so. Narrow this
+# to .ntm/logs/ and .ntm/pids/ on the day one is written.
+.ntm/
