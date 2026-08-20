@@ -232,8 +232,9 @@ struct MetadataEnvelope {
 ///
 /// `PlaybackStatus` is the admission rule: only `Playing` counts, and a missing or wrongly
 /// typed status is a failure for that player, because it is the evidence that the player is
-/// playing at all. Metadata is best-effort: a playing player with no metadata is still returned
-/// by name.
+/// playing at all. A playing player with an empty metadata dictionary is still returned by
+/// name, but a missing or unparseable metadata line is a failure, the same as a missing status:
+/// a failed property query is not a stop.
 fn parse_properties(output: &str, bus_name: &BusName, blacklist: &Blacklist) -> PlayerOutcome {
     let mut lines = output.lines().filter(|line| !line.trim().is_empty());
 
@@ -267,12 +268,27 @@ fn parse_properties(output: &str, bus_name: &BusName, blacklist: &Blacklist) -> 
     }
 
     let metadata = match lines.next() {
-        Some(line) => serde_json::from_str::<MetadataEnvelope>(line)
-            .ok()
-            .filter(|envelope| envelope.type_tag == "a{sv}")
-            .map(|envelope| envelope.data)
-            .unwrap_or_default(),
-        None => HashMap::new(),
+        Some(line) => {
+            let envelope = match serde_json::from_str::<MetadataEnvelope>(line) {
+                Ok(envelope) => envelope,
+                Err(error) => {
+                    return PlayerOutcome::Failed(format!(
+                        "{} returned unparseable Metadata: {error}",
+                        bus_name.full
+                    ));
+                }
+            };
+            if envelope.type_tag != "a{sv}" {
+                return PlayerOutcome::Failed(format!(
+                    "{} Metadata is not a dictionary",
+                    bus_name.full
+                ));
+            }
+            envelope.data
+        }
+        None => {
+            return PlayerOutcome::Failed(format!("{} returned no Metadata", bus_name.full));
+        }
     };
 
     let title = string_field(&metadata, "xesam:title", &bus_name.full);
@@ -704,6 +720,23 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
                 None
             )
         );
+    }
+
+    #[test]
+    fn an_unparseable_metadata_line_is_a_failure() {
+        // Garbage, truncated JSON, a wrong envelope type and a missing metadata line must all
+        // cost the player, never become silent absence: a failed property query is not a stop.
+        for output in [
+            "{\"type\":\"s\",\"data\":\"Playing\"}\nnot json",
+            "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{",
+            "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"s\",\"data\":{\"xesam:title\":{\"type\":\"s\",\"data\":\"Track\"}}}",
+            "{\"type\":\"s\",\"data\":\"Playing\"}",
+        ] {
+            assert!(matches!(
+                parse(output, "org.mpris.MediaPlayer2.spotify", "spotify"),
+                PlayerOutcome::Failed(_)
+            ));
+        }
     }
 
     #[test]
