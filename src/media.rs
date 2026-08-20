@@ -730,6 +730,52 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
     }
 
     #[test]
+    fn a_blacklisted_player_is_skipped_by_the_parser() {
+        // The wiring, not the pure function: parse_properties must call should_skip_media with a
+        // non-default blacklist, or a blacklisted player is recorded by name. Deleting the call
+        // leaves this green only if the blacklist is never consulted.
+        let blacklist = Blacklist::new(vec!["spotify".to_string()], Vec::new(), Vec::new());
+        let output = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{\"xesam:title\":{\"type\":\"s\",\"data\":\"Track\"}}}";
+        let outcome = parse_properties(
+            output,
+            &BusName {
+                full: "org.mpris.MediaPlayer2.spotify".to_string(),
+                key: "spotify".to_string(),
+            },
+            &blacklist,
+        );
+        assert_eq!(outcome, PlayerOutcome::NotPlaying);
+    }
+
+    #[test]
+    fn a_domain_term_in_the_title_does_not_skip_the_player() {
+        // The three Option<&str> arguments are interchangeable to the type checker, so a refactor
+        // that swaps title and address would pass every other test. A domain term must match the
+        // address alone, never the title.
+        let blacklist = Blacklist::new(Vec::new(), Vec::new(), vec!["bank.test".to_string()]);
+        let output = "{\"type\":\"s\",\"data\":\"Playing\"}\n{\"type\":\"a{sv}\",\"data\":{\"xesam:title\":{\"type\":\"s\",\"data\":\"bank.test\"},\"xesam:url\":{\"type\":\"s\",\"data\":\"https://open.spotify.com/track/1\"}}}";
+        let outcome = parse_properties(
+            output,
+            &BusName {
+                full: "org.mpris.MediaPlayer2.spotify".to_string(),
+                key: "spotify".to_string(),
+            },
+            &blacklist,
+        );
+        assert_eq!(
+            outcome,
+            PlayerOutcome::Playing(PlayingMedia {
+                player_key: "spotify".to_string(),
+                bus_name: "org.mpris.MediaPlayer2.spotify".to_string(),
+                title: Some("bank.test".to_string()),
+                artist: None,
+                album: None,
+                item_url: Some("https://open.spotify.com/track/1".to_string()),
+            })
+        );
+    }
+
+    #[test]
     fn discovery_invokes_busctl_with_the_full_listing_flags() {
         let args: Vec<String> = discovery_command(&["busctl".to_string()])
             .get_args()
