@@ -13,7 +13,7 @@ It is a small Rust CLI and daemon that records active-window changes on Hyprland
 - No page-content capture.
 - No keystroke capture: an input device is read only for the timestamp of an event, to detect idle and AFK, never for a key, button, or pointer value.
 - Sensitive URLs and tokens are redacted before storage.
-- Browser window titles are redacted by default because they can contain page content.
+- Browser window titles are stored like other titles: addresses and `keyword=value` secrets are redacted, but the page name is kept.
 - Browser private and incognito windows are skipped when Hyprland exposes a recognizable private-mode title marker.
 - Domain and application blacklists exist from the first capture milestone.
 - Stored activity has a retention window, the last `90` days by default, applied on demand by `daytrace prune` and never automatically.
@@ -114,7 +114,7 @@ daytrace today --date 2026-07-20
 ```text
 Timeline for 2026-07-20
 09:10-09:34  24m     ghostty - tmux
-09:34-09:51  17m     firefox - [browser title redacted]
+09:34-09:51  17m     firefox - Inbox - Brave
 09:51-09:52  12s     ghostty - tmux
 09:52-10:08  16m     AFK
 23:40-24:00  20m     ghostty - tmux
@@ -137,7 +137,7 @@ Totals sum seconds and round once, so a minute spread over several short visits 
 
 `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
 
-There is no browser extension, so browser private and incognito detection is best-effort from the Hyprland window title alone, and a browser that does not mark a private window in its title is not detected at all. Browser titles are redacted before storage either way, which is what keeps a missed detection from costing anything beyond a row that reads as an ordinary browser block.
+There is no browser extension, so browser private and incognito detection is best-effort from the Hyprland window title alone, and a browser that does not mark a private window in its title is not detected at all. With the wholesale redaction removed, a missed private window writes the page name into the store; that is the one case where the browser kept no history of its own to compare against. The residual is accepted rather than hidden.
 
 ## Exporting a Day
 
@@ -166,7 +166,7 @@ daytrace export --date 2026-07-20 > 2026-07-20.json
 }
 ```
 
-Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window`, `idle`, or `suspended`. Titles are exported as they were stored, which means already redacted: the export applies no further filtering and performs no further capture.
+Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window`, `idle`, or `suspended`. Titles are exported as they were stored; the export applies no further filtering and performs no further capture.
 
 A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
 
