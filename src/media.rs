@@ -469,9 +469,10 @@ org.mpris.MediaPlayer2.playerctld                                     100201 pla
 
     /// A Spotify property query, the sanitized capture of a real player: eleven keys, with the
     /// `t`, `d` and `i` typings a constructed fixture never carried. Every value is fictional;
-    /// the structure and type tags are byte-for-byte what the player emitted.
+    /// the structure and type tags are byte-for-byte what the player emitted. `xesam:albumArtist`
+    /// is given a different value from `xesam:artist` so the assertion can tell the two apart.
     const SPOTIFY_PLAYING: &str = r#"{"type":"s","data":"Playing"}
-{"type":"a{sv}","data":{"mpris:trackid":{"type":"s","data":"spotify:track:0000000000000000000000"},"mpris:length":{"type":"t","data":213000000},"mpris:artUrl":{"type":"s","data":"https://i.scdn.co/image/0000000000000000000000000000000000000000"},"xesam:album":{"type":"s","data":"A Fictional Album"},"xesam:albumArtist":{"type":"as","data":["A Fictional Artist","A Second Artist"]},"xesam:artist":{"type":"as","data":["A Fictional Artist","A Second Artist"]},"xesam:autoRating":{"type":"d","data":0.5},"xesam:discNumber":{"type":"i","data":1},"xesam:title":{"type":"s","data":"A Fictional Title"},"xesam:trackNumber":{"type":"i","data":1},"xesam:url":{"type":"s","data":"https://open.spotify.com/track/0000000000000000000000"}}}"#;
+{"type":"a{sv}","data":{"mpris:trackid":{"type":"s","data":"spotify:track:0000000000000000000000"},"mpris:length":{"type":"t","data":213000000},"mpris:artUrl":{"type":"s","data":"https://i.scdn.co/image/0000000000000000000000000000000000000000"},"xesam:album":{"type":"s","data":"A Fictional Album"},"xesam:albumArtist":{"type":"as","data":["A Different Album Artist"]},"xesam:artist":{"type":"as","data":["A Fictional Artist","A Second Artist"]},"xesam:autoRating":{"type":"d","data":0.5},"xesam:discNumber":{"type":"i","data":1},"xesam:title":{"type":"s","data":"A Fictional Title"},"xesam:trackNumber":{"type":"i","data":1},"xesam:url":{"type":"s","data":"https://open.spotify.com/track/0000000000000000000000"}}}"#;
 
     fn parse(output: &str, full: &str, key: &str) -> PlayerOutcome {
         parse_properties(
