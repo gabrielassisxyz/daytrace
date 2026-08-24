@@ -266,10 +266,20 @@ def is_work_tree(path: str) -> bool:
 
 
 def tracked_markdown(repo: str) -> list[str]:
-    """Tracked .md paths only — anything git-ignored is out of scope by definition."""
+    """Every .md git would carry — tracked, plus untracked and not ignored.
+
+    Untracked files are included because of how the gate is actually reached: AGENTS.md
+    says to run `bin/ci` before opening a PR, which is before the new file has been
+    committed. Listing only tracked paths made a brand-new document invisible to the very
+    run meant to clear it, so the local gate passed, the PR's own run failed on the same
+    check, and master went red behind a merge nobody had reason to doubt.
+
+    Ignored files stay out: they are out of scope by definition, and --exclude-standard is
+    what keeps `--others` from dragging build output and vendored trees in.
+    """
     try:
         listed = subprocess.run(
-            ["git", "-C", repo, "ls-files", "-z", "*.md"],
+            ["git", "-C", repo, "ls-files", "-z", "--cached", "--others", "--exclude-standard", "*.md"],
             capture_output=True, text=True, timeout=60, check=True,
         ).stdout
     except (subprocess.CalledProcessError, subprocess.TimeoutExpired, OSError):
