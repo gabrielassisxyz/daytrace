@@ -26,7 +26,7 @@ pub fn render_user_unit(exec_path: &Path) -> String {
     format!(
         "\
 [Unit]
-Description=daytrace desktop activity capture
+Description=daytrace desktop and media activity capture
 # Capture is meaningless without the compositor it observes, and the query needs the
 # session's instance signature, which the session publishes into the systemd user
 # environment. Binding to the session also means a logout stops the daemon instead of
