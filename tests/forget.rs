@@ -2,7 +2,7 @@
 //!
 //! `forget` is the counterpart to `prune`: it deletes by content instead of by date, so these
 //! cases seed rows by their app class and title rather than by age and check the same command
-//! surface `retention.rs` already checks for `prune` — dry run, a real deletion, and a pattern
+//! surface `retention.rs` already checks for `prune`: dry run, a real deletion, and a pattern
 //! that matches nothing.
 
 use rusqlite::{Connection, params};
