@@ -1076,14 +1076,21 @@ mod tests {
         day_start: i64,
         day_end: i64,
     ) -> Vec<MediaSegment> {
-        let day_length = (day_end - day_start).max(1) as u64;
-        (0..6)
+        let day_length = (day_end - day_start).max(1);
+        // Every start falls inside a narrow window near the day's own start, rather than
+        // scattered uniformly across it: uniformly scattered starts rarely overlap enough for
+        // the naive sum of their durations to reach the day's length, so a property test built
+        // that way would never exercise the case the ceiling exists to guard. Clustering many
+        // segments this close together makes that naive sum reach well past the day even
+        // though the true wall-clock coverage of the cluster cannot.
+        let cluster_window = (day_length / 8).max(1) as u64;
+        (0..40)
             .map(|index| {
-                let start = day_start + (lcg_next(state) % day_length) as i64;
-                let duration = 1 + (lcg_next(state) % 7_200) as i64;
+                let start = day_start + (lcg_next(state) % cluster_window) as i64;
+                let duration = 1 + (lcg_next(state) % 14_400) as i64;
                 let end = (start + duration).min(day_end);
-                let player = if index % 2 == 0 { "spotify" } else { "brave" };
-                media_segment(start, end, Some(player), Some("Track"), None, None)
+                let player = format!("player-{}", index % 5);
+                media_segment(start, end, Some(&player), Some("Track"), None, None)
             })
             .collect()
     }
