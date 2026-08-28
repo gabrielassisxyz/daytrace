@@ -1,6 +1,6 @@
 # Roadmap
 
-The desktop layer is complete. Everything below it in this document is either what that layer already does, what a later layer would add, or something deliberately left undone with the reason it was left.
+The desktop and media layers are complete. Everything below this line is either what those layers already do, what a later layer would add, or something deliberately left undone with the reason it was left.
 
 ## What Exists
 
@@ -14,18 +14,25 @@ The desktop layer is complete. Everything below it in this document is either wh
 - One capture daemon runs per database. A second `daytrace start` is refused and names the process already running.
 - `daytrace service unit` prints a systemd user unit that runs the daemon for the desktop session.
 
+### Media
+
+- `daytrace start` polls the user D-Bus for whichever MPRIS player is playing, on its own interval, separate from the desktop poll, since a track change matters far less often than a window change.
+- A played track's title, artist, album and address are stored in a lane of its own rather than folded into the desktop timeline, because media overlaps the desktop and can overlap itself.
+- Without `busctl` or a reachable user bus, media polling fails, a rate-limited warning is logged, and desktop capture continues unaffected.
+
 ### Reading it back
 
 - `daytrace today` prints a chronological timeline with durations, then totals the day by application.
 - `daytrace today --date` and `daytrace export --date` report and export any past local day. A day that a clock change shortens or lengthens still meets its neighbours exactly.
 - `daytrace export` emits one day as JSON on standard output, with a stable shape and instants carrying the local offset.
+- Both commands report media apart from the desktop timeline, as a section and an array of their own; the two are never summed together, since media overlaps the desktop and itself and a combined total would claim more time than the day held.
 - A usage error prints the usage block and exits 2; a failure while running prints only what went wrong and exits 1. A caller can tell a refused duplicate start from a mistyped flag.
 
 ### Privacy
 
 - Storage is local and nothing leaves the machine.
 - No screenshot, no clipboard content, no page content, and no keystroke: an input device is read for the timestamp of an event, never for a key, button or pointer value.
-- Browser window titles are stored through the same scan as any other title: addresses and `keyword=value` secrets are redacted, and the page name is kept. Private and incognito browser windows are skipped where Hyprland exposes a recognizable private-mode marker. The detector is best-effort, so a missed private window writes the page name into the store; that is the one case where the browser kept no history of its own to compare against, and it is accepted rather than hidden.
+- Browser window titles are stored through the same scan as any other title: addresses and `keyword=value` secrets are redacted, and the page name is kept. Private and incognito browser windows are skipped where Hyprland exposes a recognizable private-mode marker. The detector is best-effort and desktop-only, so a missed private window writes the page name into the store; that is one residual, accepted rather than hidden. Media carries a second one: MPRIS has no private-window signal, so a media row from a browser names what was playing regardless of which window it played in, and the blacklists are how a user closes it.
 - Application, title and domain blacklists are configurable, and a blacklisted class matches by substring so a short entry covers the reverse-DNS class a compositor reports.
 - Stored activity has a documented retention window, applied by `daytrace prune` and by nothing else. A prune makes the deleted activity unreadable rather than merely unlisted, which takes rebuilding the file and checkpointing the log, both measured rather than assumed.
 
@@ -37,11 +44,10 @@ The desktop layer is complete. Everything below it in this document is either wh
 
 ## What Is Missing
 
-Four layers, none started, each usable on its own once it exists. None is queued: they are one-line intentions rather than specifications, and a task with no acceptance criteria is one an implementer and a reviewer can disagree about with both being defensible. Each needs a design pass before it becomes work.
+Three layers, none started, each usable on its own once it exists. None is queued: they are one-line intentions rather than specifications, and a task with no acceptance criteria is one an implementer and a reviewer can disagree about with both being defensible. Each needs a design pass before it becomes work.
 
-- **Media.** Capture what was playing, including in the background, from MPRIS over DBus. This is what separates having watched a video from having left a tab playing.
 - **Browser.** A light extension sending the active tab, tab switches, a normalized domain and per-tab media state to the daemon over Native Messaging, with blacklist and redaction for sensitive domains. The extension is what would make private-window detection reliable, rather than the best-effort title marker used today. It would also add per-tab detail and domain normalization; the desktop layer already names the browser window by its title, using the same redaction scan as every other title.
-- **Aggregation.** Merging adjacent events, computing durations, and resolving conflicts between active window, active tab, background media and idle, so a block can say that one application held focus while another played behind it. The timeline renders stored segments directly today, which holds only while the desktop is the single source. This layer is wanted once a second source describes the same instant, not before.
+- **Aggregation.** Merging adjacent events, computing durations, and resolving conflicts between active window, active tab, background media and idle, so a block can say that one application held focus while another played behind it. The timeline renders stored segments directly today, which held only while the desktop was the single source; media now describes the same instant apart from it, reported side by side rather than reconciled. This layer is what would merge the two into one narrative instead.
 - **End-of-day package.** A compact local activity package for an external summarizer to consume, keeping this repository independent of whatever consumes it.
 
 ## Settled, And Not Being Done
