@@ -26,7 +26,7 @@ pub fn render_user_unit(exec_path: &Path) -> String {
     format!(
         "\
 [Unit]
-Description=daytrace desktop activity capture
+Description=daytrace desktop and media activity capture
 # Capture is meaningless without the compositor it observes, and the query needs the
 # session's instance signature, which the session publishes into the systemd user
 # environment. Binding to the session also means a logout stops the daemon instead of
@@ -105,6 +105,23 @@ mod tests {
             "{directive} belongs in {section}, where systemd will read it, but the rendered \
              unit has {section} as {:?}",
             directives_in(unit, section)
+        );
+    }
+
+    /// The README env-var and command gates read `README.md` against the source; neither
+    /// reads this generated string, so a source-side change to what capture does can drift
+    /// here silently unless something reads the rendered unit itself.
+    #[test]
+    fn the_unit_description_names_both_capture_sources() {
+        let rendered = unit();
+        let description = directives_in(&rendered, "[Unit]")
+            .into_iter()
+            .find(|line| line.starts_with("Description="))
+            .expect("a Description directive");
+
+        assert!(
+            description.contains("media"),
+            "the unit description still describes only desktop capture: {description}"
         );
     }
 

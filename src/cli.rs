@@ -37,7 +37,7 @@ Usage:
   daytrace help
 
 Commands:
-  start         Start the desktop activity capture daemon.
+  start         Start the desktop and media activity capture daemon.
   today         Print a chronological activity timeline, by default for today.
   export        Print one day of stored activity as JSON, by default today.
   prune         Delete stored activity from before the retention window.
