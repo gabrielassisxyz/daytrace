@@ -1,4 +1,4 @@
-use crate::activity::{ActivityKind, TimelineSegment};
+use crate::activity::{ActivityKind, MediaSegment, TimelineSegment};
 use chrono::{Days, Local, MappedLocalTime, NaiveDate, TimeZone};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -134,12 +134,23 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
     totals
 }
 
-pub fn render_day(date: NaiveDate, segments: &[TimelineSegment]) -> Result<String, String> {
+/// Render one day: the desktop timeline and its per-application totals, unchanged from before
+/// media existed, followed by a media section when the day held any.
+///
+/// The two sources stay apart rather than sharing one list or one total, because media
+/// overlaps with the desktop and with itself: a track played behind a window is real time
+/// twice over, and a total that summed both would claim more than the day held. Reconciling
+/// them into one narrative is the aggregation layer's job, not this one's.
+pub fn render_day(
+    date: NaiveDate,
+    segments: &[TimelineSegment],
+    media: &[MediaSegment],
+) -> Result<String, String> {
     // A row needs the end of the reported day to tell a boundary clip from a segment that
     // genuinely stopped at midnight, and only the day being rendered knows where that is.
     let (_, day_end) = day_bounds(date)?;
 
-    if segments.is_empty() {
+    if segments.is_empty() && media.is_empty() {
         return Ok(format!("No activity events recorded for {date}.\n"));
     }
 
@@ -149,12 +160,92 @@ pub fn render_day(date: NaiveDate, segments: &[TimelineSegment]) -> Result<Strin
         output.push('\n');
     }
 
-    output.push_str("\nTime per application\n");
-    for total in application_totals(segments) {
-        let duration = format_duration(total.seconds);
-        output.push_str(&format!("{duration:>6}  {}\n", total.label));
+    if !segments.is_empty() {
+        output.push_str("\nTime per application\n");
+        for total in application_totals(segments) {
+            let duration = format_duration(total.seconds);
+            output.push_str(&format!("{duration:>6}  {}\n", total.label));
+        }
     }
+
+    if !media.is_empty() {
+        if !segments.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("Media playing\n");
+        for entry in media {
+            output.push_str(&format_media_segment(entry, day_end)?);
+            output.push('\n');
+        }
+        output.push('\n');
+        let total = format_duration(media_playing_seconds(media));
+        output.push_str(&format!("{total:>6}  Total\n"));
+    }
+
     Ok(output)
+}
+
+/// One row of the media section, at the timeline's own column widths so the two sections read
+/// as one report.
+fn format_media_segment(segment: &MediaSegment, day_end: i64) -> Result<String, String> {
+    let started = format_clock(segment.started_at)?;
+    let ended = format_end_clock(segment.ended_at, day_end)?;
+    let duration = format_duration(segment.ended_at.saturating_sub(segment.started_at));
+    let label = media_label(segment);
+    Ok(format!("{started}-{ended}  {duration:<6}  {label}"))
+}
+
+/// `<player> - <title> - <artist>`, with the artist and its separator dropped when there is no
+/// artist, and the title itself falling back first to the address and then to a fixed label,
+/// mirroring how a window with no class already reads as `unknown app`.
+fn media_label(segment: &MediaSegment) -> String {
+    let player = segment
+        .snapshot
+        .player
+        .as_deref()
+        .unwrap_or("unknown player");
+    let title = segment
+        .snapshot
+        .title
+        .as_deref()
+        .or(segment.snapshot.item_url.as_deref())
+        .unwrap_or("unknown media");
+
+    match segment.snapshot.artist.as_deref() {
+        Some(artist) => format!("{player} - {title} - {artist}"),
+        None => format!("{player} - {title}"),
+    }
+}
+
+/// The time media held the day, counting a stretch during which more than one player was
+/// reporting once rather than once per player.
+///
+/// Summing each segment's own length would let two players playing at once double the total,
+/// which is exactly the double count the media section exists apart from the desktop timeline
+/// to avoid; nothing makes that hazard exclusive to the boundary between the two sources.
+fn media_playing_seconds(media: &[MediaSegment]) -> i64 {
+    let mut intervals: Vec<(i64, i64)> = media
+        .iter()
+        .map(|segment| (segment.started_at, segment.ended_at.max(segment.started_at)))
+        .collect();
+    intervals.sort_unstable_by_key(|&(start, _)| start);
+
+    let mut total = 0i64;
+    let mut open: Option<(i64, i64)> = None;
+    for (start, end) in intervals {
+        open = Some(match open {
+            Some((open_start, open_end)) if start <= open_end => (open_start, open_end.max(end)),
+            Some((open_start, open_end)) => {
+                total += open_end - open_start;
+                (start, end)
+            }
+            None => (start, end),
+        });
+    }
+    if let Some((start, end)) = open {
+        total += end - start;
+    }
+    total
 }
 
 /// What to call the thing that held the time, for both a timeline row and a total.
@@ -253,9 +344,10 @@ fn format_duration(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationTotal, application_totals, day_bounds, local_date, render_day, retention_cutoff,
+        ApplicationTotal, application_totals, day_bounds, local_date, media_playing_seconds,
+        render_day, retention_cutoff,
     };
-    use crate::activity::{ActivitySnapshot, TimelineSegment};
+    use crate::activity::{ActivitySnapshot, MediaSegment, MediaSnapshot, TimelineSegment};
     use chrono::NaiveDate;
 
     fn idle_segment(started_at: i64, ended_at: i64) -> TimelineSegment {
@@ -325,8 +417,12 @@ mod tests {
     #[test]
     fn the_header_names_the_requested_day_and_not_today() {
         let (start, _) = day_bounds(date(2026, 7, 20)).expect("bounds");
-        let rendered = render_day(date(2026, 7, 20), &[segment(start, start + 600, "ghostty")])
-            .expect("render");
+        let rendered = render_day(
+            date(2026, 7, 20),
+            &[segment(start, start + 600, "ghostty")],
+            &[],
+        )
+        .expect("render");
 
         assert!(
             rendered.starts_with("Timeline for 2026-07-20\n"),
@@ -337,7 +433,7 @@ mod tests {
 
     #[test]
     fn an_empty_day_says_which_day_was_empty() {
-        let rendered = render_day(date(2026, 7, 20), &[]).expect("render");
+        let rendered = render_day(date(2026, 7, 20), &[], &[]).expect("render");
 
         assert_eq!(rendered, "No activity events recorded for 2026-07-20.\n");
     }
@@ -409,7 +505,7 @@ mod tests {
             .map(|index| segment(index * 100, index * 100 + 20, "ghostty"))
             .collect();
 
-        let rendered = render_day(date(2026, 7, 20), &short_visits).expect("render");
+        let rendered = render_day(date(2026, 7, 20), &short_visits, &[]).expect("render");
         let totals = application_totals(&short_visits);
 
         assert_eq!(
@@ -446,7 +542,7 @@ mod tests {
             },
         ];
 
-        let rendered = render_day(date(2026, 7, 20), &segments).expect("render");
+        let rendered = render_day(date(2026, 7, 20), &segments, &[]).expect("render");
 
         assert_eq!(
             application_totals(&segments),
@@ -490,7 +586,7 @@ mod tests {
         let (start, end) = day_bounds(date(2026, 7, 20)).expect("bounds");
 
         let rendered =
-            render_day(date(2026, 7, 20), &[segment(start, end, "ghostty")]).expect("render");
+            render_day(date(2026, 7, 20), &[segment(start, end, "ghostty")], &[]).expect("render");
 
         assert!(
             rendered.contains("00:00-24:00"),
@@ -507,8 +603,12 @@ mod tests {
     fn a_segment_clipped_at_midnight_says_which_midnight() {
         let (_, end) = day_bounds(date(2026, 7, 20)).expect("bounds");
 
-        let rendered =
-            render_day(date(2026, 7, 20), &[segment(end - 600, end, "ghostty")]).expect("render");
+        let rendered = render_day(
+            date(2026, 7, 20),
+            &[segment(end - 600, end, "ghostty")],
+            &[],
+        )
+        .expect("render");
 
         assert!(
             rendered.contains("-24:00"),
@@ -522,8 +622,12 @@ mod tests {
     fn the_start_of_the_day_is_still_the_start_of_the_day() {
         let (start, _) = day_bounds(date(2026, 7, 20)).expect("bounds");
 
-        let rendered = render_day(date(2026, 7, 20), &[segment(start, start + 600, "ghostty")])
-            .expect("render");
+        let rendered = render_day(
+            date(2026, 7, 20),
+            &[segment(start, start + 600, "ghostty")],
+            &[],
+        )
+        .expect("render");
 
         assert!(
             rendered.contains("00:00-00:10"),
@@ -533,7 +637,8 @@ mod tests {
 
     #[test]
     fn a_visit_shorter_than_a_minute_reports_the_seconds_it_lasted() {
-        let rendered = render_day(date(2026, 7, 20), &[segment(0, 12, "ghostty")]).expect("render");
+        let rendered =
+            render_day(date(2026, 7, 20), &[segment(0, 12, "ghostty")], &[]).expect("render");
         let row = rendered
             .lines()
             .find(|line| line.contains("ghostty - "))
@@ -567,6 +672,7 @@ mod tests {
                 segment(600, 600, "displaced"),
                 segment(600, 1200, "firefox"),
             ],
+            &[],
         )
         .expect("render");
 
@@ -594,8 +700,12 @@ mod tests {
     /// the same stored rows.
     #[test]
     fn a_day_holding_only_zero_length_segments_does_not_claim_to_be_empty() {
-        let rendered = render_day(date(2026, 7, 20), &[segment(600, 600, "last-before-crash")])
-            .expect("render");
+        let rendered = render_day(
+            date(2026, 7, 20),
+            &[segment(600, 600, "last-before-crash")],
+            &[],
+        )
+        .expect("render");
 
         assert!(
             rendered.contains("last-before-crash"),
@@ -608,6 +718,7 @@ mod tests {
         let rendered = render_day(
             date(2026, 7, 20),
             &[segment(0, 600, "ghostty"), segment(600, 900, "firefox")],
+            &[],
         )
         .expect("render");
 
@@ -617,5 +728,363 @@ mod tests {
             chronology < totals,
             "the day is read in order first and summed second: {rendered}"
         );
+    }
+
+    fn media_segment(
+        started_at: i64,
+        ended_at: i64,
+        player: Option<&str>,
+        title: Option<&str>,
+        artist: Option<&str>,
+        item_url: Option<&str>,
+    ) -> MediaSegment {
+        MediaSegment {
+            started_at,
+            ended_at,
+            snapshot: MediaSnapshot {
+                player: player.map(str::to_string),
+                title: title.map(str::to_string),
+                artist: artist.map(str::to_string),
+                album: None,
+                item_url: item_url.map(str::to_string),
+            },
+        }
+    }
+
+    // Golden fixtures over a fixed day, offsets kept relative to `day_bounds` so the expected
+    // clock readings do not depend on the timezone the test happens to run under.
+
+    fn desktop_only_fixture() -> (NaiveDate, i64, Vec<TimelineSegment>) {
+        let day = date(2026, 7, 20);
+        let (start, _) = day_bounds(day).expect("bounds");
+        let segments = vec![
+            TimelineSegment {
+                started_at: start,
+                ended_at: start + 1_440,
+                snapshot: ActivitySnapshot::window(
+                    Some("ghostty".to_string()),
+                    Some("tmux".to_string()),
+                    Some("3".to_string()),
+                    Some(1),
+                ),
+            },
+            TimelineSegment {
+                started_at: start + 1_440,
+                ended_at: start + 2_460,
+                snapshot: ActivitySnapshot::window(
+                    Some("firefox".to_string()),
+                    Some("Inbox - Brave".to_string()),
+                    None,
+                    None,
+                ),
+            },
+            idle_segment(start + 2_460, start + 3_420),
+        ];
+        (day, start, segments)
+    }
+
+    fn media_only_fixture(start: i64) -> Vec<MediaSegment> {
+        vec![media_segment(
+            start + 1_440,
+            start + 2_880,
+            Some("spotify"),
+            Some("Track title"),
+            Some("Artist"),
+            None,
+        )]
+    }
+
+    /// The desktop block alone, exactly as the renderer produced it before this bead: a
+    /// backslash-continued string literal eats the leading whitespace of the following line,
+    /// which would silently swallow the total block's own indentation, so the lines are joined
+    /// explicitly instead.
+    fn desktop_only_golden() -> String {
+        [
+            "Timeline for 2026-07-20",
+            "00:00-00:24  24m     ghostty - tmux workspace 3, monitor 1",
+            "00:24-00:41  17m     firefox - Inbox - Brave",
+            "00:41-00:57  16m     AFK",
+            "",
+            "Time per application",
+            "   24m  ghostty",
+            "   17m  firefox",
+            "   16m  AFK",
+            "",
+        ]
+        .join("\n")
+    }
+
+    fn media_block_golden() -> String {
+        [
+            "Media playing",
+            "00:24-00:48  24m     spotify - Track title - Artist",
+            "",
+            "   24m  Total",
+            "",
+        ]
+        .join("\n")
+    }
+
+    /// A regression fixture captured from the renderer before this bead added the media
+    /// section, so a day with no media proves it still renders the same bytes rather than
+    /// merely a similar-looking string reconstructed after the change.
+    #[test]
+    fn a_day_with_no_media_renders_exactly_as_it_did_before_media_existed() {
+        let (day, _, segments) = desktop_only_fixture();
+
+        let rendered = render_day(day, &segments, &[]).expect("render");
+
+        assert_eq!(rendered, desktop_only_golden());
+    }
+
+    #[test]
+    fn a_media_only_day_golden() {
+        let (day, start, _) = desktop_only_fixture();
+        let media = media_only_fixture(start);
+
+        let rendered = render_day(day, &[], &media).expect("render");
+
+        assert_eq!(
+            rendered,
+            format!("Timeline for {day}\n{}", media_block_golden())
+        );
+    }
+
+    #[test]
+    fn a_mixed_day_golden_puts_media_after_the_desktop_totals() {
+        let (day, start, segments) = desktop_only_fixture();
+        let media = media_only_fixture(start);
+
+        let rendered = render_day(day, &segments, &media).expect("render");
+
+        assert_eq!(
+            rendered,
+            format!("{}\n{}", desktop_only_golden(), media_block_golden())
+        );
+    }
+
+    #[test]
+    fn an_empty_day_with_neither_source_is_unchanged() {
+        let rendered = render_day(date(2026, 7, 20), &[], &[]).expect("render");
+
+        assert_eq!(rendered, "No activity events recorded for 2026-07-20.\n");
+    }
+
+    #[test]
+    fn a_day_with_media_and_no_desktop_rows_skips_straight_to_the_media_section() {
+        let (day, start, _) = desktop_only_fixture();
+        let media = media_only_fixture(start);
+
+        let rendered = render_day(day, &[], &media).expect("render");
+
+        assert!(
+            rendered.starts_with(&format!("Timeline for {day}\nMedia playing\n")),
+            "a day with media and no desktop rows must not print an empty timeline or an empty \
+             totals heading before the media section: {rendered}"
+        );
+        assert!(
+            !rendered.contains("No activity events recorded"),
+            "a day that held media happened, even with nothing on the desktop side: {rendered}"
+        );
+    }
+
+    /// The media row's own boundary clipping has to read exactly as a desktop row's does: a
+    /// media segment reaching the end of the reported day says `24:00` rather than `00:00`, the
+    /// same distinction `format_end_clock` exists to make for the desktop timeline above it.
+    #[test]
+    fn a_media_row_reaching_the_end_of_the_day_says_so_rather_than_saying_midnight() {
+        let day = date(2026, 7, 20);
+        let (start, end) = day_bounds(day).expect("bounds");
+        let media = vec![media_segment(
+            start,
+            end,
+            Some("spotify"),
+            Some("Full Day"),
+            None,
+            None,
+        )];
+
+        let rendered = render_day(day, &[], &media).expect("render");
+
+        assert!(
+            rendered.contains("00:00-24:00"),
+            "a media row covering the whole day must not read as beginning and ending at the \
+             same instant: {rendered}"
+        );
+        assert!(
+            rendered.contains("24h"),
+            "the span shown and the hours claimed have to agree: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_media_entry_omits_the_artist_and_its_separator_when_there_is_none() {
+        let (day, start, _) = desktop_only_fixture();
+        let media = vec![media_segment(
+            start,
+            start + 60,
+            Some("spotify"),
+            Some("Track title"),
+            None,
+            None,
+        )];
+
+        let rendered = render_day(day, &[], &media).expect("render");
+
+        assert!(
+            rendered.contains("spotify - Track title\n"),
+            "no artist must drop the separator along with it, not leave a trailing dash: \
+             {rendered}"
+        );
+        assert!(!rendered.contains(" - Track title - "), "{rendered}");
+    }
+
+    #[test]
+    fn a_media_entry_with_no_title_falls_back_to_the_address() {
+        let (day, start, _) = desktop_only_fixture();
+        let media = vec![media_segment(
+            start,
+            start + 60,
+            Some("spotify"),
+            None,
+            None,
+            Some("https://example.test/stream"),
+        )];
+
+        let rendered = render_day(day, &[], &media).expect("render");
+
+        assert!(
+            rendered.contains("spotify - https://example.test/stream\n"),
+            "no title must fall back to the address rather than to a placeholder: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_media_entry_with_neither_title_nor_address_reads_as_unknown_media() {
+        let (day, start, _) = desktop_only_fixture();
+        let media = vec![media_segment(
+            start,
+            start + 60,
+            Some("spotify"),
+            None,
+            None,
+            None,
+        )];
+
+        let rendered = render_day(day, &[], &media).expect("render");
+
+        assert!(
+            rendered.contains("spotify - unknown media\n"),
+            "with nothing to name the track, the row still names the player: {rendered}"
+        );
+    }
+
+    #[test]
+    fn media_playing_seconds_counts_an_overlap_once_rather_than_per_player() {
+        let media = vec![
+            media_segment(0, 1_200, Some("spotify"), None, None, None),
+            media_segment(600, 1_800, Some("brave"), None, None, None),
+        ];
+
+        assert_eq!(
+            media_playing_seconds(&media),
+            1_800,
+            "two players overlapping from 600 to 1200 must not double that stretch: the wall \
+             clock covered is 0 to 1800, eighteen hundred seconds, not the sum of both durations"
+        );
+    }
+
+    #[test]
+    fn media_playing_seconds_sums_disjoint_stretches() {
+        let media = vec![
+            media_segment(0, 600, Some("spotify"), None, None, None),
+            media_segment(1_000, 1_300, Some("brave"), None, None, None),
+        ];
+
+        assert_eq!(media_playing_seconds(&media), 900);
+    }
+
+    /// A day where media and desktop overlap for most of it must still keep every total the
+    /// report prints at or under the length of the day, whichever source produced it, and
+    /// whichever players overlapped each other.
+    #[test]
+    fn no_total_the_report_prints_exceeds_the_length_of_the_day() {
+        let day = date(2026, 7, 20);
+        let (day_start, day_end) = day_bounds(day).expect("bounds");
+        let day_length = day_end - day_start;
+        let mut state: u64 = 0x2026_0720_da91_face;
+
+        for _ in 0..200 {
+            let desktop = generated_desktop_segments(&mut state, day_start, day_end);
+            let media = generated_media_segments(&mut state, day_start, day_end);
+
+            let rendered = render_day(day, &desktop, &media).expect("render");
+
+            let desktop_total: i64 = application_totals(&desktop)
+                .iter()
+                .map(|total| total.seconds)
+                .sum();
+            assert!(
+                desktop_total <= day_length,
+                "the desktop totals summed to {desktop_total}s, more than the day's \
+                 {day_length}s: {rendered}"
+            );
+
+            let media_total = media_playing_seconds(&media);
+            assert!(
+                media_total <= day_length,
+                "the media section's own total was {media_total}s, more than the day's \
+                 {day_length}s: {rendered}"
+            );
+        }
+    }
+
+    /// A small, dependency-free linear congruential generator: the property test above needs
+    /// many varied inputs, not a cryptographically sound one, and pulling in a fuzzing crate
+    /// for one test would ask every future audit of this crate's dependencies to account for it.
+    fn lcg_next(state: &mut u64) -> u64 {
+        *state = state
+            .wrapping_mul(6_364_136_223_846_793_005)
+            .wrapping_add(1);
+        *state
+    }
+
+    /// Non-overlapping desktop segments walking the whole day, the way capture actually
+    /// produces them: one lane, one row open at a time.
+    fn generated_desktop_segments(
+        state: &mut u64,
+        day_start: i64,
+        day_end: i64,
+    ) -> Vec<TimelineSegment> {
+        let apps = ["ghostty", "firefox", "zed"];
+        let mut segments = Vec::new();
+        let mut cursor = day_start;
+        while cursor < day_end {
+            let duration = 1 + (lcg_next(state) % 3_600) as i64;
+            let end = (cursor + duration).min(day_end);
+            let app = apps[(lcg_next(state) % apps.len() as u64) as usize];
+            segments.push(segment(cursor, end, app));
+            cursor = end;
+        }
+        segments
+    }
+
+    /// Media segments placed freely within the day, deliberately allowed to overlap each other
+    /// and the desktop: a second player genuinely can start before the first one stops.
+    fn generated_media_segments(
+        state: &mut u64,
+        day_start: i64,
+        day_end: i64,
+    ) -> Vec<MediaSegment> {
+        let day_length = (day_end - day_start).max(1) as u64;
+        (0..6)
+            .map(|index| {
+                let start = day_start + (lcg_next(state) % day_length) as i64;
+                let duration = 1 + (lcg_next(state) % 7_200) as i64;
+                let end = (start + duration).min(day_end);
+                let player = if index % 2 == 0 { "spotify" } else { "brave" };
+                media_segment(start, end, Some(player), Some("Track"), None, None)
+            })
+            .collect()
     }
 }

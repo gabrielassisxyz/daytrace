@@ -108,10 +108,7 @@ pub struct TimelineSegment {
 /// nothing to say otherwise. A distinct type makes that path unreachable rather than merely
 /// untaken.
 ///
-/// Read by the media half of a day's activity; nothing writes one yet, so this is dead code in
-/// the binary until the capture loop that polls MPRIS lands and the query that reads it back
-/// gains a caller in the reporting layer.
-#[allow(dead_code)]
+/// Read by the media half of a day's activity, through `Store::day_activity`.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaSnapshot {
     pub player: Option<String>,
@@ -123,7 +120,6 @@ pub struct MediaSnapshot {
 
 /// A media segment: a stretch during which one player was reporting the same track, mirroring
 /// `TimelineSegment` for the desktop side without sharing its shape.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MediaSegment {
     pub started_at: i64,
