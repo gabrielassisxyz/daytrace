@@ -211,8 +211,8 @@ fn uri_scheme_end(value: &str) -> Option<usize> {
 ///
 /// The authority is the span between the scheme's `//` and the next `/`, `?`, `#`, or the end
 /// of the address. An `@` outside that span belongs to a path segment or a query value, not to
-/// a credential; splitting on the first or last `@` in the whole address would treat it as one
-/// anyway, which is exactly the over-redaction this scoping avoids.
+/// a credential; splitting on any `@` in the whole address would treat it as one anyway, which
+/// is exactly the over-redaction this scoping avoids.
 fn redact_userinfo(address: &str, scheme_end: usize) -> String {
     let after_scheme = &address[scheme_end + 1..];
     if !after_scheme.starts_with("//") {
@@ -224,7 +224,11 @@ fn redact_userinfo(address: &str, scheme_end: usize) -> String {
     let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let authority = &rest[..authority_end];
 
-    let Some((userinfo, _host)) = authority.split_once('@') else {
+    // The LAST `@` in the authority, because that is where the host begins: an unencoded `@`
+    // inside a credential is malformed but arrives anyway, and splitting on the first one
+    // leaves everything between the two in the clear. `https://user@evil.test:pass@host.test/`
+    // stored as `https://[redacted]@evil.test:pass@host.test/` keeps the password.
+    let Some((userinfo, _host)) = authority.rsplit_once('@') else {
         return address.to_string();
     };
 
@@ -614,6 +618,20 @@ mod tests {
         for (input, expected) in cases {
             assert_eq!(redact_address(input), expected);
         }
+    }
+
+    #[test]
+    fn redact_address_redacts_a_credential_carrying_an_unencoded_at_sign() {
+        // The host is what follows the LAST `@` of the authority, so everything before it is
+        // credential text. Splitting on the first `@` instead leaves the password readable.
+        assert_eq!(
+            redact_address("https://user@evil.test:pass@host.test/p"),
+            "https://[redacted]:[redacted]@host.test/p"
+        );
+        assert_eq!(
+            redact_address("https://a@b@host.test/p"),
+            "https://[redacted]@host.test/p"
+        );
     }
 
     #[test]
