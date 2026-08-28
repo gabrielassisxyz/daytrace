@@ -166,42 +166,79 @@ pub fn redact_title(title: &str) -> String {
         .to_string()
 }
 
-/// Redacts the values of sensitive query and fragment parameters in an address, keeping
-/// everything else byte for byte.
+/// Redacts a credential embedded in the authority, plus the values of sensitive query and
+/// fragment parameters, keeping everything else byte for byte.
 ///
 /// `redact_title` cannot serve here: its URL regex replaces a whole address with
 /// `[redacted-url]`, which on a field whose entire value is the address would say a track
 /// was played and refuse to say which. This scan keeps the address and replaces only the
-/// values of parameters whose name says they carry a secret, so the stored string still
-/// names what was played.
+/// userinfo of its authority (`user:pass@host`) and the values of parameters whose name says
+/// they carry a secret, so the stored string still names what was played without carrying the
+/// credentials that reached it.
 #[allow(dead_code)] // not yet called: the media capture path will use it once media is polled
 pub fn redact_address(address: &str) -> String {
-    if !has_uri_scheme(address) {
+    let Some(scheme_end) = uri_scheme_end(address) else {
         return address.to_string();
-    }
+    };
+    let address = redact_userinfo(address, scheme_end);
     match address.split_once('#') {
         Some((main, fragment)) => format!("{}#{}", redact_query(main), redact_fragment(fragment)),
-        None => redact_query(address),
+        None => redact_query(&address),
     }
 }
 
-/// Whether the value is an absolute URI: a scheme (`[A-Za-z][A-Za-z0-9+.-]*:`) followed by
-/// anything. A relative or malformed value is not an address and is left alone rather than
-/// having its `?`-suffixed text read as a query.
-fn has_uri_scheme(value: &str) -> bool {
+/// The byte index of the scheme-terminating `:`, if `value` starts with a valid URI scheme
+/// (`[A-Za-z][A-Za-z0-9+.-]*:`). A relative or malformed value has none, and is left alone
+/// rather than having its `?`-suffixed text read as a query.
+fn uri_scheme_end(value: &str) -> Option<usize> {
     let bytes = value.as_bytes();
     if bytes.is_empty() || !bytes[0].is_ascii_alphabetic() {
-        return false;
+        return None;
     }
-    for &byte in &bytes[1..] {
+    for (index, &byte) in bytes.iter().enumerate().skip(1) {
         if byte == b':' {
-            return true;
+            return Some(index);
         }
         if !(byte.is_ascii_alphanumeric() || byte == b'+' || byte == b'-' || byte == b'.') {
-            return false;
+            return None;
         }
     }
-    false
+    None
+}
+
+/// Replaces a credential in the authority (`user:pass@host`, `user@host`) with `[redacted]`
+/// on each side of the colon, preserving the colon only when the input carried one.
+///
+/// The authority is the span between the scheme's `//` and the next `/`, `?`, `#`, or the end
+/// of the address. An `@` outside that span belongs to a path segment or a query value, not to
+/// a credential; splitting on the first or last `@` in the whole address would treat it as one
+/// anyway, which is exactly the over-redaction this scoping avoids.
+fn redact_userinfo(address: &str, scheme_end: usize) -> String {
+    let after_scheme = &address[scheme_end + 1..];
+    if !after_scheme.starts_with("//") {
+        return address.to_string();
+    }
+
+    let authority_start = scheme_end + 3;
+    let rest = &address[authority_start..];
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
+
+    let Some((userinfo, _host)) = authority.split_once('@') else {
+        return address.to_string();
+    };
+
+    let redacted_userinfo = if userinfo.contains(':') {
+        "[redacted]:[redacted]"
+    } else {
+        "[redacted]"
+    };
+
+    format!(
+        "{}{redacted_userinfo}@{}",
+        &address[..authority_start],
+        &rest[userinfo.len() + 1..]
+    )
 }
 
 /// Redacts the query of a URI part: everything after the first `?`, if any.
@@ -544,6 +581,72 @@ mod tests {
     }
 
     #[test]
+    fn redact_address_redacts_a_credential_in_the_authority() {
+        let cases = [
+            (
+                "https://user:s3cret@host.test/path",
+                "https://[redacted]:[redacted]@host.test/path",
+            ),
+            // A password-less userinfo does not gain a colon it never had.
+            (
+                "https://user@host.test/path",
+                "https://[redacted]@host.test/path",
+            ),
+            // An explicit, empty password is still a colon the input carried, so the shape
+            // (one colon) survives: both halves become `[redacted]` exactly as a non-empty
+            // password would, rather than treating "present but empty" as "absent".
+            (
+                "https://user:@host.test/path",
+                "https://[redacted]:[redacted]@host.test/path",
+            ),
+            // Percent-encoded credential text: the marker replaces it outright, so nothing
+            // about the original encoding is left to preserve.
+            (
+                "https://%75ser:%70a%24s@host.test/path",
+                "https://[redacted]:[redacted]@host.test/path",
+            ),
+            // A credential and a sensitive query parameter, redacted in one pass.
+            (
+                "https://user:s3cret@host.test/cb?access_token=abc",
+                "https://[redacted]:[redacted]@host.test/cb?access_token=[redacted]",
+            ),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(redact_address(input), expected);
+        }
+    }
+
+    #[test]
+    fn redact_address_does_not_treat_an_out_of_authority_at_sign_as_a_credential_delimiter() {
+        // `@` in the path and in a query value. Splitting the whole address on the first or
+        // the last `@` would catch one of these and corrupt the address; scoping the search
+        // to the authority catches neither.
+        let address = "https://host.test/p@th?to=a@b.test";
+        assert_eq!(redact_address(address), address);
+    }
+
+    #[test]
+    fn redact_address_without_userinfo_is_untouched() {
+        // Over-redaction is exactly the failure this scan exists to avoid: an address with no
+        // credential must come back byte-identical, never gaining a `[redacted]` it never
+        // carried, including one with no authority at all.
+        for address in [
+            "https://host.test/path",
+            "file:///home/user/Videos/talk.mkv",
+        ] {
+            assert_eq!(redact_address(address), address);
+        }
+
+        // A sensitive query parameter is still redacted as before, but the address had no
+        // `@` anywhere, so the output must not gain one: the query scan and the userinfo
+        // scan run over the same address without inventing a credential for each other.
+        let with_sensitive_query = "https://host.test/cb?access_token=abc";
+        let output = redact_address(with_sensitive_query);
+        assert_eq!(output, "https://host.test/cb?access_token=[redacted]");
+        assert!(!output.contains('@'), "invented a credential: {output}");
+    }
+
+    #[test]
     fn redact_address_leaves_relative_or_malformed_values_unchanged() {
         for value in [
             "relative/path?token=abc",
@@ -557,10 +660,17 @@ mod tests {
 
     #[test]
     fn redact_address_preserves_every_byte_outside_sensitive_values() {
-        // Generated addresses: every combination of scheme, path, query and fragment, with a
-        // sensitive and a benign parameter interleaved. The invariant is that the output
-        // differs from the input only where a sensitive value stood.
+        // Generated addresses: every combination of scheme, userinfo, path, query and
+        // fragment, with a sensitive and a benign parameter interleaved. The invariant is
+        // that the output differs from the input only where a sensitive value stood, and
+        // as of this bead userinfo counts as a sensitive value too.
         let schemes = ["https://", "spotify:", "file:///"];
+        // Only `https://`'s paths are host-shaped. Inserting userinfo before a `spotify:` or
+        // `file:///` path would land in the path (or, for `file:///`, after an authority the
+        // scheme's own third slash already closed empty) rather than in an authority, so a
+        // non-empty userinfo is exercised for `https://` only; the other two keep the single
+        // no-userinfo case they already had.
+        let userinfos = ["", "user@", "user:pass@"];
         let paths = [
             "host.test/cb",
             "open.spotify.com/track/abc",
@@ -584,29 +694,59 @@ mod tests {
         ];
 
         for scheme in schemes {
-            for path in paths {
-                for sensitive_name in sensitive {
-                    for benign_name in benign {
-                        for (fragment, emptied) in fragments {
-                            let fragment = fragment.replace("{s}", sensitive_name);
-                            let emptied = emptied.replace("{s}", sensitive_name);
-                            let input = format!(
-                                "{scheme}{path}?{benign_name}=keep&{sensitive_name}=drop#{fragment}"
-                            );
-                            let output = redact_address(&input);
+            for userinfo in userinfos {
+                if !userinfo.is_empty() && scheme != "https://" {
+                    continue;
+                }
+                // What a redacted userinfo leaves behind once its `[redacted]` markers are
+                // stripped for the byte-preservation check below: the colon only if the
+                // input carried one, then the `@` every non-empty userinfo carries.
+                let userinfo_shape = if userinfo.is_empty() {
+                    ""
+                } else if userinfo.contains(':') {
+                    ":@"
+                } else {
+                    "@"
+                };
+                let userinfo_marker_count = if userinfo.is_empty() {
+                    0
+                } else if userinfo.contains(':') {
+                    2
+                } else {
+                    1
+                };
+                for path in paths {
+                    for sensitive_name in sensitive {
+                        for benign_name in benign {
+                            for (fragment, emptied) in fragments {
+                                let fragment = fragment.replace("{s}", sensitive_name);
+                                let emptied = emptied.replace("{s}", sensitive_name);
+                                let input = format!(
+                                    "{scheme}{userinfo}{path}?{benign_name}=keep&{sensitive_name}=drop#{fragment}"
+                                );
+                                let output = redact_address(&input);
 
-                            // The sensitive values are gone, replaced by the marker.
-                            assert!(!output.contains("=drop"), "value leaked: {output}");
-                            assert!(!output.contains("=leak"), "value leaked: {output}");
-                            assert_eq!(output.matches("[redacted]").count(), 2, "{output}");
+                                // The sensitive values are gone, replaced by the marker.
+                                assert!(!output.contains("=drop"), "value leaked: {output}");
+                                assert!(!output.contains("=leak"), "value leaked: {output}");
+                                assert!(
+                                    userinfo.is_empty() || !output.contains(userinfo),
+                                    "credential leaked: {output}"
+                                );
+                                assert_eq!(
+                                    output.matches("[redacted]").count(),
+                                    2 + userinfo_marker_count,
+                                    "{output}"
+                                );
 
-                            // Every byte outside a sensitive value survives, in order:
-                            // removing the markers leaves the input with the sensitive values
-                            // emptied.
-                            let expected = format!(
-                                "{scheme}{path}?{benign_name}=keep&{sensitive_name}=#{emptied}"
-                            );
-                            assert_eq!(output.replace("[redacted]", ""), expected, "{output}");
+                                // Every byte outside a sensitive value survives, in order:
+                                // removing the markers leaves the input with the sensitive
+                                // values emptied.
+                                let expected = format!(
+                                    "{scheme}{userinfo_shape}{path}?{benign_name}=keep&{sensitive_name}=#{emptied}"
+                                );
+                                assert_eq!(output.replace("[redacted]", ""), expected, "{output}");
+                            }
                         }
                     }
                 }
