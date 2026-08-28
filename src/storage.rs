@@ -193,13 +193,15 @@ fn stored_kinds_are_complete(conn: &Connection) -> Result<bool, String> {
             .all(|kind| kind_list.contains(&format!("'{kind}'")))
     }))
 }
-/// What a prune deleted, and what it could not finish once the deletion had committed.
+/// What a deletion removed, and what it could not finish once the deletion had committed.
 ///
-/// The two are reported apart because they fail apart. The rows go in a transaction that either
-/// commits or does not; rewriting the file so the deleted activity stops being readable happens
-/// after that commit, and can be refused by a reader that is still attached. Answering with a
-/// bare failure for the second would say nothing about the first, which has already happened and
-/// cannot be undone.
+/// Shared by `prune`, which selects rows by date, and `forget`, which selects them by content:
+/// both end at the same rewrite, so both report through the same shape. The two fields are
+/// reported apart because they fail apart. The rows go in a transaction that either commits or
+/// does not; rewriting the file so the deleted activity stops being readable happens after that
+/// commit, and can be refused by a reader that is still attached. Answering with a bare failure
+/// for the second would say nothing about the first, which has already happened and cannot be
+/// undone.
 #[derive(Debug)]
 pub struct Pruned {
     pub deleted: u64,
@@ -274,6 +276,18 @@ fn is_busy(error: &rusqlite::Error) -> bool {
 }
 
 const ENDED_BEFORE_CUTOFF: &str = "COALESCE(ended_at, last_seen_at, ?2) < ?1";
+
+/// Which segments `forget` matches: a case-insensitive substring of `?1` against every field a
+/// blacklist entry would be checked against. `should_skip` compares app_class and title, and
+/// `should_skip_media` adds artist, album and address as their own fields rather than folding
+/// them into title. `INSTR` rather than `LIKE` so the pattern is read as literal text: a `%` or
+/// `_` typed by someone looking for a literal percent sign must not turn into a wildcard.
+const FORGET_MATCHES_PATTERN: &str = "\
+    INSTR(LOWER(app_class), LOWER(?1)) > 0
+    OR INSTR(LOWER(title), LOWER(?1)) > 0
+    OR INSTR(LOWER(artist), LOWER(?1)) > 0
+    OR INSTR(LOWER(album), LOWER(?1)) > 0
+    OR INSTR(LOWER(item_url), LOWER(?1)) > 0";
 
 impl Store {
     pub fn open(path: impl AsRef<Path>, secure_data_dir: Option<PathBuf>) -> Result<Self, String> {
@@ -505,6 +519,49 @@ impl Store {
         // Past this point the rows are gone for good, so nothing below may be raised as if the
         // deletion had not happened. The rewrite is attempted every time rather than only after
         // a delete, which is what makes running the command again finish an interrupted one.
+        let still_in_the_file = self.rewrite_the_file_without_the_deleted_rows().err();
+        self.secure_permissions()?;
+        Ok(Pruned {
+            deleted: deleted as u64,
+            still_in_the_file,
+        })
+    }
+
+    /// How many stored segments `pattern` matches, deleting none.
+    ///
+    /// The same purpose `count_segments_ended_before` serves for the window: the number a
+    /// preview reports has to come from the exact query the deletion below runs, or a preview
+    /// could name a count the deletion would not produce.
+    pub fn count_segments_matching(&self, pattern: &str) -> Result<u64, String> {
+        self.conn
+            .query_row(
+                &format!("SELECT COUNT(*) FROM activity_segments WHERE {FORGET_MATCHES_PATTERN}"),
+                params![pattern],
+                |row| row.get::<_, i64>(0),
+            )
+            .map(|count| count as u64)
+            .map_err(|error| format!("failed to count segments matching the pattern: {error}"))
+    }
+
+    /// Delete every stored segment `pattern` matches, then make the deletion real on disk.
+    ///
+    /// The two-step rewrite that follows the delete is `prune_segments_ended_before`'s own,
+    /// reused as it stands rather than reimplemented, because it is what turns a `DELETE` into
+    /// text that has actually stopped being readable in the file.
+    pub fn forget_segments_matching(&mut self, pattern: &str) -> Result<Pruned, String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start transaction: {error}"))?;
+        let deleted = tx
+            .execute(
+                &format!("DELETE FROM activity_segments WHERE {FORGET_MATCHES_PATTERN}"),
+                params![pattern],
+            )
+            .map_err(|error| format!("failed to delete segments matching the pattern: {error}"))?;
+        tx.commit()
+            .map_err(|error| format!("failed to commit the deletion: {error}"))?;
+
         let still_in_the_file = self.rewrite_the_file_without_the_deleted_rows().err();
         self.secure_permissions()?;
         Ok(Pruned {
@@ -1105,7 +1162,7 @@ fn insert_segment(
 mod tests {
     use super::{Lane, Store};
     use crate::activity::{ActivitySnapshot, MediaSnapshot, TimelineSegment};
-    use rusqlite::Connection;
+    use rusqlite::{Connection, params};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::time::Duration;
@@ -1511,6 +1568,54 @@ mod tests {
             .expect("close");
     }
 
+    /// Every stored title, in insertion order, for a `forget` test that has to see which rows
+    /// survived rather than only how many.
+    fn titles(db_path: &Path) -> Vec<Option<String>> {
+        let connection = Connection::open(db_path).expect("open scratch database");
+        let mut statement = connection
+            .prepare("SELECT title FROM activity_segments ORDER BY started_at ASC")
+            .expect("prepare");
+        let rows = statement
+            .query_map([], |row| row.get::<_, Option<String>>(0))
+            .expect("query");
+        rows.collect::<Result<Vec<_>, _>>().expect("materialize")
+    }
+
+    /// Insert one closed window-kind row with exactly the `app_class`/`title` given, for a
+    /// predicate test that has to isolate one field rather than the title `seed_segments`
+    /// always fills.
+    fn seed_window_row(store: &Store, at: i64, app_class: Option<&str>, title: Option<&str>) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (?1, ?2, 'window', ?3, ?4, 'desktop')",
+                params![at, at + 10, app_class, title],
+            )
+            .expect("insert a window-kind row");
+    }
+
+    /// Insert one closed media-kind row with the given artist/album/address, none of which
+    /// `seed_segments` can reach: `ActivitySnapshot` carries no media fields, so a predicate
+    /// test over them has to write the row directly.
+    fn seed_media_row(
+        store: &Store,
+        at: i64,
+        artist: Option<&str>,
+        album: Option<&str>,
+        item_url: Option<&str>,
+    ) {
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, lane, artist, album, item_url)
+                 VALUES (?1, ?2, 'media', 'player', 'media:test', ?3, ?4, ?5)",
+                params![at, at + 10, artist, album, item_url],
+            )
+            .expect("insert a media-kind row");
+    }
+
     fn window_snapshot(app_class: &str) -> ActivitySnapshot {
         ActivitySnapshot::window(
             Some(app_class.to_string()),
@@ -1889,6 +1994,272 @@ mod tests {
             "a day recorded after a prune reuses what the prune gave back, so a store pruned \
              and refilled forever stays the size of its window"
         );
+    }
+
+    #[test]
+    fn forgetting_deletes_rows_matching_the_pattern_and_keeps_the_rest() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 3, "keepassxc-session", 0);
+        seed_segments(&mut store, 2, "ordinary-window", 100);
+
+        let forgotten = store.forget_segments_matching("keepassxc").expect("forget");
+
+        assert_eq!(forgotten.deleted, 3);
+        assert_eq!(forgotten.still_in_the_file, None);
+        let survivors = titles(&db);
+        assert_eq!(
+            survivors.len(),
+            2,
+            "the two unmatched rows have to be left: {survivors:?}"
+        );
+        assert!(
+            survivors.iter().all(|title| title
+                .as_deref()
+                .is_some_and(|title| title.starts_with("ordinary-window"))),
+            "no surviving title may be one the pattern matched: {survivors:?}"
+        );
+    }
+
+    #[test]
+    fn the_predicate_matches_by_app_class() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        // Reverse-DNS classes, the same shape the blacklist's own case matches: a substring,
+        // not the whole string.
+        seed_window_row(
+            &store,
+            0,
+            Some("org.keepassxc.KeePassXC"),
+            Some("Passwords"),
+        );
+        seed_window_row(&store, 100, Some("com.mitchellh.ghostty"), Some("tmux"));
+
+        assert_eq!(
+            store.count_segments_matching("keepassxc").expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn the_predicate_matches_by_title() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        seed_window_row(&store, 0, Some("firefox"), Some("Private Browsing"));
+        seed_window_row(&store, 100, Some("firefox"), Some("Docs"));
+
+        assert_eq!(store.count_segments_matching("private").expect("count"), 1);
+    }
+
+    #[test]
+    fn the_predicate_matches_by_artist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        seed_media_row(&store, 0, Some("Sensitive Artist"), None, None);
+        seed_media_row(&store, 100, Some("Ordinary Band"), None, None);
+
+        assert_eq!(
+            store.count_segments_matching("sensitive").expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn the_predicate_matches_by_album() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        seed_media_row(&store, 0, None, Some("Secret Album"), None);
+        seed_media_row(&store, 100, None, Some("Public Album"), None);
+
+        assert_eq!(store.count_segments_matching("secret").expect("count"), 1);
+    }
+
+    #[test]
+    fn the_predicate_matches_by_address() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        seed_media_row(&store, 0, None, None, Some("https://bank.test/session"));
+        seed_media_row(&store, 100, None, None, Some("https://public.test/track"));
+
+        assert_eq!(
+            store.count_segments_matching("bank.test").expect("count"),
+            1
+        );
+    }
+
+    #[test]
+    fn a_pattern_matching_nothing_deletes_nothing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 5, "ordinary-window", 0);
+
+        let forgotten = store
+            .forget_segments_matching("nothing-stored-contains-this")
+            .expect("forget");
+
+        assert_eq!(forgotten.deleted, 0);
+        assert_eq!(
+            titles(&db).len(),
+            5,
+            "a pattern nothing matches must delete nothing"
+        );
+    }
+
+    #[test]
+    fn a_pattern_matching_every_row_deletes_all_of_them() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 4, "shared-app-name", 0);
+
+        let forgotten = store
+            .forget_segments_matching("shared-app-name")
+            .expect("forget");
+
+        assert_eq!(forgotten.deleted, 4);
+        assert!(titles(&db).is_empty());
+    }
+
+    /// The defect a preview computed from a different query than the deletion would produce: a
+    /// count that disagrees with what actually goes. `count_segments_matching` and
+    /// `forget_segments_matching` both run `FORGET_MATCHES_PATTERN`, so this pins them to
+    /// staying in agreement rather than merely happening to agree today.
+    #[test]
+    fn a_preview_and_the_deletion_agree_because_they_share_one_predicate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 3, "flagged-window-title", 0);
+        seed_segments(&mut store, 2, "kept-window-title", 100);
+
+        let previewed = store.count_segments_matching("flagged").expect("count");
+        let forgotten = store.forget_segments_matching("flagged").expect("forget");
+
+        assert_eq!(
+            previewed, forgotten.deleted,
+            "a preview computed from a different query than the deletion is the defect this \
+             guards against"
+        );
+        assert_eq!(previewed, 3);
+    }
+
+    #[test]
+    fn forgetting_leaves_none_of_the_matched_activity_on_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "sensitive-window-title", 0);
+        seed_segments(&mut store, 3, "surviving-window-title", 100_000);
+
+        let forgotten = store.forget_segments_matching("sensitive").expect("forget");
+
+        assert_eq!(forgotten.deleted, 300);
+        assert_eq!(
+            forgotten.still_in_the_file, None,
+            "nothing was holding the store, so the rewrite had to complete"
+        );
+        assert_eq!(
+            occurrences_on_disk(&db, "sensitive-window-title"),
+            0,
+            "a title `forget` matched and removed must not be readable in the file or in the log"
+        );
+        assert_eq!(
+            byte_len(&wal_of(&db)),
+            0,
+            "the log is reset rather than left holding a copy of what was removed"
+        );
+        assert!(
+            occurrences_on_disk(&db, "surviving-window-title") > 0,
+            "the measurement has to be able to find a title that is still stored, or it is \
+             reading the wrong bytes"
+        );
+    }
+
+    #[test]
+    fn forgetting_beside_an_attached_reader_still_clears_the_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "sensitive-window-title", 0);
+
+        // The arrangement the README recommends for `forget` too: a second connection attached
+        // for the whole call, as the capture daemon is while it runs beside a deletion.
+        let daemon = Connection::open(&db).expect("a second connection on the same store");
+        let seen: i64 = daemon
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("the second connection can read");
+        assert_eq!(seen, 300, "the second connection is really attached");
+
+        let forgotten = store.forget_segments_matching("sensitive").expect("forget");
+
+        assert_eq!(forgotten.deleted, 300);
+        assert_eq!(
+            forgotten.still_in_the_file, None,
+            "a reader that is up to date must not stop the rewrite"
+        );
+        assert_eq!(occurrences_on_disk(&db, "sensitive-window-title"), 0);
+        assert_eq!(byte_len(&wal_of(&db)), 0);
+        drop(daemon);
+    }
+
+    #[test]
+    fn an_incomplete_checkpoint_is_reported_beside_the_deletion_not_instead_of_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db, None).expect("store");
+        seed_segments(&mut store, 300, "sensitive-window-title", 0);
+
+        let reader = Connection::open(&db).expect("a second connection");
+        reader.execute_batch("BEGIN").expect("open a read");
+        let _: i64 = reader
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("take a snapshot and hold it");
+        // Without this the checkpoint would sit on the busy handler for the five seconds the
+        // store is configured to wait before giving the same answer, since this reader is never
+        // going to move.
+        store
+            .conn
+            .busy_timeout(Duration::from_millis(50))
+            .expect("shorten the wait");
+
+        let forgotten = store
+            .forget_segments_matching("sensitive")
+            .expect("the delete itself still has to succeed");
+
+        assert_eq!(
+            forgotten.deleted, 300,
+            "the rows are gone whatever the file still holds, and reporting a failure here \
+             would describe a committed deletion as one that did not happen"
+        );
+        let reason = forgotten
+            .still_in_the_file
+            .expect("a rewrite that could not run has to be reported");
+        assert!(
+            reason.contains("reading"),
+            "the reason has to name what stopped it: {reason}"
+        );
+        assert!(
+            occurrences_on_disk(&db, "sensitive-window-title") > 0,
+            "the warning has to be true: this is the case where the deleted activity really is \
+             still readable on disk"
+        );
+
+        // And running it again finishes the rewrite once the reader lets go, the same recovery
+        // `prune` offers.
+        drop(reader);
+        let again = store
+            .forget_segments_matching("sensitive")
+            .expect("forget again");
+
+        assert_eq!(again.deleted, 0);
+        assert_eq!(again.still_in_the_file, None);
+        assert_eq!(occurrences_on_disk(&db, "sensitive-window-title"), 0);
     }
 
     /// The rebuild's scratch copy must not land outside the directory the store is kept private
