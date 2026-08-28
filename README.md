@@ -2,7 +2,7 @@
 
 `daytrace` is a local-first personal activity logger for reconstructing where time went during the day.
 
-It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, and stretches the machine spent suspended, stores them locally, and prints a chronological daily timeline with durations. That is the whole of it today: the desktop is the only source, so what the day says about a browser is what a window title says about it, and nothing reports what was playing behind the window in focus.
+It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, stretches the machine spent suspended, and what was playing behind the focused window, stores them locally, and prints a chronological daily timeline with durations. The printed timeline and `export` cover the desktop side only for now: what was playing is captured and stored, but reporting it is not built yet.
 
 ## Privacy Controls
 
@@ -15,7 +15,8 @@ It is a small Rust CLI and daemon that records active-window changes on Hyprland
 - Sensitive URLs and tokens are redacted before storage.
 - Browser window titles are stored like other titles: addresses and `keyword=value` secrets are redacted, but the page name is kept.
 - Browser private and incognito windows are skipped when Hyprland exposes a recognizable private-mode title marker.
-- Domain and application blacklists exist from the first capture milestone.
+- Media is recorded by name, the same as a window: title, every artist, album and address are read from whichever player is playing over the user D-Bus (MPRIS), redacted the same way a window title is, and stored in a lane of its own rather than folded into the desktop timeline.
+- Domain and application blacklists exist from the first capture milestone, and cover media too: an application entry matches the player, and a domain entry matches the address.
 - Stored activity has a retention window, the last `90` days by default, applied on demand by `daytrace prune` and never automatically.
 - Logs are easy to delete and export.
 
@@ -29,9 +30,11 @@ It is a small Rust CLI and daemon that records active-window changes on Hyprland
 daytrace start
 ```
 
-`daytrace start` runs the local capture loop. It polls Hyprland for the active window, watches `/dev/input/event*` for input activity timestamps, and stores segments in a local SQLite database.
+`daytrace start` runs the local capture loop. It polls Hyprland for the active window, watches `/dev/input/event*` for input activity timestamps, polls the user D-Bus for whichever MPRIS player is playing, and stores segments in a local SQLite database.
 
 AFK tracking requires read access to at least one `/dev/input/event*` device. If no readable input devices are available, `daytrace start` exits instead of recording misleading activity.
+
+Media polling requires `busctl`, the systemd D-Bus client, on `PATH`. It runs on its own interval, separate from the desktop poll, because a track change matters far less often than a window change and the check costs a subprocess per player on the bus. A machine with no `busctl`, or no player ever running, is unaffected beyond that: media polling fails or finds nothing, is logged, and the desktop side of capture keeps running.
 
 One capture process runs per database. A second `daytrace start` is refused and names the process already running, rather than doubling capture: each process reads its own configuration, so a blacklist set in one shell is invisible to the other, and the process without it would record what the other one exists to skip. The claim is a lock on `daytrace.db.lock`, held beside the database for as long as the daemon runs and released by the kernel when it exits, so an unclean shutdown leaves nothing to clean up. Two daemons on different databases are not duplicates and both run.
 
@@ -97,6 +100,7 @@ Useful environment overrides:
 
 - `DAYTRACE_IDLE_AFTER_SECONDS`: AFK threshold, default `300`.
 - `DAYTRACE_POLL_SECONDS`: desktop polling interval, default `1`.
+- `DAYTRACE_MEDIA_POLL_SECONDS`: media polling interval, default `5`. Separate from `DAYTRACE_POLL_SECONDS`, since a track change costs a `busctl` call per player and does not need the desktop's own cadence to be caught.
 - `DAYTRACE_RETENTION_DAYS`: days before today that `daytrace prune` keeps, default `90`, so the default keeps 91 calendar days. An empty value reads as unset; `0` is refused rather than read as "keep only today", since the difference between those two is a whole history.
 - `DAYTRACE_BLACKLIST_APPS`: comma-separated application class substrings to skip. Matching is by substring so that a short entry such as `keepassxc` covers the reverse-DNS class `org.keepassxc.KeePassXC` that a compositor actually reports.
 - `DAYTRACE_BLACKLIST_TITLES`: comma-separated title substrings to skip.
