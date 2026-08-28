@@ -2,7 +2,7 @@
 
 `daytrace` is a local-first personal activity logger for reconstructing where time went during the day.
 
-It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, stretches the machine spent suspended, and what was playing behind the focused window, stores them locally, and prints a chronological daily timeline with durations. The printed timeline and `export` cover the desktop side only for now: what was playing is captured and stored, but reporting it is not built yet.
+It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, stretches the machine spent suspended, and what was playing behind the focused window, stores them locally, and prints a chronological daily timeline with durations. `daytrace today` and `daytrace export` report the desktop timeline and a media section apart from each other: media overlaps the desktop and itself, so a shared list or a shared total would claim more time than the day held. Reconciling the two into one narrative is not built yet.
 
 ## Privacy Controls
 
@@ -143,6 +143,19 @@ Totals sum seconds and round once, so a minute spread over several short visits 
 
 There is no browser extension, so browser private and incognito detection is best-effort from the Hyprland window title alone, and a browser that does not mark a private window in its title is not detected at all. With the wholesale redaction removed, a missed private window writes the page name into the store; that is the one case where the browser kept no history of its own to compare against. The residual is accepted rather than hidden.
 
+A day that held media gains a section below the desktop timeline and its totals:
+
+```text
+Media playing
+09:10-09:34  24m     spotify - Track title - Artist
+```
+
+The section carries its own total, at the same column widths as the timeline above it, so the two read as one report. Every number the report prints, in either section, stays at or under the length of the day: media overlaps the desktop and can overlap itself, and a total that summed across an overlap would claim more time than the day held, which is why the two sources are never added together. The artist and its separator are dropped when there is no artist; a player with no title falls back to the address; with neither, the row reads as `unknown media`. A day with media and no desktop activity at all still prints the dated header and the media section, rather than the empty-day line below, and a day with neither source keeps that line exactly as it always has:
+
+```text
+No activity events recorded for 2026-07-20.
+```
+
 ## Exporting a Day
 
 ```sh
@@ -166,13 +179,27 @@ daytrace export --date 2026-07-20 > 2026-07-20.json
       "workspace": "3",
       "monitor": 1
     }
+  ],
+  "media": [
+    {
+      "started_at": "2026-07-20T09:10:00-03:00",
+      "ended_at": "2026-07-20T09:34:00-03:00",
+      "duration_seconds": 1440,
+      "player": "spotify",
+      "title": "Track title",
+      "artist": "Artist",
+      "album": "Album",
+      "item_url": "https://open.spotify.com/track/1"
+    }
   ]
 }
 ```
 
 Every segment carries the same keys, with an absent value written as `null` rather than dropped, so a consumer can rely on the shape. Instants are RFC 3339 with the local offset, which keeps an exported day readable on a machine that does not share this one's timezone. `duration_seconds` is included so that summing a day does not require parsing two timestamps per segment. `kind` is `window`, `idle`, or `suspended`. Titles are exported as they were stored; the export applies no further filtering and performs no further capture.
 
-A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable.
+`media` is a list of its own, beside `segments` rather than folded into it: a consumer summing `segments` for a day's total gets exactly what it got before media existed, because a media entry never appears there. The array is present and empty on a day with nothing played, never omitted, so a consumer never has to tell an empty day apart from a daytrace too old to have recorded media at all. A media entry carries `started_at`, `ended_at`, `duration_seconds`, `player`, `title`, `artist`, `album` and `item_url`; the internal lane a player is stored under, and the fact that the row is media rather than a window, stay out of the export.
+
+A segment still in progress has no end yet, and is exported with `ended_at` at the last moment it was observed. Exporting today twice therefore gives the final segment a later end the second time, while any completed day is stable. The same holds for a media entry still playing.
 
 ## Deleting Data
 

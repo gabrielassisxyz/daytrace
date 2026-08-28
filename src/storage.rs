@@ -734,10 +734,12 @@ impl Store {
 
     /// The stored desktop segments intersecting `[start, end)`, excluding every media lane.
     ///
-    /// What `today` and `export` both read through, neither of which reads media yet, and the
-    /// exclusion is what keeps a media row out of a report that has no way to show it apart
-    /// from a window. Delegates to `desktop_segments_in` so a caller that also wants the media
-    /// side, `Store::day_activity`, can read both against one snapshot instead of two.
+    /// `today` and `export` read the desktop and media lanes together, through
+    /// `Store::day_activity`, so both agree on one SQLite snapshot; this stays the desktop-only
+    /// entry point `day_activity` delegates to, and the one the desktop-only storage tests
+    /// exercise directly. No production caller reaches it on its own any more, hence the
+    /// `#[allow(dead_code)]`.
+    #[allow(dead_code)]
     pub fn timeline_between(
         &self,
         start: i64,
@@ -757,10 +759,6 @@ impl Store {
     /// media state from after it, a pair that describes no instant that ever existed. A
     /// DEFERRED transaction's snapshot is fixed at its first statement, so the desktop read
     /// below has to run first for the guarantee to cover both.
-    ///
-    /// Nothing calls this yet, since the reporting layer that would is a later bead, so it is
-    /// dead code in the binary until then.
-    #[allow(dead_code)]
     pub fn day_activity(
         &self,
         start: i64,
@@ -1172,9 +1170,11 @@ fn desktop_segments_in(
 /// schema's own CHECK constraint, and matching the lane keeps this query and
 /// `desktop_segments_in`'s `lane = 'desktop'` reading the same column for the same reason.
 ///
-/// Nothing calls this yet outside `Store::day_activity`, itself uncalled until the reporting
-/// layer lands, so it is dead code in the binary until then.
-#[allow(dead_code)]
+/// Ordered by start, then by the normalized player (`app_class`), then by `lane`, rather than
+/// by discovery order or `id`: two players polled in a different order, or a player that
+/// reopens under a new bus name, would otherwise reorder a day between two runs that stored
+/// the exact same activity. `app_class` and `lane` are read only to order by; neither leaves
+/// this function in the returned rows.
 fn media_segments_in(
     conn: &Connection,
     start: i64,
@@ -1186,7 +1186,7 @@ fn media_segments_in(
             "SELECT started_at, COALESCE(ended_at, last_seen_at, ?3), app_class, title, artist, album, item_url
              FROM activity_segments
              WHERE lane GLOB 'media:?*' AND started_at < ?2 AND COALESCE(ended_at, last_seen_at, ?3) > ?1
-             ORDER BY started_at ASC, id ASC",
+             ORDER BY started_at ASC, app_class ASC, lane ASC, id ASC",
         )
         .map_err(|error| format!("failed to prepare media timeline query: {error}"))?;
 
@@ -1408,7 +1408,9 @@ fn close_media_lanes_absent_from(
 mod tests {
     use super::{Lane, Store};
     use crate::activity::{ActivitySnapshot, MediaSnapshot, TimelineSegment};
+    use crate::export::render_day_export;
     use crate::media::{PlayerOutcome, PlayingMedia};
+    use crate::timeline::{day_bounds, render_day};
     use rusqlite::{Connection, params};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4482,8 +4484,9 @@ mod tests {
         );
     }
 
-    // CRITERION 10: a media row constructed directly through the store appears in neither
-    // `today` nor `export`, both of which read through `timeline_between`.
+    // CRITERION 10: a media row constructed directly through the store never appears in the
+    // desktop-only read, the one that keeps a media row out of the timeline it has no way to
+    // show apart from a window.
 
     #[test]
     fn a_media_row_never_appears_in_the_desktop_timeline_that_today_and_export_read() {
@@ -4999,6 +5002,155 @@ mod tests {
         assert_eq!(
             desktop_ended_at, None,
             "sealing media lanes must not touch the desktop lane"
+        );
+    }
+
+    // Ordering: media rows at the same instant are ordered by start, then by the normalized
+    // player, then by lane, so a day reads the same way regardless of discovery order or which
+    // row happened to get the lower id.
+
+    #[test]
+    fn media_rows_at_the_same_instant_are_ordered_by_the_normalized_player_not_by_insertion_order()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        // Inserted with the higher-sorting player first, so a read that fell back to `id` would
+        // return them in the wrong order.
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+             VALUES (100, 200, 'media', 'zebra', 'Z Track', 'media:zebra-bus')",
+                [],
+            )
+            .expect("insert zebra");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+             VALUES (100, 200, 'media', 'alpha', 'A Track', 'media:alpha-bus')",
+                [],
+            )
+            .expect("insert alpha");
+
+        let (_, media) = store.day_activity(0, 1_000, 1_000).expect("day activity");
+
+        assert_eq!(
+            media
+                .iter()
+                .map(|segment| segment.snapshot.player.clone())
+                .collect::<Vec<_>>(),
+            vec![Some("alpha".to_string()), Some("zebra".to_string())],
+            "the normalized player must order the row, not the id it happened to get: {media:?}"
+        );
+    }
+
+    #[test]
+    fn media_rows_for_the_same_player_at_the_same_instant_are_ordered_by_lane() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+             VALUES (100, 200, 'media', 'spotify', 'Second Instance', 'media:spotify.instance2')",
+                [],
+            )
+            .expect("insert second instance");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title, lane)
+             VALUES (100, 200, 'media', 'spotify', 'First Instance', 'media:spotify.instance1')",
+                [],
+            )
+            .expect("insert first instance");
+
+        let (_, media) = store.day_activity(0, 1_000, 1_000).expect("day activity");
+
+        assert_eq!(
+            media
+                .iter()
+                .map(|segment| segment.snapshot.title.clone())
+                .collect::<Vec<_>>(),
+            vec![
+                Some("First Instance".to_string()),
+                Some("Second Instance".to_string())
+            ],
+            "two instances of one player at the same instant must order by lane: {media:?}"
+        );
+    }
+
+    fn discovered(player_key: &str, bus_name: &str, title: &str) -> PlayerOutcome {
+        PlayerOutcome::Playing(PlayingMedia {
+            player_key: player_key.to_string(),
+            bus_name: bus_name.to_string(),
+            title: Some(title.to_string()),
+            artist: None,
+            album: None,
+            item_url: None,
+        })
+    }
+
+    /// Feeding busctl discovery in one order and then the reverse must not be observable in
+    /// either the report or the export: both are read through the same ordered query, and this
+    /// proves that end to end rather than only at the SQL layer.
+    #[test]
+    fn feeding_the_same_players_in_opposite_discovery_order_renders_byte_identical_output() {
+        let day = chrono::NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let (start, end) = day_bounds(day).expect("bounds");
+
+        let dir_a = tempfile::tempdir().expect("tempdir");
+        let mut store_a = Store::open(dir_a.path().join("daytrace.db"), None).expect("store a");
+        let discovery_order = [
+            discovered("zebra", "bus-zebra", "Z Track"),
+            discovered("alpha", "bus-alpha", "A Track"),
+        ];
+        store_a
+            .record_media_poll(start, &discovery_order)
+            .expect("poll a, first");
+        store_a
+            .record_media_poll(start + 600, &discovery_order)
+            .expect("poll a, second, to give each lane a nonzero duration");
+        store_a
+            .close_open_media_lanes_at_last_seen()
+            .expect("seal a");
+
+        let dir_b = tempfile::tempdir().expect("tempdir");
+        let mut store_b = Store::open(dir_b.path().join("daytrace.db"), None).expect("store b");
+        let reverse_discovery_order = [
+            discovered("alpha", "bus-alpha", "A Track"),
+            discovered("zebra", "bus-zebra", "Z Track"),
+        ];
+        store_b
+            .record_media_poll(start, &reverse_discovery_order)
+            .expect("poll b, first");
+        store_b
+            .record_media_poll(start + 600, &reverse_discovery_order)
+            .expect("poll b, second");
+        store_b
+            .close_open_media_lanes_at_last_seen()
+            .expect("seal b");
+
+        let (desktop_a, media_a) = store_a
+            .day_activity(start, end, end)
+            .expect("day activity a");
+        let (desktop_b, media_b) = store_b
+            .day_activity(start, end, end)
+            .expect("day activity b");
+
+        let report_a = render_day(day, &desktop_a, &media_a).expect("render a");
+        let report_b = render_day(day, &desktop_b, &media_b).expect("render b");
+        assert_eq!(
+            report_a, report_b,
+            "the same activity, discovered in a different order, must render byte-identically"
+        );
+
+        let export_a = render_day_export(day, &desktop_a, &media_a).expect("export a");
+        let export_b = render_day_export(day, &desktop_b, &media_b).expect("export b");
+        assert_eq!(
+            export_a, export_b,
+            "and the export must not carry the discovery order either"
         );
     }
 }

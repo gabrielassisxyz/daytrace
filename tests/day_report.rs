@@ -65,6 +65,47 @@ fn seeded_database(directory: &Path, segments: &[StoredSegment]) -> PathBuf {
     db_path
 }
 
+/// Open an already-migrated database and insert one media row directly.
+///
+/// A media row cannot go through `seeded_database`'s minimal legacy schema: that table has
+/// neither `lane` nor `artist`/`album`/`item_url`, and its `kind` check does not admit `media`.
+/// The caller runs the binary once first so `Store::open`'s own migration brings the schema up
+/// to its current shape, the same path a real installation upgrades through; this only adds a
+/// row afterwards, rather than re-declaring the schema a second time for tests to drift out of
+/// step with.
+fn seed_media_row(db_path: &Path, started_at: i64, ended_at: i64, player: &str, title: &str) {
+    let connection = Connection::open(db_path).expect("open migrated database");
+    connection
+        .execute(
+            "INSERT INTO activity_segments
+                (started_at, ended_at, last_seen_at, kind, app_class, title, lane)
+             VALUES (?1, ?2, ?2, 'media', ?3, ?4, ?5)",
+            params![
+                started_at,
+                ended_at,
+                player,
+                title,
+                format!("media:{player}"),
+            ],
+        )
+        .expect("insert media row");
+}
+
+/// Trigger `Store::open`'s migration as a side effect of an ordinary read, on whichever day: the
+/// date argued here answers no assertion in the tests that call this.
+fn migrate_schema(db_path: &Path) {
+    let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
+        .args(["today", "--date", "1970-01-02"])
+        .env("DAYTRACE_DB_PATH", db_path)
+        .output()
+        .expect("run daytrace to trigger migration");
+    assert!(
+        output.status.success(),
+        "the migrating run failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 fn run_in_zone(db_path: &Path, timezone: &str, args: &[&str]) -> String {
     let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
         .args(args)
@@ -356,5 +397,81 @@ fn a_day_left_open_by_a_crash_does_not_spill_into_later_days() {
     assert!(
         !tuesday.contains("crashed-app"),
         "a later day must not inherit a segment nobody closed: {tuesday}"
+    );
+}
+
+/// A media row's day boundary has to behave exactly as a desktop row's does: the same zone,
+/// the same clip target, and the same `-24:00` reading rather than an hour that belongs to the
+/// following day.
+#[test]
+fn a_media_row_crossing_a_shifted_local_midnight_ends_at_the_same_boundary_a_desktop_row_would() {
+    // The end of 2038-09-04 in Santiago, the instant `the_end_of_a_day_whose_midnight_never_happened_is_still_the_end_of_that_day`
+    // pins for a desktop row, reused here for a media row over the same span.
+    const FRIDAY_END: i64 = 2_167_272_000;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = seeded_database(directory.path(), &[]);
+    migrate_schema(&db_path);
+    seed_media_row(
+        &db_path,
+        FRIDAY_END - 600,
+        FRIDAY_END + 3600,
+        "spotify",
+        "Late Set",
+    );
+
+    let friday = run_in_zone(
+        &db_path,
+        "America/Santiago",
+        &["today", "--date", "2038-09-04"],
+    );
+
+    assert!(
+        friday.contains("Media playing"),
+        "a day with a media row and no desktop rows must still report it: {friday}"
+    );
+    assert!(
+        friday.contains("23:50-24:00  10m"),
+        "the media row's own ten minutes must end at this day's boundary, exactly as a desktop \
+         row's would: {friday}"
+    );
+    assert!(
+        !friday.contains("-01:00"),
+        "the end of Friday must not be reported as an hour that belongs to Saturday, for media \
+         any more than for the desktop timeline: {friday}"
+    );
+}
+
+/// The mirror case: a media row spanning a day the clock lengthens to 25 hours by moving back
+/// at midnight must keep its last hour, exactly as `a_day_whose_clock_moves_back_at_midnight_keeps_its_last_hour`
+/// already proves for a desktop row over the same span.
+#[test]
+fn a_media_row_spanning_a_25_hour_day_keeps_its_last_hour_and_does_not_spill_into_the_next_day() {
+    // 2018-02-17 00:00 in Sao_Paulo, and the true start of the 18th, 25 hours later.
+    const SATURDAY: i64 = 1_518_832_800;
+    const SUNDAY: i64 = 1_518_922_800;
+    let directory = tempfile::tempdir().expect("tempdir");
+    let db_path = seeded_database(directory.path(), &[]);
+    migrate_schema(&db_path);
+    seed_media_row(&db_path, SATURDAY, SUNDAY, "spotify", "All Night Set");
+
+    let saturday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2018-02-17"],
+    );
+    let sunday = run_in_zone(
+        &db_path,
+        "America/Sao_Paulo",
+        &["today", "--date", "2018-02-18"],
+    );
+
+    assert!(
+        saturday.contains("00:00-24:00  25h"),
+        "a day the clock lengthens to 25 hours has to report all of them for media, exactly as \
+         it already does for the desktop timeline: {saturday}"
+    );
+    assert!(
+        !sunday.contains("All Night Set"),
+        "the last hour of Saturday must not be reported as Sunday's: {sunday}"
     );
 }

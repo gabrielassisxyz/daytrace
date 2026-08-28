@@ -1,4 +1,4 @@
-use crate::activity::{ActivitySnapshot, TimelineSegment};
+use crate::activity::{ActivitySnapshot, MediaSegment, TimelineSegment};
 use crate::config::{Blacklist, Config, redact_address, redact_title};
 use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::export::render_day_export;
@@ -114,13 +114,13 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, AppError> {
         // itself rather than as whatever the configuration complains about first.
         [arg, rest @ ..] if arg == "today" => {
             let requested = requested_day(rest)?;
-            let (date, segments) = stored_day(&Config::from_env()?, requested)?;
-            render_day(date, &segments).map_err(AppError::from)
+            let (date, segments, media) = stored_day(&Config::from_env()?, requested)?;
+            render_day(date, &segments, &media).map_err(AppError::from)
         }
         [arg, rest @ ..] if arg == "export" => {
             let requested = requested_day(rest)?;
-            let (date, segments) = stored_day(&Config::from_env()?, requested)?;
-            render_day_export(date, &segments).map_err(AppError::from)
+            let (date, segments, media) = stored_day(&Config::from_env()?, requested)?;
+            render_day_export(date, &segments, &media).map_err(AppError::from)
         }
         [arg, rest @ ..] if arg == "prune" => {
             let dry_run = prune_is_dry_run(rest)?;
@@ -750,7 +750,7 @@ impl MediaSourceFailureLog {
 fn stored_day(
     config: &Config,
     requested: Option<NaiveDate>,
-) -> Result<(NaiveDate, Vec<TimelineSegment>), String> {
+) -> Result<(NaiveDate, Vec<TimelineSegment>, Vec<MediaSegment>), String> {
     let now = unix_now();
     let date = match requested {
         Some(date) => date,
@@ -758,14 +758,16 @@ fn stored_day(
     };
 
     if !config.db_path.exists() {
-        return Ok((date, Vec::new()));
+        return Ok((date, Vec::new(), Vec::new()));
     }
 
     let store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
     let (start, end) = day_bounds(date)?;
     // `now` still bounds a segment left open, which for a past day the query clips to the
-    // end of that day.
-    Ok((date, store.timeline_between(start, end, now)?))
+    // end of that day. One read against one snapshot, so a desktop row and a media row never
+    // describe an instant that never existed together.
+    let (segments, media) = store.day_activity(start, end, now)?;
+    Ok((date, segments, media))
 }
 
 /// Delete the stored activity that the retention window no longer covers.
