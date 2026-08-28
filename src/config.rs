@@ -10,6 +10,7 @@ pub struct Config {
     pub secure_data_dir: Option<PathBuf>,
     pub idle_after: Duration,
     pub poll_interval: Duration,
+    pub media_poll_interval: Duration,
     pub retention_days: u32,
     pub blacklist: Blacklist,
 }
@@ -38,6 +39,10 @@ impl Config {
             secure_data_dir: db_location.secure_data_dir,
             idle_after: duration_from_env("DAYTRACE_IDLE_AFTER_SECONDS", 300)?,
             poll_interval: duration_from_env("DAYTRACE_POLL_SECONDS", 1)?,
+            // A window change matters at one second; a track change does not, and the boundary
+            // costs a subprocess per player, which is why this defaults wider than the desktop
+            // poll rather than sharing its interval.
+            media_poll_interval: duration_from_env("DAYTRACE_MEDIA_POLL_SECONDS", 5)?,
             retention_days: retention_days(env::var("DAYTRACE_RETENTION_DAYS").ok().as_deref())?,
             blacklist: Blacklist::from_env(),
         })
@@ -405,7 +410,11 @@ fn normalize_list(values: Vec<String>) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Blacklist, DEFAULT_RETENTION_DAYS, redact_address, redact_title, retention_days};
+    use super::{
+        Blacklist, DEFAULT_RETENTION_DAYS, duration_from_env, redact_address, redact_title,
+        retention_days,
+    };
+    use std::time::Duration;
 
     #[test]
     fn an_unset_retention_window_falls_back_to_the_documented_default() {
@@ -840,5 +849,21 @@ mod tests {
             None,
             None,
         ));
+    }
+
+    #[test]
+    fn media_poll_seconds_parses_through_the_same_helper_every_numeric_setting_uses() {
+        // `duration_from_env` is the shared helper `Config::from_env` calls for every numeric
+        // setting, including this one with `5` as its own default argument (see `src/config.rs`
+        // near `DAYTRACE_MEDIA_POLL_SECONDS`): this pins that shared contract, not the literal
+        // `5` at that call site, which nothing short of reading the source currently pins. The
+        // clamp itself (a configured value below one reads as one) has no test anywhere in this
+        // codebase, for this setting or the two it shares the helper with: proving it here would
+        // mean mutating real process environment state that every parallel test shares.
+        assert_eq!(
+            duration_from_env("DAYTRACE_MEDIA_POLL_SECONDS", 5).expect("an unset interval"),
+            Duration::from_secs(5),
+            "unset must fall back to the default passed in, the same as every other setting"
+        );
     }
 }

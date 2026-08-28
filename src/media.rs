@@ -30,7 +30,6 @@ const MEDIA_POLL_BUDGET: Duration = Duration::from_secs(1);
 /// `mpris:artUrl` and `mpris:trackid` are deliberately absent: the first is a path into `/tmp`
 /// or a cover image, and the second is redundant with the address where it is legible and
 /// opaque where it is not.
-#[allow(dead_code)]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PlayingMedia {
     /// The normalized player key, e.g. `brave` or `spotify`.
@@ -44,25 +43,24 @@ pub struct PlayingMedia {
 }
 
 /// What one discovered player turned out to be doing.
-#[allow(dead_code)]
+///
+/// `NotPlaying` and `Failed` carry the bus name a `Playing` outcome carries inside its own
+/// `PlayingMedia`, because the capture loop closes or seals a player's lane by that name and has
+/// no other way to learn it: the two outcomes are the ones where a bus went quiet or broke
+/// rather than one where its metadata says who it was.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum PlayerOutcome {
     /// The player is playing, with its metadata.
     Playing(PlayingMedia),
     /// The player is present but not playing.
-    NotPlaying,
+    NotPlaying { bus_name: String },
     /// The property query for this player failed or returned unparseable output.
-    Failed(String),
+    Failed { bus_name: String, error: String },
 }
 
 /// The media boundary the capture loop observes through.
 ///
 /// Exists so the loop's failure handling can be driven by a fake, the way the compositor's is.
-///
-/// The capture loop that polls this is a later bead, so the trait, its client and the model
-/// types are dead code in the binary until then; the allows below are removed when the loop
-/// lands.
-#[allow(dead_code)]
 pub trait MediaSource {
     fn poll(&self, blacklist: &Blacklist) -> Result<Vec<PlayerOutcome>, String>;
 }
@@ -75,13 +73,11 @@ struct BusName {
 }
 
 /// The real client, reading the user bus through `busctl`.
-#[allow(dead_code)]
 pub struct BusctlClient {
     command: Vec<String>,
 }
 
 impl BusctlClient {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self {
             command: vec!["busctl".to_string()],
@@ -113,7 +109,10 @@ impl MediaSource for BusctlClient {
                 Ok(output) => {
                     parse_properties(&String::from_utf8_lossy(&output), &bus_name, blacklist)
                 }
-                Err(error) => PlayerOutcome::Failed(error),
+                Err(error) => PlayerOutcome::Failed {
+                    bus_name: bus_name.full.clone(),
+                    error,
+                },
             };
             outcomes.push(outcome);
         }
@@ -238,33 +237,37 @@ struct MetadataEnvelope {
 fn parse_properties(output: &str, bus_name: &BusName, blacklist: &Blacklist) -> PlayerOutcome {
     let mut lines = output.lines().filter(|line| !line.trim().is_empty());
 
+    let failed = |error: String| PlayerOutcome::Failed {
+        bus_name: bus_name.full.clone(),
+        error,
+    };
+
     let status = match lines.next() {
         Some(line) => match serde_json::from_str::<BusctlValue>(line) {
             Ok(value) => value,
             Err(error) => {
-                return PlayerOutcome::Failed(format!(
+                return failed(format!(
                     "{} returned unparseable PlaybackStatus: {error}",
                     bus_name.full
                 ));
             }
         },
         None => {
-            return PlayerOutcome::Failed(format!("{} returned no PlaybackStatus", bus_name.full));
+            return failed(format!("{} returned no PlaybackStatus", bus_name.full));
         }
     };
 
     let status = match status.as_string() {
         Some(value) => value,
         None => {
-            return PlayerOutcome::Failed(format!(
-                "{} PlaybackStatus is not a string",
-                bus_name.full
-            ));
+            return failed(format!("{} PlaybackStatus is not a string", bus_name.full));
         }
     };
 
     if status != "Playing" {
-        return PlayerOutcome::NotPlaying;
+        return PlayerOutcome::NotPlaying {
+            bus_name: bus_name.full.clone(),
+        };
     }
 
     let metadata = match lines.next() {
@@ -272,22 +275,19 @@ fn parse_properties(output: &str, bus_name: &BusName, blacklist: &Blacklist) -> 
             let envelope = match serde_json::from_str::<MetadataEnvelope>(line) {
                 Ok(envelope) => envelope,
                 Err(error) => {
-                    return PlayerOutcome::Failed(format!(
+                    return failed(format!(
                         "{} returned unparseable Metadata: {error}",
                         bus_name.full
                     ));
                 }
             };
             if envelope.type_tag != "a{sv}" {
-                return PlayerOutcome::Failed(format!(
-                    "{} Metadata is not a dictionary",
-                    bus_name.full
-                ));
+                return failed(format!("{} Metadata is not a dictionary", bus_name.full));
             }
             envelope.data
         }
         None => {
-            return PlayerOutcome::Failed(format!("{} returned no Metadata", bus_name.full));
+            return failed(format!("{} returned no Metadata", bus_name.full));
         }
     };
 
@@ -303,7 +303,9 @@ fn parse_properties(output: &str, bus_name: &BusName, blacklist: &Blacklist) -> 
         album.as_deref(),
         item_url.as_deref(),
     ) {
-        return PlayerOutcome::NotPlaying;
+        return PlayerOutcome::NotPlaying {
+            bus_name: bus_name.full.clone(),
+        };
     }
 
     PlayerOutcome::Playing(PlayingMedia {
@@ -599,7 +601,9 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
                 "org.mpris.MediaPlayer2.brave.instance100200",
                 "brave"
             ),
-            PlayerOutcome::NotPlaying
+            PlayerOutcome::NotPlaying {
+                bus_name: "org.mpris.MediaPlayer2.brave.instance100200".to_string()
+            }
         );
     }
 
@@ -608,7 +612,9 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
         let stopped = "{\"type\":\"s\",\"data\":\"Stopped\"}\n{\"type\":\"a{sv}\",\"data\":{}}";
         assert_eq!(
             parse(stopped, "org.mpris.MediaPlayer2.spotify", "spotify"),
-            PlayerOutcome::NotPlaying
+            PlayerOutcome::NotPlaying {
+                bus_name: "org.mpris.MediaPlayer2.spotify".to_string()
+            }
         );
     }
 
@@ -616,7 +622,7 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
     fn a_missing_playback_status_is_a_failure() {
         assert!(matches!(
             parse("", "org.mpris.MediaPlayer2.spotify", "spotify"),
-            PlayerOutcome::Failed(_)
+            PlayerOutcome::Failed { .. }
         ));
     }
 
@@ -625,7 +631,7 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
         let wrong = "{\"type\":\"x\",\"data\":123}\n{\"type\":\"a{sv}\",\"data\":{}}";
         assert!(matches!(
             parse(wrong, "org.mpris.MediaPlayer2.spotify", "spotify"),
-            PlayerOutcome::Failed(_)
+            PlayerOutcome::Failed { .. }
         ));
     }
 
@@ -735,7 +741,7 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
         ] {
             assert!(matches!(
                 parse(output, "org.mpris.MediaPlayer2.spotify", "spotify"),
-                PlayerOutcome::Failed(_)
+                PlayerOutcome::Failed { .. }
             ));
         }
     }
@@ -778,7 +784,12 @@ org.mpris.MediaPlayer2.brave.instance2 101 brave user :1.2 user@1000.service - -
             },
             &blacklist,
         );
-        assert_eq!(outcome, PlayerOutcome::NotPlaying);
+        assert_eq!(
+            outcome,
+            PlayerOutcome::NotPlaying {
+                bus_name: "org.mpris.MediaPlayer2.spotify".to_string()
+            }
+        );
     }
 
     #[test]
@@ -953,7 +964,7 @@ fi
         let result = client.poll(&Blacklist::default()).expect("list succeeded");
         assert_eq!(result.len(), 2);
         assert!(matches!(&result[0], PlayerOutcome::Playing(_)));
-        assert!(matches!(&result[1], PlayerOutcome::Failed(_)));
+        assert!(matches!(&result[1], PlayerOutcome::Failed { .. }));
     }
 
     #[test]

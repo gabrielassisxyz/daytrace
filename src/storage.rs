@@ -1,7 +1,9 @@
 use crate::activity::{
     ActivityKind, ActivitySnapshot, MediaSegment, MediaSnapshot, TimelineSegment,
 };
+use crate::media::{PlayerOutcome, PlayingMedia};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
+use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -26,10 +28,6 @@ pub enum Lane {
     Desktop,
     /// A player's own lane, keyed by its full MPRIS bus name rather than the normalized player
     /// key, so that two instances of the same player never collide in one lane.
-    ///
-    /// Nothing writes a media row yet, so this variant is only ever constructed in tests until
-    /// the capture loop that polls MPRIS lands.
-    #[allow(dead_code)]
     Media(String),
 }
 
@@ -60,6 +58,17 @@ pub trait CaptureStore {
     fn record_powered_down_gap(&mut self, started_at: i64, ended_at: i64) -> Result<(), String>;
 
     fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String>;
+
+    /// Apply one media poll's opens, progress updates, transitions and closes in one IMMEDIATE
+    /// transaction.
+    fn record_media_poll(
+        &mut self,
+        observed_at: i64,
+        outcomes: &[PlayerOutcome],
+    ) -> Result<(), String>;
+
+    /// Close every open media lane at its own `last_seen_at`, leaving the desktop lane untouched.
+    fn close_open_media_lanes_at_last_seen(&mut self) -> Result<(), String>;
 }
 
 impl CaptureStore for Store {
@@ -78,6 +87,18 @@ impl CaptureStore for Store {
 
     fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
         Store::close_open(self, ended_at, lane)
+    }
+
+    fn record_media_poll(
+        &mut self,
+        observed_at: i64,
+        outcomes: &[PlayerOutcome],
+    ) -> Result<(), String> {
+        Store::record_media_poll(self, observed_at, outcomes)
+    }
+
+    fn close_open_media_lanes_at_last_seen(&mut self) -> Result<(), String> {
+        Store::close_open_media_lanes_at_last_seen(self)
     }
 }
 
@@ -457,6 +478,68 @@ impl Store {
                 params![ended_at, lane.column_value()],
             )
             .map_err(|error| format!("failed to close the open segment in the lane: {error}"))?;
+        self.secure_permissions()
+    }
+
+    /// Apply one media poll: every player it found becomes an open, a progress update, a
+    /// transition or a close, and a player whose lane is open but absent from `outcomes`
+    /// altogether is closed too, since discovery simply not listing it any more is exactly what
+    /// vanishing from the bus looks like.
+    ///
+    /// One IMMEDIATE transaction for the whole poll, not one per player: applied row at a time, a
+    /// store failure part-way could commit player A, fail on B and leave C open from a poll that
+    /// no longer describes the machine, a state no later poll knows how to correct.
+    pub fn record_media_poll(
+        &mut self,
+        observed_at: i64,
+        outcomes: &[PlayerOutcome],
+    ) -> Result<(), String> {
+        let tx = self
+            .conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(|error| format!("failed to start transaction: {error}"))?;
+
+        let mut touched = HashSet::new();
+        for outcome in outcomes {
+            match outcome {
+                PlayerOutcome::Playing(media) => {
+                    touched.insert(media.bus_name.clone());
+                    apply_playing_outcome(&tx, observed_at, media)?;
+                }
+                PlayerOutcome::NotPlaying { bus_name } => {
+                    touched.insert(bus_name.clone());
+                    close_media_lane(&tx, observed_at, bus_name)?;
+                }
+                // A property query that failed is not evidence the player stopped: it is
+                // evidence the daemon cannot vouch for it, so its lane is sealed at its own
+                // last_seen_at rather than closed at the poll instant, the same treatment a
+                // whole-source failure gives every open lane.
+                PlayerOutcome::Failed { bus_name, .. } => {
+                    touched.insert(bus_name.clone());
+                    seal_media_lane(&tx, bus_name)?;
+                }
+            }
+        }
+        close_media_lanes_absent_from(&tx, observed_at, &touched)?;
+
+        tx.commit()
+            .map_err(|error| format!("failed to commit the media poll: {error}"))?;
+        self.secure_permissions()
+    }
+
+    /// Close every open media lane at its own `last_seen_at`, leaving the desktop lane untouched.
+    ///
+    /// What a whole-source media failure and a graceful shutdown both need: uncertain time
+    /// becomes a gap rather than being bridged as playback, or written as hours of it the moment
+    /// the daemon stops. Not wrapped in an explicit transaction: it is the one statement in it.
+    pub fn close_open_media_lanes_at_last_seen(&mut self) -> Result<(), String> {
+        self.conn
+            .execute(
+                "UPDATE activity_segments SET ended_at = last_seen_at \
+                 WHERE ended_at IS NULL AND lane GLOB 'media:?*'",
+                [],
+            )
+            .map_err(|error| format!("failed to seal the open media lanes: {error}"))?;
         self.secure_permissions()
     }
 
@@ -1158,10 +1241,174 @@ fn insert_segment(
     Ok(())
 }
 
+/// The row open in a media lane, with the fields a new `Playing` reading is compared against.
+#[derive(Debug)]
+struct MediaOpenSegment {
+    id: i64,
+    started_at: i64,
+    title: Option<String>,
+    artist: Option<String>,
+    album: Option<String>,
+    item_url: Option<String>,
+}
+
+impl MediaOpenSegment {
+    /// Whether `media` is the same track this row is already open for: title, every artist,
+    /// album and address all unchanged. `player_key` is not part of the comparison, since it
+    /// cannot differ from one poll to the next for a lane keyed by one fixed bus name.
+    fn matches(&self, media: &PlayingMedia) -> bool {
+        self.title == media.title
+            && self.artist == media.artist
+            && self.album == media.album
+            && self.item_url == media.item_url
+    }
+}
+
+/// The open row in a player's lane, or `None` if that lane has nothing open.
+fn load_open_media_segment(
+    conn: &Connection,
+    bus_name: &str,
+) -> Result<Option<MediaOpenSegment>, String> {
+    conn.query_row(
+        "SELECT id, started_at, title, artist, album, item_url
+         FROM activity_segments
+         WHERE ended_at IS NULL AND lane = ?1
+         ORDER BY id DESC
+         LIMIT 1",
+        params![Lane::Media(bus_name.to_string()).column_value()],
+        |row| {
+            Ok(MediaOpenSegment {
+                id: row.get(0)?,
+                started_at: row.get(1)?,
+                title: row.get(2)?,
+                artist: row.get(3)?,
+                album: row.get(4)?,
+                item_url: row.get(5)?,
+            })
+        },
+    )
+    .optional()
+    .map_err(|error| format!("failed to load the open segment in the player's lane: {error}"))
+}
+
+/// Apply one `Playing` reading: extend the row already open for the same track, or close it and
+/// open a fresh one when the track changed, or open the lane's first row when nothing was open.
+fn apply_playing_outcome(
+    conn: &Connection,
+    observed_at: i64,
+    media: &PlayingMedia,
+) -> Result<(), String> {
+    match load_open_media_segment(conn, &media.bus_name)? {
+        Some(open) if open.matches(media) => {
+            conn.execute(
+                "UPDATE activity_segments SET last_seen_at = ?1 WHERE id = ?2",
+                params![observed_at.max(open.started_at), open.id],
+            )
+            .map_err(|error| format!("failed to record media progress: {error}"))?;
+        }
+        Some(open) => {
+            // Clamped the same way `close_media_lane` is: an NTP step backwards between polls
+            // must not store a close that precedes the row's own start.
+            let ends_at = observed_at.max(open.started_at);
+            conn.execute(
+                "UPDATE activity_segments SET ended_at = ?1, last_seen_at = ?1 WHERE id = ?2",
+                params![ends_at, open.id],
+            )
+            .map_err(|error| format!("failed to close the previous track: {error}"))?;
+            insert_media_segment(conn, observed_at, observed_at, media)?;
+        }
+        None => insert_media_segment(conn, observed_at, observed_at, media)?,
+    }
+    Ok(())
+}
+
+/// Insert one open media row.
+fn insert_media_segment(
+    conn: &Connection,
+    started_at: i64,
+    last_seen_at: i64,
+    media: &PlayingMedia,
+) -> Result<(), String> {
+    conn.execute(
+        "INSERT INTO activity_segments
+            (started_at, ended_at, last_seen_at, kind, lane, app_class, title, artist, album, item_url)
+         VALUES (?1, NULL, ?2, 'media', ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            started_at,
+            last_seen_at.max(started_at),
+            Lane::Media(media.bus_name.clone()).column_value(),
+            media.player_key,
+            media.title,
+            media.artist,
+            media.album,
+            media.item_url,
+        ],
+    )
+    .map_err(|error| format!("failed to insert media segment: {error}"))?;
+    Ok(())
+}
+
+/// Close the row open in a player's lane at `ended_at`, the ordinary close a stop, a pause, a
+/// track change away from playing, or an absence from discovery all get: ended_at and
+/// last_seen_at both land on the poll instant, because the daemon has fresh evidence up to it.
+/// A no-op when that lane has nothing open.
+fn close_media_lane(conn: &Connection, ended_at: i64, bus_name: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE activity_segments SET ended_at = MAX(?1, started_at), \
+         last_seen_at = MAX(?1, started_at) WHERE ended_at IS NULL AND lane = ?2",
+        params![ended_at, Lane::Media(bus_name.to_string()).column_value()],
+    )
+    .map_err(|error| format!("failed to close the player's lane: {error}"))?;
+    Ok(())
+}
+
+/// Seal the row open in a player's lane at its own `last_seen_at`: what a property query that
+/// failed gets, since the daemon cannot vouch for the player past the last successful read.
+/// Reaching past it to the poll instant would bridge the whole unread stretch as playback the
+/// moment a later poll finds the same track again. A no-op when that lane has nothing open.
+fn seal_media_lane(conn: &Connection, bus_name: &str) -> Result<(), String> {
+    conn.execute(
+        "UPDATE activity_segments SET ended_at = last_seen_at \
+         WHERE ended_at IS NULL AND lane = ?1",
+        params![Lane::Media(bus_name.to_string()).column_value()],
+    )
+    .map_err(|error| format!("failed to seal the player's lane: {error}"))?;
+    Ok(())
+}
+
+/// Close every open media lane whose bus name this poll did not mention at all: discovery simply
+/// not listing a player any more is what a vanished bus looks like, and the lane it left open has
+/// no later outcome to close it otherwise.
+fn close_media_lanes_absent_from(
+    conn: &Connection,
+    ended_at: i64,
+    touched: &HashSet<String>,
+) -> Result<(), String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT lane FROM activity_segments WHERE ended_at IS NULL AND lane GLOB 'media:?*'",
+        )
+        .map_err(|error| format!("failed to list the open media lanes: {error}"))?;
+    let open_lanes = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .map_err(|error| format!("failed to read the open media lanes: {error}"))?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to materialize the open media lanes: {error}"))?;
+
+    for lane_value in open_lanes {
+        let bus_name = lane_value.strip_prefix("media:").unwrap_or(&lane_value);
+        if !touched.contains(bus_name) {
+            close_media_lane(conn, ended_at, bus_name)?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Lane, Store};
     use crate::activity::{ActivitySnapshot, MediaSnapshot, TimelineSegment};
+    use crate::media::{PlayerOutcome, PlayingMedia};
     use rusqlite::{Connection, params};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -4303,5 +4550,455 @@ mod tests {
             .query_row("SELECT title FROM activity_segments", [], |row| row.get(0))
             .expect("remaining row");
         assert_eq!(remaining_title, "Recent Track");
+    }
+
+    // record_media_poll: applying one poll's opens, progress updates, transitions and closes.
+
+    fn playing(bus_name: &str, title: &str) -> PlayerOutcome {
+        PlayerOutcome::Playing(PlayingMedia {
+            player_key: "spotify".to_string(),
+            bus_name: bus_name.to_string(),
+            title: Some(title.to_string()),
+            artist: None,
+            album: None,
+            item_url: None,
+        })
+    }
+
+    fn open_row(conn: &Connection, bus_name: &str) -> (i64, Option<i64>, i64, String) {
+        conn.query_row(
+            "SELECT id, ended_at, last_seen_at, title FROM activity_segments \
+             WHERE lane = ?1",
+            params![format!("media:{bus_name}")],
+            |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, i64>(2)?,
+                    row.get::<_, String>(3)?,
+                ))
+            },
+        )
+        .expect("the row for the lane")
+    }
+
+    #[test]
+    fn a_first_playing_reading_opens_a_row() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("apply the poll");
+
+        let (_, ended_at, last_seen_at, title) = open_row(&store.conn, "spotify");
+        assert_eq!(ended_at, None, "the row must still be open");
+        assert_eq!(last_seen_at, 100);
+        assert_eq!(title, "Track A");
+    }
+
+    #[test]
+    fn an_unchanged_reading_extends_the_open_row_rather_than_rotating() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("first poll");
+        store
+            .record_media_poll(105, &[playing("spotify", "Track A")])
+            .expect("second poll, same track");
+
+        let rows: Vec<(i64, Option<i64>)> = store
+            .conn
+            .prepare("SELECT id, ended_at FROM activity_segments WHERE lane = 'media:spotify'")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the same track across two polls must stay one row, not rotate: {rows:?}"
+        );
+        let (_, _, last_seen_at, _) = open_row(&store.conn, "spotify");
+        assert_eq!(last_seen_at, 105, "progress must advance to the later poll");
+    }
+
+    #[test]
+    fn adding_the_address_alone_rotates_the_segment_once() {
+        // The measured Chromium player publishes no address at all, so two polls agreeing on
+        // everything but the address must not be read as "the same track": address is part of
+        // the identity, not an incidental field.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let no_address = PlayerOutcome::Playing(PlayingMedia {
+            player_key: "brave".to_string(),
+            bus_name: "brave".to_string(),
+            title: Some("Track A".to_string()),
+            artist: None,
+            album: None,
+            item_url: None,
+        });
+        let with_address = PlayerOutcome::Playing(PlayingMedia {
+            item_url: Some("https://example.test/1".to_string()),
+            ..(match &no_address {
+                PlayerOutcome::Playing(media) => media.clone(),
+                _ => unreachable!(),
+            })
+        });
+
+        store
+            .record_media_poll(100, &[no_address])
+            .expect("open without an address");
+        store
+            .record_media_poll(110, &[with_address])
+            .expect("the same poll, now with an address");
+
+        let rows: Vec<(Option<i64>, Option<String>)> = store
+            .conn
+            .prepare(
+                "SELECT ended_at, item_url FROM activity_segments \
+                 WHERE lane = 'media:brave' ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![
+                (Some(110), None),
+                (None, Some("https://example.test/1".to_string())),
+            ],
+            "an address appearing where there was none must rotate the segment, not extend it"
+        );
+    }
+
+    #[test]
+    fn a_stop_then_the_same_track_reopens_a_new_segment_rather_than_reviving_the_old_one() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("open");
+        store
+            .record_media_poll(
+                110,
+                &[PlayerOutcome::NotPlaying {
+                    bus_name: "spotify".to_string(),
+                }],
+            )
+            .expect("pause closes it");
+        store
+            .record_media_poll(120, &[playing("spotify", "Track A")])
+            .expect("playing the same track again");
+
+        let rows: Vec<(i64, Option<i64>)> = store
+            .conn
+            .prepare(
+                "SELECT started_at, ended_at FROM activity_segments \
+                 WHERE lane = 'media:spotify' ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![(100, Some(110)), (120, None)],
+            "a pause followed by the same track must open a NEW segment at 120, never extend \
+             the row a pause already closed at 110"
+        );
+    }
+
+    #[test]
+    fn a_changed_reading_closes_the_previous_track_and_opens_the_next_at_the_same_instant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("first poll");
+        store
+            .record_media_poll(110, &[playing("spotify", "Track B")])
+            .expect("second poll, different track");
+
+        let rows: Vec<(Option<i64>, i64, String)> = store
+            .conn
+            .prepare(
+                "SELECT ended_at, started_at, title FROM activity_segments \
+                 WHERE lane = 'media:spotify' ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![
+                (Some(110), 100, "Track A".to_string()),
+                (None, 110, "Track B".to_string()),
+            ],
+            "the old track must close and the new one open at the very same instant"
+        );
+    }
+
+    #[test]
+    fn not_playing_closes_the_open_row_at_the_poll_instant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("open the row");
+
+        store
+            .record_media_poll(
+                150,
+                &[PlayerOutcome::NotPlaying {
+                    bus_name: "spotify".to_string(),
+                }],
+            )
+            .expect("apply the stop");
+
+        let (_, ended_at, last_seen_at, _) = open_row(&store.conn, "spotify");
+        assert_eq!(ended_at, Some(150), "a stop closes at the poll instant");
+        assert_eq!(last_seen_at, 150);
+    }
+
+    #[test]
+    fn not_playing_for_a_lane_with_nothing_open_is_a_no_op() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_media_poll(
+                100,
+                &[PlayerOutcome::NotPlaying {
+                    bus_name: "spotify".to_string(),
+                }],
+            )
+            .expect("apply a stop nothing was open for");
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("count rows");
+        assert_eq!(
+            rows, 0,
+            "a stop for a lane that was never open writes nothing"
+        );
+    }
+
+    #[test]
+    fn a_failed_property_query_seals_the_lane_at_its_own_last_seen_at_not_the_poll_instant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("open the row, last_seen_at = 100");
+        store
+            .record_media_poll(105, &[playing("spotify", "Track A")])
+            .expect("advance progress, last_seen_at = 105");
+
+        store
+            .record_media_poll(
+                500,
+                &[PlayerOutcome::Failed {
+                    bus_name: "spotify".to_string(),
+                    error: "property query timed out".to_string(),
+                }],
+            )
+            .expect("apply the failure");
+
+        let (_, ended_at, last_seen_at, _) = open_row(&store.conn, "spotify");
+        assert_eq!(
+            ended_at,
+            Some(105),
+            "a failed player is sealed at its last successful read, never at the poll instant \
+             that could not vouch for it"
+        );
+        assert_eq!(last_seen_at, 105);
+    }
+
+    #[test]
+    fn an_absent_bus_name_closes_the_lane_it_left_open_at_the_poll_instant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_media_poll(
+                100,
+                &[playing("spotify", "Track A"), playing("brave", "Video")],
+            )
+            .expect("two players open");
+
+        // The next poll only lists spotify: brave has vanished from discovery entirely, which
+        // is what a player quitting the bus looks like.
+        store
+            .record_media_poll(150, &[playing("spotify", "Track A")])
+            .expect("apply the second poll");
+
+        let (_, spotify_ended, _, _) = open_row(&store.conn, "spotify");
+        let (_, brave_ended, brave_last_seen, _) = open_row(&store.conn, "brave");
+        assert_eq!(spotify_ended, None, "the player still listed stays open");
+        assert_eq!(
+            brave_ended,
+            Some(150),
+            "the player absent from the poll closes at the poll instant"
+        );
+        assert_eq!(brave_last_seen, 150);
+    }
+
+    #[test]
+    fn two_players_playing_at_once_are_two_untouched_lanes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_media_poll(
+                100,
+                &[playing("spotify", "Track A"), playing("brave", "Video")],
+            )
+            .expect("apply the poll");
+
+        let open_lanes: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM activity_segments WHERE ended_at IS NULL AND kind = 'media'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(
+            open_lanes, 2,
+            "neither player's lane may be merged or dropped"
+        );
+    }
+
+    #[test]
+    fn an_empty_bus_over_the_whole_run_produces_no_media_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        for observed_at in [100, 105, 110] {
+            store
+                .record_media_poll(observed_at, &[])
+                .expect("an empty poll must not fail");
+        }
+
+        let rows: i64 = store
+            .conn
+            .query_row("SELECT COUNT(*) FROM activity_segments", [], |row| {
+                row.get(0)
+            })
+            .expect("count");
+        assert_eq!(
+            rows, 0,
+            "an empty bus over the whole run must write nothing"
+        );
+    }
+
+    #[test]
+    fn a_store_failure_partway_through_a_poll_leaves_every_lane_at_its_pre_poll_state() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_media_poll(100, &[playing("spotify", "Track A")])
+            .expect("spotify already open before the failing poll");
+
+        // The second outcome names an empty bus name, whose lane value ("media:") fails the
+        // schema's own CHECK constraint (`lane GLOB 'media:?*'` requires at least one byte after
+        // the prefix), so the INSERT for it fails mid-transaction: exactly the shape of a store
+        // rejecting a write it cannot honour, without a fake store to script it.
+        let outcomes = vec![
+            playing("brave", "New Video"),
+            PlayerOutcome::Playing(PlayingMedia {
+                player_key: "broken".to_string(),
+                bus_name: String::new(),
+                title: Some("Unwritable".to_string()),
+                artist: None,
+                album: None,
+                item_url: None,
+            }),
+        ];
+        store
+            .record_media_poll(200, &outcomes)
+            .expect_err("a mid-poll store failure must be reported");
+
+        let rows: Vec<(String, Option<i64>)> = store
+            .conn
+            .prepare("SELECT lane, ended_at FROM activity_segments ORDER BY id")
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![("media:spotify".to_string(), None)],
+            "the whole poll must roll back: brave's open must not have committed, and spotify's \
+             pre-poll row must be exactly as it was, not touched by any part of a failed poll"
+        );
+    }
+
+    #[test]
+    fn close_open_media_lanes_at_last_seen_seals_every_media_lane_and_leaves_the_desktop_lane_open()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("open a desktop row");
+        store
+            .record_media_poll(
+                100,
+                &[playing("spotify", "Track A"), playing("brave", "Video")],
+            )
+            .expect("open two media rows");
+        // Advance only spotify's own progress marker directly, the way a later successful poll
+        // would, so the two lanes have different last_seen_at values and a seal that used one
+        // shared wall-clock instant instead could not produce the result asserted below.
+        store
+            .conn
+            .execute(
+                "UPDATE activity_segments SET last_seen_at = 140 WHERE lane = 'media:spotify'",
+                [],
+            )
+            .expect("advance spotify's progress marker");
+
+        store
+            .close_open_media_lanes_at_last_seen()
+            .expect("seal every open media lane");
+
+        let (_, spotify_ended, spotify_last_seen, _) = open_row(&store.conn, "spotify");
+        let (_, brave_ended, brave_last_seen, _) = open_row(&store.conn, "brave");
+        assert_eq!(spotify_ended, Some(140), "sealed at its own last_seen_at");
+        assert_eq!(spotify_last_seen, 140);
+        assert_eq!(
+            brave_ended,
+            Some(100),
+            "sealed at ITS own last_seen_at, not spotify's"
+        );
+        assert_eq!(brave_last_seen, 100);
+
+        let desktop_ended_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE lane = 'desktop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("desktop row");
+        assert_eq!(
+            desktop_ended_at, None,
+            "sealing media lanes must not touch the desktop lane"
+        );
     }
 }

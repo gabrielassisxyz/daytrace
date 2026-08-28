@@ -1,9 +1,10 @@
 use crate::activity::{ActivitySnapshot, TimelineSegment};
-use crate::config::{Blacklist, Config};
+use crate::config::{Blacklist, Config, redact_address, redact_title};
 use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::export::render_day_export;
 use crate::input::InputActivity;
 use crate::lock::CaptureLock;
+use crate::media::{BusctlClient, MediaSource, PlayerOutcome, PlayingMedia};
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
 use crate::storage::{CaptureStore, Lane, Pruned, Store};
@@ -52,6 +53,7 @@ Environment:
   DAYTRACE_BLACKLIST_TITLES        Comma-separated title substrings to skip.
   DAYTRACE_BLACKLIST_DOMAINS       Comma-separated URL/domain substrings to skip.
   DAYTRACE_POLL_SECONDS            Desktop polling interval, default 1.
+  DAYTRACE_MEDIA_POLL_SECONDS      Media polling interval, default 5.
 ";
 
 /// The two ways dispatch can fail.
@@ -258,6 +260,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
         .map_err(|error| format!("failed to install Ctrl-C handler: {error}"))?;
 
     let hyprland = HyprlandClient::new();
+    let media_source = BusctlClient::new();
     let input_activity = InputActivity::start(Arc::clone(&running), unix_now())?;
     let mut store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
     store.close_stale_open_segments()?;
@@ -266,47 +269,93 @@ fn run_daemon(config: Config) -> Result<(), String> {
     let mut power_gaps = PowerGapWatch::default();
     let mut pending_gaps = PendingGaps::default();
     let mut streak = FailureStreak::default();
+    let mut media_store_streak = FailureStreak::default();
+    let mut media_source_log = MediaSourceFailureLog::default();
+
+    // Both start due, so the daemon polls each source once on its first wake rather than
+    // waiting out a full interval before the first observation.
+    let mut desktop_deadline = Instant::now();
+    let mut media_deadline = Instant::now();
+
     while running.load(Ordering::Relaxed) {
-        // The clock is read through the watch rather than separately, so the instant the poll
-        // is dated by is the same one the powered-down stretch was measured against.
+        wait_until(&running, desktop_deadline.min(media_deadline));
+        if !running.load(Ordering::Relaxed) {
+            break;
+        }
+        let now = Instant::now();
+        let desktop_due = now >= desktop_deadline;
+        let media_due = now >= media_deadline;
+
+        // The clock is read through the watch on every wake, whichever source is due, so a gap
+        // that just ended is queued before either source's write below rather than only on a
+        // desktop tick: the gap floor reads every lane, and a media row written first would move
+        // it forward and truncate the gap that had just been measured.
         let session = power_gaps.observe(&session_clock);
         let observed_at = session.observed_at;
-        // Idle is only detectable once the threshold has already passed, so the transition is
-        // dated back to the last input rather than to the moment it was noticed. Dating it to
-        // now credited the whole threshold window to whichever window still held focus, which
-        // inflated that one application by up to the threshold on every single absence.
-        let last_input = input_activity.last_activity_at();
-        let idle_since =
-            (observed_at - last_input >= config.idle_after.as_secs() as i64).then_some(last_input);
-
-        match capture_once(
-            &mut store,
-            &hyprland,
-            &config.blacklist,
-            observed_at,
-            idle_since,
-            session.powered_down_gap,
-            &mut pending_gaps,
-        ) {
-            // Only a poll that actually reached the desktop is evidence that it is reachable.
-            Ok(Observed::Desktop) => streak.record_success(),
-            Ok(Observed::Idle) => {}
-            Err(error) => match streak.record_failure() {
-                Some(count) => eprintln!(
-                    "daytrace: observation failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
-                ),
-                None => {
-                    return Err(format!(
-                        "capture failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
-                    ));
-                }
-            },
+        if let Some(gap) = session.powered_down_gap {
+            pending_gaps.push(gap);
         }
 
-        wait_for_next_poll(&running, config.poll_interval);
+        if desktop_due {
+            // Idle is only detectable once the threshold has already passed, so the transition
+            // is dated back to the last input rather than to the moment it was noticed. Dating
+            // it to now credited the whole threshold window to whichever window still held
+            // focus, which inflated that one application by up to the threshold on every single
+            // absence.
+            let last_input = input_activity.last_activity_at();
+            let idle_since = (observed_at - last_input >= config.idle_after.as_secs() as i64)
+                .then_some(last_input);
+
+            match capture_once(
+                &mut store,
+                &hyprland,
+                &config.blacklist,
+                observed_at,
+                idle_since,
+                // Already queued above: passing it again here would double-queue the same
+                // stretch. `capture_once` flushes the queue itself, which is also what gives a
+                // failed flush the same retry tolerance an ordinary desktop failure gets, through
+                // `streak` below, rather than ending the daemon on the first busy write.
+                None,
+                &mut pending_gaps,
+            ) {
+                // Only a poll that actually reached the desktop is evidence that it is reachable.
+                Ok(Observed::Desktop) => streak.record_success(),
+                Ok(Observed::Idle) => {}
+                Err(error) => match streak.record_failure() {
+                    Some(count) => eprintln!(
+                        "daytrace: observation failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
+                    ),
+                    None => {
+                        return Err(format!(
+                            "capture failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
+                        ));
+                    }
+                },
+            }
+            desktop_deadline = next_poll_deadline(desktop_deadline, now, config.poll_interval);
+        } else {
+            // A media-only wake: nothing else is going to flush a queued gap this time around,
+            // so it happens here instead, on the same retry tolerance a flush failure gets when
+            // `capture_once` runs it.
+            flush_pending_gaps(&mut store, &mut pending_gaps, &mut streak)?;
+        }
+
+        if media_due {
+            handle_media_wake(
+                &mut store,
+                &media_source,
+                &config.blacklist,
+                observed_at,
+                &mut media_source_log,
+                &mut media_store_streak,
+            )?;
+            media_deadline = next_poll_deadline(media_deadline, now, config.media_poll_interval);
+        }
     }
 
-    store.close_open(unix_now(), &Lane::Desktop)
+    store.close_open(unix_now(), &Lane::Desktop)?;
+    store.close_open_media_lanes_at_last_seen()
 }
 
 /// How many consecutive failed observations end the daemon.
@@ -378,6 +427,32 @@ impl PendingGaps {
     }
 }
 
+/// Flush whatever `pending_gaps` still owes, on the desktop streak's own retry tolerance: a
+/// flush failure is logged and retried on a later wake exactly as an ordinary desktop failure
+/// is, rather than ending the daemon over the first busy write. What `capture_once` already does
+/// as part of a desktop poll, pulled out so a media-only wake with something queued can run the
+/// same flush, on the same streak, without a desktop poll alongside it.
+fn flush_pending_gaps(
+    store: &mut dyn CaptureStore,
+    pending_gaps: &mut PendingGaps,
+    streak: &mut FailureStreak,
+) -> Result<(), String> {
+    match pending_gaps.flush(store) {
+        Ok(()) => Ok(()),
+        Err(error) => match streak.record_failure() {
+            Some(count) => {
+                eprintln!(
+                    "daytrace: observation failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
+                );
+                Ok(())
+            }
+            None => Err(format!(
+                "capture failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
+            )),
+        },
+    }
+}
+
 /// Record one observation. `idle_since` carries the moment input stopped when the machine is
 /// idle, which is earlier than `observed_at` by at least the idle threshold.
 /// `powered_down_gap` carries a stretch the machine spent off, which is only ever known on the
@@ -418,14 +493,178 @@ fn capture_once(
     Ok(observed)
 }
 
-fn wait_for_next_poll(running: &AtomicBool, poll_interval: Duration) {
-    let deadline = Instant::now() + poll_interval;
+/// Sleep until `deadline`, or until `running` turns false, whichever comes first.
+///
+/// Takes the deadline rather than an interval to sleep for, so a caller juggling more than one
+/// source can wait for the earlier of several absolute deadlines in one call instead of picking
+/// one interval to sleep on and starving whichever source is not it.
+fn wait_until(running: &AtomicBool, deadline: Instant) {
     while running.load(Ordering::Relaxed) {
         let now = Instant::now();
         if now >= deadline {
             break;
         }
         thread::sleep((deadline - now).min(Duration::from_millis(200)));
+    }
+}
+
+/// The first deadline strictly after `observed`, reached by advancing `previous_deadline` in
+/// whole steps of `interval` rather than restarting the schedule from `observed`.
+///
+/// Pure, and takes the previous deadline rather than "now" plus an interval, because that is
+/// what keeps the schedule from drifting by however long a poll took: an interval measured from
+/// when the work finished, rather than from when it was due, pushes the whole schedule later by
+/// the time the work spent. A poll that fell behind by more than one interval gets exactly one
+/// deadline back, in the future, rather than every deadline it missed in between: replaying
+/// those as a catch-up burst the instant capture recovers is the failure this avoids.
+fn next_poll_deadline(
+    previous_deadline: Instant,
+    observed: Instant,
+    interval: Duration,
+) -> Instant {
+    let mut deadline = previous_deadline;
+    while deadline <= observed {
+        deadline += interval;
+    }
+    deadline
+}
+
+/// What one media poll found out, kept apart because the two are unrelated failure domains: the
+/// SOURCE answers whether the bus could be read at all, the STORE answers whether the write
+/// landed, and a caller keeping one streak for both would end the daemon over an outage that no
+/// player being on the bus produces just as reliably as a broken one.
+struct MediaPollOutcome {
+    source_error: Option<String>,
+    store_error: Option<String>,
+}
+
+/// Poll media once and apply what it found through `store`.
+///
+/// A whole-source failure still has to reach the store: every open media lane has to be sealed
+/// at its own `last_seen_at` rather than left open to bridge the dark interval as playback once
+/// a later poll finds the same track again, so `close_open_media_lanes_at_last_seen` stands in
+/// for `record_media_poll` on that path, and its own outcome is reported as the store error the
+/// same way.
+fn capture_media_once(
+    store: &mut dyn CaptureStore,
+    source: &dyn MediaSource,
+    blacklist: &Blacklist,
+    observed_at: i64,
+) -> MediaPollOutcome {
+    match source.poll(blacklist) {
+        Ok(outcomes) => {
+            let sanitized: Vec<PlayerOutcome> =
+                outcomes.into_iter().map(sanitize_media_outcome).collect();
+            MediaPollOutcome {
+                source_error: None,
+                store_error: store.record_media_poll(observed_at, &sanitized).err(),
+            }
+        }
+        Err(error) => MediaPollOutcome {
+            store_error: store.close_open_media_lanes_at_last_seen().err(),
+            source_error: Some(error),
+        },
+    }
+}
+
+/// One media wake: poll, apply, and keep the two failure trackers in the shape the ordinary
+/// daemon loop needs, right down to the `Err` that means "give up".
+///
+/// A function of its own, called from `run_daemon` and from a test the same way, because the
+/// wiring between `capture_media_once`'s two-error result and each tracker is exactly the part
+/// a passing test can silently stop covering the moment it is duplicated instead of shared: the
+/// production loop and the test would each keep their own copy, and only one of them has to
+/// drift for a red gate to say nothing.
+fn handle_media_wake(
+    store: &mut dyn CaptureStore,
+    source: &dyn MediaSource,
+    blacklist: &Blacklist,
+    observed_at: i64,
+    media_source_log: &mut MediaSourceFailureLog,
+    media_store_streak: &mut FailureStreak,
+) -> Result<(), String> {
+    let outcome = capture_media_once(store, source, blacklist, observed_at);
+
+    match outcome.source_error {
+        Some(error) => {
+            if let Some(count) = media_source_log.record_failure() {
+                eprintln!("daytrace: media source failed ({count}): {error}");
+            }
+        }
+        None => {
+            if media_source_log.record_success() {
+                eprintln!("daytrace: media source recovered");
+            }
+        }
+    }
+
+    match outcome.store_error {
+        Some(error) => match media_store_streak.record_failure() {
+            Some(count) => {
+                eprintln!(
+                    "daytrace: media store write failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
+                );
+                Ok(())
+            }
+            None => Err(format!(
+                "media store failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
+            )),
+        },
+        None => {
+            media_store_streak.record_success();
+            Ok(())
+        }
+    }
+}
+
+/// Redact a `Playing` outcome's free-text fields and address before it reaches storage.
+///
+/// The boundary a raw MPRIS reading crosses on its way into the store, mirroring where the
+/// desktop side redacts a window title: `media.rs` stays pure parsing, so its fixtures assert
+/// the bus's raw output, and every `MediaSource` implementation, staged fakes included, is
+/// sanitized here rather than only the real one.
+fn sanitize_media_outcome(outcome: PlayerOutcome) -> PlayerOutcome {
+    match outcome {
+        PlayerOutcome::Playing(media) => PlayerOutcome::Playing(PlayingMedia {
+            title: media.title.as_deref().map(redact_title),
+            artist: media.artist.as_deref().map(redact_title),
+            album: media.album.as_deref().map(redact_title),
+            item_url: media.item_url.as_deref().map(redact_address),
+            ..media
+        }),
+        other => other,
+    }
+}
+
+/// How often a media SOURCE failure that never ends the daemon still earns a line in the log.
+///
+/// Unlike `FailureStreak`, this never gives up: no player on the bus is the ordinary state of
+/// the machine, and a source that stays broken degrades media alone, forever, rather than ending
+/// capture. Logging every failure of an outage with no upper bound would fill the log at the
+/// poll interval for as long as the outage lasts, so only the first failure and every
+/// `LOG_PERIOD`-th one after it get a line. A count rather than a period, so the bound needs no
+/// clock seam to test.
+const MEDIA_SOURCE_LOG_PERIOD: u32 = 60;
+
+#[derive(Debug, Default)]
+struct MediaSourceFailureLog {
+    consecutive: u32,
+}
+
+impl MediaSourceFailureLog {
+    /// The failure count worth logging, or `None` when this one is not.
+    fn record_failure(&mut self) -> Option<u32> {
+        self.consecutive += 1;
+        (self.consecutive == 1 || self.consecutive.is_multiple_of(MEDIA_SOURCE_LOG_PERIOD))
+            .then_some(self.consecutive)
+    }
+
+    /// Whether this success follows at least one failure, which is when a recovery line is
+    /// owed: a source that was never broken has nothing to announce.
+    fn record_success(&mut self) -> bool {
+        let was_failing = self.consecutive > 0;
+        self.consecutive = 0;
+        was_failing
     }
 }
 
@@ -573,13 +812,17 @@ fn segments(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, PendingGaps, capture_once,
-        forget_request, prune_is_dry_run, render_forget, render_forget_preview, render_preview,
-        render_prune, requested_day, run,
+        AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, MediaSourceFailureLog, Observed,
+        PendingGaps, capture_media_once, capture_once, flush_pending_gaps, forget_request,
+        handle_media_wake, next_poll_deadline, prune_is_dry_run, render_forget,
+        render_forget_preview, render_preview, render_prune, requested_day, run,
+        sanitize_media_outcome,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
+    use crate::media::fakes::ScriptedMediaSource;
+    use crate::media::{PlayerOutcome, PlayingMedia};
     use crate::session::PoweredDownGap;
     use crate::storage::CaptureStore;
     use crate::storage::Lane;
@@ -587,6 +830,7 @@ mod tests {
     use crate::storage::Store;
     use chrono::NaiveDate;
     use std::cell::RefCell;
+    use std::time::Duration;
 
     fn pruned(deleted: u64, still_in_the_file: Option<&str>) -> Pruned {
         Pruned {
@@ -662,6 +906,18 @@ mod tests {
 
         fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
             self.inner.close_open(ended_at, lane)
+        }
+
+        fn record_media_poll(
+            &mut self,
+            observed_at: i64,
+            outcomes: &[PlayerOutcome],
+        ) -> Result<(), String> {
+            self.inner.record_media_poll(observed_at, outcomes)
+        }
+
+        fn close_open_media_lanes_at_last_seen(&mut self) -> Result<(), String> {
+            self.inner.close_open_media_lanes_at_last_seen()
         }
     }
 
@@ -1153,6 +1409,65 @@ mod tests {
         );
     }
 
+    // flush_pending_gaps: the media-only wake's own path to the same write, on the same streak.
+
+    #[test]
+    fn flush_pending_gaps_retries_a_busy_write_on_the_desktop_streak_rather_than_giving_up() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, 1);
+        let mut pending_gaps = PendingGaps::default();
+        let mut streak = FailureStreak::default();
+        pending_gaps.push(PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 5_000,
+        });
+
+        flush_pending_gaps(&mut store, &mut pending_gaps, &mut streak)
+            .expect("a single busy write must not end the daemon");
+        assert_eq!(
+            streak.record_failure(),
+            Some(2),
+            "the first failed flush must count against the same streak an ordinary desktop \
+             failure uses"
+        );
+
+        flush_pending_gaps(&mut store, &mut pending_gaps, &mut streak)
+            .expect("the retried write succeeds once the database is free");
+        let rows = store
+            .inner
+            .timeline_between(0, 10_000, 10_000)
+            .expect("timeline");
+        assert_eq!(
+            rows.iter()
+                .filter(|row| row.snapshot == ActivitySnapshot::suspended())
+                .count(),
+            1,
+            "the queued gap must still be written once the retry succeeds: {rows:?}"
+        );
+    }
+
+    #[test]
+    fn flush_pending_gaps_gives_up_once_the_desktop_streak_is_exhausted() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyGapStore::new(inner, u32::MAX);
+        let mut pending_gaps = PendingGaps::default();
+        let mut streak = FailureStreak::default();
+        pending_gaps.push(PoweredDownGap {
+            started_at: 1_010,
+            ended_at: 5_000,
+        });
+
+        for count in 1..MAX_CONSECUTIVE_FAILURES {
+            flush_pending_gaps(&mut store, &mut pending_gaps, &mut streak)
+                .unwrap_or_else(|error| panic!("must not give up at failure {count}: {error}"));
+        }
+        let error = flush_pending_gaps(&mut store, &mut pending_gaps, &mut streak)
+            .expect_err("the streak must give up at the same threshold desktop uses elsewhere");
+        assert!(error.contains("capture failed"));
+    }
+
     #[test]
     fn a_second_stretch_measured_before_the_first_is_stored_gets_its_own_row() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1555,6 +1870,620 @@ mod tests {
         assert_eq!(
             error,
             AppError::Usage("unknown command: capture".to_string())
+        );
+    }
+
+    // Media polling: opens, progress, transitions and closes driven through the loop's own
+    // wiring, not through storage directly.
+
+    fn playing(bus_name: &str, title: &str) -> PlayerOutcome {
+        PlayerOutcome::Playing(PlayingMedia {
+            player_key: "spotify".to_string(),
+            bus_name: bus_name.to_string(),
+            title: Some(title.to_string()),
+            artist: None,
+            album: None,
+            item_url: None,
+        })
+    }
+
+    /// Read the row in a player's lane through a connection of its own, since `Store` keeps its
+    /// own connection private and these tests only need to observe what landed on disk.
+    fn media_row(
+        db_path: &std::path::Path,
+        bus_name: &str,
+    ) -> Option<(Option<i64>, i64, String, Option<String>)> {
+        rusqlite::Connection::open(db_path)
+            .expect("open a read connection")
+            .query_row(
+                "SELECT ended_at, last_seen_at, title, item_url FROM activity_segments \
+                 WHERE lane = ?1 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![format!("media:{bus_name}")],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<i64>>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                    ))
+                },
+            )
+            .ok()
+    }
+
+    #[test]
+    fn a_scripted_sequence_of_start_track_change_pause_and_disappearance_produces_the_right_rows() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db_path, None).expect("store");
+        let blacklist = Blacklist::default();
+        // Popped from the back: start, a track change, a pause, then gone from the bus.
+        let source = ScriptedMediaSource::new(vec![
+            Ok(vec![]),
+            Ok(vec![PlayerOutcome::NotPlaying {
+                bus_name: "spotify".to_string(),
+            }]),
+            Ok(vec![playing("spotify", "Track B")]),
+            Ok(vec![playing("spotify", "Track A")]),
+        ]);
+
+        let start = capture_media_once(&mut store, &source, &blacklist, 100);
+        assert_eq!((start.source_error, start.store_error), (None, None));
+        let (ended_at, last_seen_at, title, _) =
+            media_row(&db_path, "spotify").expect("a row after start");
+        assert_eq!(
+            (ended_at, last_seen_at, title.as_str()),
+            (None, 100, "Track A")
+        );
+
+        capture_media_once(&mut store, &source, &blacklist, 110);
+        let (ended_at, _, title, _) = media_row(&db_path, "spotify").expect("still one row");
+        assert_eq!(
+            (ended_at, title.as_str()),
+            (None, "Track B"),
+            "a track change closes the old row and opens the next, never leaving both open"
+        );
+
+        capture_media_once(&mut store, &source, &blacklist, 120);
+        let (ended_at, last_seen_at, _, _) = media_row(&db_path, "spotify").expect("closed row");
+        assert_eq!(
+            (ended_at, last_seen_at),
+            (Some(120), 120),
+            "a pause closes at the poll instant"
+        );
+
+        // Gone entirely: the empty result means nothing to do, since spotify is already closed.
+        capture_media_once(&mut store, &source, &blacklist, 130);
+        let unchanged = media_row(&db_path, "spotify").expect("row still there, still closed");
+        assert_eq!(
+            unchanged.0,
+            Some(120),
+            "an already-closed lane is untouched by an empty poll"
+        );
+    }
+
+    #[test]
+    fn a_whole_source_failure_seals_open_lanes_and_recovery_opens_a_fresh_segment() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db_path, None).expect("store");
+        let blacklist = Blacklist::default();
+        // Popped from the back: playing, then a run of source failures, then a success with the
+        // SAME track. The regression this guards: an unchanged snapshot advancing progress
+        // would bridge the whole dark interval as one continuous segment.
+        let source = ScriptedMediaSource::new(vec![
+            Ok(vec![playing("spotify", "Track A")]),
+            Err("busctl list failed".to_string()),
+            Err("busctl list failed".to_string()),
+            Ok(vec![playing("spotify", "Track A")]),
+        ]);
+
+        capture_media_once(&mut store, &source, &blacklist, 100);
+        let after_open = media_row(&db_path, "spotify").expect("open row");
+        assert_eq!(after_open.1, 100, "last_seen_at at the open");
+
+        let first_failure = capture_media_once(&mut store, &source, &blacklist, 110);
+        assert!(first_failure.source_error.is_some());
+        let sealed_once = media_row(&db_path, "spotify").expect("sealed row");
+        assert_eq!(
+            sealed_once.0,
+            Some(100),
+            "a whole-source failure seals at the last successful read (100), never at the \
+             failed poll's own instant (110)"
+        );
+
+        let second_failure = capture_media_once(&mut store, &source, &blacklist, 200);
+        assert!(second_failure.source_error.is_some());
+        let still_sealed = media_row(&db_path, "spotify").expect("still one sealed row");
+        assert_eq!(
+            still_sealed.0,
+            Some(100),
+            "a second failure re-seals the same instant"
+        );
+
+        let recovery = capture_media_once(&mut store, &source, &blacklist, 500);
+        assert_eq!((recovery.source_error, recovery.store_error), (None, None));
+
+        let rows: Vec<(i64, Option<i64>)> = rusqlite::Connection::open(&db_path)
+            .expect("open a read connection")
+            .prepare(
+                "SELECT started_at, ended_at FROM activity_segments \
+                 WHERE lane = 'media:spotify' ORDER BY id",
+            )
+            .expect("prepare")
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("query")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("collect");
+        assert_eq!(
+            rows,
+            vec![(100, Some(100)), (500, None)],
+            "the recovery must open a NEW segment starting at 500, not extend the sealed one: \
+             two segments with an unknown gap between them, not one continuous row bridging the \
+             whole outage"
+        );
+    }
+
+    #[test]
+    fn free_text_fields_and_the_address_are_redacted_before_they_reach_sqlite() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db_path = dir.path().join("daytrace.db");
+        let mut store = Store::open(&db_path, None).expect("store");
+        let blacklist = Blacklist::default();
+        let source =
+            ScriptedMediaSource::new(vec![Ok(vec![PlayerOutcome::Playing(PlayingMedia {
+                player_key: "brave".to_string(),
+                bus_name: "org.mpris.MediaPlayer2.brave".to_string(),
+                title: Some("prefix token=secret-marker more text".to_string()),
+                artist: Some("password=secret-marker https://x.test/y".to_string()),
+                album: Some("key=secret-marker".to_string()),
+                item_url: Some(
+                    "https://host.test/cb?access_token=secret-marker&list=RD1".to_string(),
+                ),
+            })])]);
+
+        let outcome = capture_media_once(&mut store, &source, &blacklist, 100);
+        assert_eq!((outcome.source_error, outcome.store_error), (None, None));
+
+        let (title, artist, album, item_url): (String, String, String, String) =
+            rusqlite::Connection::open(&db_path)
+                .expect("open a read connection")
+                .query_row(
+                    "SELECT title, artist, album, item_url FROM activity_segments \
+                 WHERE lane = 'media:org.mpris.MediaPlayer2.brave'",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+                )
+                .expect("stored row");
+
+        for field in [&title, &artist, &album, &item_url] {
+            assert!(
+                !field.contains("secret-marker"),
+                "the marker must never reach storage: {field}"
+            );
+        }
+        assert!(
+            title.contains("more text"),
+            "ordinary text survives: {title}"
+        );
+        assert!(
+            item_url.contains("list=RD1"),
+            "an unmatched parameter survives: {item_url}"
+        );
+        assert!(
+            item_url.contains("access_token=[redacted]"),
+            "a sensitive parameter is redacted, keeping the query shape: {item_url}"
+        );
+    }
+
+    #[test]
+    fn sanitize_leaves_a_not_playing_or_failed_outcome_untouched() {
+        let not_playing = PlayerOutcome::NotPlaying {
+            bus_name: "spotify".to_string(),
+        };
+        assert_eq!(sanitize_media_outcome(not_playing.clone()), not_playing);
+
+        let failed = PlayerOutcome::Failed {
+            bus_name: "spotify".to_string(),
+            error: "timed out".to_string(),
+        };
+        assert_eq!(sanitize_media_outcome(failed.clone()), failed);
+    }
+
+    #[test]
+    fn desktop_segments_are_identical_whether_or_not_media_was_playing_alongside_them() {
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        let blacklist = Blacklist::default();
+
+        let run_desktop = |media_outcomes: Vec<Result<Vec<PlayerOutcome>, String>>| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+            let desktop_source =
+                ScriptedWindowSource::new(vec![Ok(Some(window.clone())), Ok(Some(window.clone()))]);
+            let media_source = ScriptedMediaSource::new(media_outcomes);
+            let mut pending_gaps = PendingGaps::default();
+
+            capture_once(
+                &mut store,
+                &desktop_source,
+                &blacklist,
+                100,
+                None,
+                None,
+                &mut pending_gaps,
+            )
+            .expect("desktop poll one");
+            capture_media_once(&mut store, &media_source, &blacklist, 100);
+            capture_once(
+                &mut store,
+                &desktop_source,
+                &blacklist,
+                110,
+                None,
+                None,
+                &mut pending_gaps,
+            )
+            .expect("desktop poll two");
+            capture_media_once(&mut store, &media_source, &blacklist, 110);
+            store.close_open(120, &Lane::Desktop).expect("close");
+
+            store.timeline_between(0, 200, 200).expect("timeline")
+        };
+
+        let with_media = run_desktop(vec![
+            Ok(vec![playing("spotify", "Track A")]),
+            Ok(vec![playing("spotify", "Track A")]),
+        ]);
+        let without_media = run_desktop(vec![Ok(vec![]), Ok(vec![])]);
+
+        assert_eq!(
+            with_media, without_media,
+            "the desktop timeline must not depend on whether media was playing alongside it"
+        );
+    }
+
+    #[test]
+    fn next_poll_deadline_does_not_drift_when_a_poll_runs_long() {
+        let start = std::time::Instant::now();
+        let interval = Duration::from_secs(2);
+        // The poll ran until 5 seconds past the previous deadline: the next one must be the
+        // next multiple of the interval after that (6s), not 5s + interval (7s), which is what
+        // scheduling from "now" instead of from the missed deadline would produce.
+        let observed = start + Duration::from_secs(5);
+        let next = next_poll_deadline(start, observed, interval);
+        assert_eq!(next, start + Duration::from_secs(6));
+    }
+
+    #[test]
+    fn next_poll_deadline_skips_missed_ticks_rather_than_replaying_them_as_a_burst() {
+        let start = std::time::Instant::now();
+        let interval = Duration::from_secs(1);
+        // Ten intervals' worth of time passed in one stall: exactly one deadline comes back, in
+        // the future, not every deadline that was missed along the way.
+        let observed = start + Duration::from_secs(10);
+        let next = next_poll_deadline(start, observed, interval);
+        assert_eq!(next, start + Duration::from_secs(11));
+    }
+
+    #[test]
+    fn the_earlier_of_two_deadlines_is_reached_the_documented_number_of_times_with_no_extra_query()
+    {
+        // Ten-second desktop interval, two-second media interval: four media-only deadlines
+        // occur before the next desktop query, with no desktop query in between. Advanced
+        // purely through `next_poll_deadline`, with no real sleep.
+        let start = std::time::Instant::now();
+        let desktop_interval = Duration::from_secs(10);
+        let media_interval = Duration::from_secs(2);
+        let mut desktop_deadline = start;
+        let mut media_deadline = start;
+        let mut desktop_polls = 0;
+        let mut media_polls = 0;
+
+        for _ in 0..5 {
+            let now = desktop_deadline.min(media_deadline);
+            let desktop_due = now >= desktop_deadline;
+            let media_due = now >= media_deadline;
+            if desktop_due {
+                desktop_polls += 1;
+                desktop_deadline = next_poll_deadline(desktop_deadline, now, desktop_interval);
+            }
+            if media_due {
+                media_polls += 1;
+                media_deadline = next_poll_deadline(media_deadline, now, media_interval);
+            }
+        }
+
+        assert_eq!(
+            desktop_polls, 1,
+            "only the very first wake is due for the desktop too"
+        );
+        assert_eq!(
+            media_polls, 5,
+            "every one of the five wakes is a media deadline"
+        );
+    }
+
+    #[test]
+    fn media_source_failures_are_logged_at_one_sixty_and_every_period_after_then_once_on_recovery()
+    {
+        let mut log = MediaSourceFailureLog::default();
+        let logged: Vec<u32> = (1..=121_u32).filter_map(|_| log.record_failure()).collect();
+        assert_eq!(
+            logged,
+            vec![1, 60, 120],
+            "an outage with no upper bound must not log every failure, or the log fills at the \
+             poll interval for as long as the outage lasts"
+        );
+        assert!(
+            log.record_success(),
+            "a success following a failure streak owes a recovery line"
+        );
+        assert!(
+            !MediaSourceFailureLog::default().record_success(),
+            "a source that was never broken has nothing to announce"
+        );
+    }
+
+    /// A storage boundary whose media write, or media seal, fails a fixed number of times
+    /// before delegating to a real store: the same shape `FlakyGapStore` gives the desktop
+    /// side, staged for the media path instead.
+    struct FlakyMediaStore {
+        inner: Store,
+        remaining_failures: u32,
+    }
+
+    impl FlakyMediaStore {
+        fn new(inner: Store, remaining_failures: u32) -> Self {
+            Self {
+                inner,
+                remaining_failures,
+            }
+        }
+
+        fn maybe_fail(&mut self) -> Result<(), String> {
+            if self.remaining_failures > 0 {
+                self.remaining_failures -= 1;
+                return Err("database is busy".to_string());
+            }
+            Ok(())
+        }
+    }
+
+    impl CaptureStore for FlakyMediaStore {
+        fn record_observation(
+            &mut self,
+            starts_at: i64,
+            seen_at: i64,
+            snapshot: &ActivitySnapshot,
+        ) -> Result<(), String> {
+            self.inner.record_observation(starts_at, seen_at, snapshot)
+        }
+
+        fn record_powered_down_gap(
+            &mut self,
+            started_at: i64,
+            ended_at: i64,
+        ) -> Result<(), String> {
+            self.inner.record_powered_down_gap(started_at, ended_at)
+        }
+
+        fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
+            self.inner.close_open(ended_at, lane)
+        }
+
+        fn record_media_poll(
+            &mut self,
+            observed_at: i64,
+            outcomes: &[PlayerOutcome],
+        ) -> Result<(), String> {
+            self.maybe_fail()?;
+            self.inner.record_media_poll(observed_at, outcomes)
+        }
+
+        fn close_open_media_lanes_at_last_seen(&mut self) -> Result<(), String> {
+            self.maybe_fail()?;
+            self.inner.close_open_media_lanes_at_last_seen()
+        }
+    }
+
+    #[test]
+    fn a_media_store_that_never_recovers_exhausts_its_own_streak_and_ends_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyMediaStore::new(inner, u32::MAX);
+        let source = ScriptedMediaSource::new(vec![Ok(vec![]); MAX_CONSECUTIVE_FAILURES as usize]);
+        let blacklist = Blacklist::default();
+        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_store_streak = FailureStreak::default();
+
+        for count in 1..MAX_CONSECUTIVE_FAILURES {
+            handle_media_wake(
+                &mut store,
+                &source,
+                &blacklist,
+                count as i64,
+                &mut media_source_log,
+                &mut media_store_streak,
+            )
+            .unwrap_or_else(|error| panic!("must not give up at failure {count}: {error}"));
+        }
+
+        let error = handle_media_wake(
+            &mut store,
+            &source,
+            &blacklist,
+            MAX_CONSECUTIVE_FAILURES as i64,
+            &mut media_source_log,
+            &mut media_store_streak,
+        )
+        .expect_err("the media store streak must give up at the same threshold desktop uses");
+        assert!(error.contains("media store failed"));
+    }
+
+    #[test]
+    fn sixty_desktop_source_failures_interleaved_with_successful_media_polls_still_end_the_daemon()
+    {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let desktop_source =
+            ScriptedWindowSource::new(vec![Err("hyprctl activewindow failed".to_string()); 60]);
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        let mut streak = FailureStreak::default();
+        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_store_streak = FailureStreak::default();
+
+        for count in 1..MAX_CONSECUTIVE_FAILURES {
+            capture_once(
+                &mut store,
+                &desktop_source,
+                &blacklist,
+                count as i64,
+                None,
+                None,
+                &mut pending_gaps,
+            )
+            .expect_err("desktop keeps failing");
+            streak.record_failure();
+            let media_source = ScriptedMediaSource::new(vec![Ok(vec![])]);
+            handle_media_wake(
+                &mut store,
+                &media_source,
+                &blacklist,
+                count as i64,
+                &mut media_source_log,
+                &mut media_store_streak,
+            )
+            .expect("a successful media poll beside a broken desktop must not give up either");
+        }
+
+        capture_once(
+            &mut store,
+            &desktop_source,
+            &blacklist,
+            MAX_CONSECUTIVE_FAILURES as i64,
+            None,
+            None,
+            &mut pending_gaps,
+        )
+        .expect_err("still failing");
+        assert!(
+            streak.record_failure().is_none(),
+            "sixty consecutive desktop failures must give up even though media kept succeeding"
+        );
+    }
+
+    #[test]
+    fn media_source_failures_interleaved_with_successful_desktop_polls_never_end_the_daemon() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        let blacklist = Blacklist::default();
+        let mut pending_gaps = PendingGaps::default();
+        let mut streak = FailureStreak::default();
+        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_store_streak = FailureStreak::default();
+
+        for count in 1..=121 {
+            let desktop_source = ScriptedWindowSource::new(vec![Ok(Some(window.clone()))]);
+            capture_once(
+                &mut store,
+                &desktop_source,
+                &blacklist,
+                count as i64,
+                None,
+                None,
+                &mut pending_gaps,
+            )
+            .expect("the desktop keeps succeeding");
+            streak.record_success();
+
+            let media_source =
+                ScriptedMediaSource::new(vec![Err("busctl list failed".to_string())]);
+            handle_media_wake(
+                &mut store,
+                &media_source,
+                &blacklist,
+                count as i64,
+                &mut media_source_log,
+                &mut media_store_streak,
+            )
+            .unwrap_or_else(|error| {
+                panic!("a media SOURCE failure alone must never give up: {error}")
+            });
+        }
+    }
+
+    #[test]
+    fn repeated_media_store_failures_are_not_cleared_by_media_source_success() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let mut store = FlakyMediaStore::new(inner, 5);
+        let blacklist = Blacklist::default();
+        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_store_streak = FailureStreak::default();
+
+        for count in 1..=5 {
+            // The SOURCE succeeds every time; only the STORE write fails.
+            let media_source = ScriptedMediaSource::new(vec![Ok(vec![])]);
+            handle_media_wake(
+                &mut store,
+                &media_source,
+                &blacklist,
+                count,
+                &mut media_source_log,
+                &mut media_store_streak,
+            )
+            .expect("below the threshold, still logging rather than giving up");
+        }
+        assert_eq!(
+            media_store_streak.record_failure(),
+            Some(6),
+            "five real store failures, none of them cleared by the source succeeding each time"
+        );
+    }
+
+    #[test]
+    fn a_successful_media_write_does_not_reset_the_desktop_failure_streak() {
+        // A successful idle write proves the store recovered but says nothing about whether the
+        // compositor did; a successful media write is the same case one lane over. `streak`
+        // here stands in for `run_daemon`'s own desktop streak, untouched by `handle_media_wake`
+        // because the two live in separate variables with no path between them.
+        let mut streak = FailureStreak::default();
+        streak.record_failure();
+        streak.record_failure();
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let blacklist = Blacklist::default();
+        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_store_streak = FailureStreak::default();
+        let media_source = ScriptedMediaSource::new(vec![Ok(vec![])]);
+        handle_media_wake(
+            &mut store,
+            &media_source,
+            &blacklist,
+            100,
+            &mut media_source_log,
+            &mut media_store_streak,
+        )
+        .expect("a successful, empty media poll");
+
+        assert_eq!(
+            streak.record_failure(),
+            Some(3),
+            "the desktop streak must still read as three failures in a row: a media write \
+             succeeding does not touch it"
         );
     }
 }
