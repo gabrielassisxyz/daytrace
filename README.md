@@ -179,7 +179,7 @@ systemctl --user stop daytrace.service
 rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/daytrace"
 ```
 
-Stop the daemon first for this one. Removing the file is not something SQLite is told about, so a running process goes on writing to a file that no longer has a name, and recreates the store at the next window change. Deleting part of the history rather than all of it is `daytrace prune`, described below, which needs no such thing and is meant to run alongside the daemon.
+Stop the daemon first for this one. Removing the file is not something SQLite is told about, so a running process goes on writing to a file that no longer has a name, and recreates the store at the next window change. Deleting part of the history is `daytrace prune`, by date, or `daytrace forget`, by content: both are described below, and neither needs the daemon stopped.
 
 ## Retention
 
@@ -218,6 +218,24 @@ The deleted activity is still readable in the database file, because another pro
 ```
 
 The rows are gone either way. What is left is the copy in the file, which the next `daytrace prune` clears even when it deletes nothing.
+
+## Forgetting Specific Activity
+
+Retention deletes by date; `daytrace forget` deletes by content, for a row that should never have been stored and does not deserve to wait out its whole day. It matches the same fields a blacklist entry would: the application, the window title, and, for a played track, its artist, album, and address, all as a case-insensitive substring.
+
+```sh
+daytrace forget --matching keepassxc --dry-run
+daytrace forget --matching keepassxc
+```
+
+```text
+1 activity segment is matched by it. Nothing was deleted.
+Deleted 1 activity segment.
+```
+
+`--dry-run` and the deletion run the same query, so the preview cannot name a count the deletion would not produce. There is no undo: `daytrace export` is the only way to keep a copy of what is about to go, and a pattern that matches nothing deletes nothing and says so rather than failing.
+
+`daytrace forget` gives the same on-disk guarantee `daytrace prune` does, because it is the same rewrite: the file is rebuilt from the rows that survive and the write-ahead log is checkpointed, so the matched text stops being readable in the database file rather than merely unlisted. It can run beside the capture daemon the same way, and an incomplete checkpoint is reported beside the deletion rather than instead of it, worded the way `daytrace prune`'s own report is.
 
 ## Development
 

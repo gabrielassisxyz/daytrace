@@ -6,7 +6,7 @@ use crate::input::InputActivity;
 use crate::lock::CaptureLock;
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
-use crate::storage::{CaptureStore, Pruned, Store};
+use crate::storage::{CaptureStore, Lane, Pruned, Store};
 use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
 use std::env;
@@ -31,6 +31,7 @@ Usage:
   daytrace today [--date YYYY-MM-DD]
   daytrace export [--date YYYY-MM-DD]
   daytrace prune [--dry-run]
+  daytrace forget --matching <text> [--dry-run]
   daytrace service unit
   daytrace help
 
@@ -39,6 +40,7 @@ Commands:
   today         Print a chronological activity timeline, by default for today.
   export        Print one day of stored activity as JSON, by default today.
   prune         Delete stored activity from before the retention window.
+  forget        Delete stored activity whose app, title, artist, album or address matches text.
   service unit  Print a systemd user unit that runs the daemon for this login session.
   help          Print this help text.
 
@@ -122,6 +124,10 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, AppError> {
             let dry_run = prune_is_dry_run(rest)?;
             prune_old_activity(&Config::from_env()?, dry_run).map_err(AppError::from)
         }
+        [arg, rest @ ..] if arg == "forget" => {
+            let request = forget_request(rest)?;
+            forget_matching_activity(&Config::from_env()?, &request).map_err(AppError::from)
+        }
         [first, second] if first == "service" && second == "unit" => {
             render_service_unit().map_err(AppError::from)
         }
@@ -176,6 +182,50 @@ fn prune_is_dry_run(args: &[String]) -> Result<bool, AppError> {
             args.join(" ")
         ))),
     }
+}
+
+/// What `forget`'s arguments named: the pattern to match, and whether it only wants a preview.
+#[derive(Debug)]
+struct ForgetRequest {
+    pattern: String,
+    dry_run: bool,
+}
+
+/// Parse `forget`'s arguments: a required `--matching TEXT`, and an optional `--dry-run` in
+/// either position around it.
+fn forget_request(args: &[String]) -> Result<ForgetRequest, AppError> {
+    let pattern = match args {
+        [flag, pattern] if flag == "--matching" => pattern,
+        [flag, pattern, dry] if flag == "--matching" && dry == "--dry-run" => pattern,
+        [dry, flag, pattern] if dry == "--dry-run" && flag == "--matching" => pattern,
+        [flag] if flag == "--matching" => {
+            return Err(AppError::Usage(
+                "--matching needs a pattern, as --matching TEXT".to_string(),
+            ));
+        }
+        [] => {
+            return Err(AppError::Usage(
+                "forget needs a pattern, as forget --matching TEXT".to_string(),
+            ));
+        }
+        _ => {
+            return Err(AppError::Usage(format!(
+                "unexpected arguments: {}",
+                args.join(" ")
+            )));
+        }
+    };
+
+    if pattern.is_empty() {
+        return Err(AppError::Usage(
+            "--matching needs a non-empty pattern".to_string(),
+        ));
+    }
+
+    Ok(ForgetRequest {
+        pattern: pattern.clone(),
+        dry_run: args.iter().any(|arg| arg == "--dry-run"),
+    })
 }
 
 /// The exact format is required, not merely a readable one.
@@ -256,7 +306,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
         wait_for_next_poll(&running, config.poll_interval);
     }
 
-    store.close_open(unix_now())
+    store.close_open(unix_now(), &Lane::Desktop)
 }
 
 /// How many consecutive failed observations end the daemon.
@@ -363,7 +413,7 @@ fn capture_once(
 
     match snapshot {
         Some(snapshot) => store.record_observation(starts_at, observed_at, &snapshot)?,
-        None => store.close_open(observed_at)?,
+        None => store.close_open(observed_at, &Lane::Desktop)?,
     }
     Ok(observed)
 }
@@ -471,6 +521,48 @@ fn render_prune(pruned: &Pruned) -> String {
     report
 }
 
+/// Delete stored activity whose app class, title, artist, album or address contains `pattern`.
+///
+/// Shaped after `prune_old_activity`: name what would go, from the one query the preview and
+/// the deletion both run, so a preview cannot disagree with the command it previews.
+fn forget_matching_activity(config: &Config, request: &ForgetRequest) -> Result<String, String> {
+    // Nothing stored is nothing to match, and opening a store to discover that would create
+    // the database this command exists to trim.
+    if !config.db_path.exists() {
+        return Ok("No stored activity was found, so nothing was deleted.\n".to_string());
+    }
+
+    let mut store = Store::open(&config.db_path, config.secure_data_dir.clone())?;
+    if request.dry_run {
+        let removable = store.count_segments_matching(&request.pattern)?;
+        return Ok(render_forget_preview(removable));
+    }
+
+    let forgotten = store.forget_segments_matching(&request.pattern)?;
+    Ok(render_forget(&forgotten))
+}
+
+fn render_forget_preview(removable: u64) -> String {
+    let are = if removable == 1 { "is" } else { "are" };
+    format!(
+        "{} {are} matched by it. Nothing was deleted.\n",
+        segments(removable)
+    )
+}
+
+/// What happened, and separately what could not be finished afterwards: the same split
+/// `render_prune` reports, worded for `forget` rather than for the retention window.
+fn render_forget(forgotten: &Pruned) -> String {
+    let mut report = format!("Deleted {}.\n", segments(forgotten.deleted));
+    if let Some(reason) = &forgotten.still_in_the_file {
+        report.push_str(&format!(
+            "The deleted activity is still readable in the database file, because {reason}. \
+             Running forget again finishes clearing it.\n"
+        ));
+    }
+    report
+}
+
 fn segments(count: u64) -> String {
     if count == 1 {
         return "1 activity segment".to_string();
@@ -482,13 +574,15 @@ fn segments(count: u64) -> String {
 mod tests {
     use super::{
         AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, PendingGaps, capture_once,
-        prune_is_dry_run, render_preview, render_prune, requested_day, run,
+        forget_request, prune_is_dry_run, render_forget, render_forget_preview, render_preview,
+        render_prune, requested_day, run,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::Blacklist;
     use crate::desktop::ActiveWindowSource;
     use crate::session::PoweredDownGap;
     use crate::storage::CaptureStore;
+    use crate::storage::Lane;
     use crate::storage::Pruned;
     use crate::storage::Store;
     use chrono::NaiveDate;
@@ -566,8 +660,8 @@ mod tests {
             self.inner.record_powered_down_gap(started_at, ended_at)
         }
 
-        fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
-            self.inner.close_open(ended_at)
+        fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
+            self.inner.close_open(ended_at, lane)
         }
     }
 
@@ -609,7 +703,7 @@ mod tests {
             &mut pending_gaps,
         )
         .expect("the recovered query is recorded");
-        store.close_open(120).expect("close");
+        store.close_open(120, &Lane::Desktop).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
         assert_eq!(rows.len(), 1);
@@ -653,7 +747,7 @@ mod tests {
             &mut pending_gaps,
         )
         .expect("idle detected");
-        store.close_open(1400).expect("close");
+        store.close_open(1400, &Lane::Desktop).expect("close");
 
         let rows = store.timeline_between(0, 2000, 2000).expect("timeline");
         assert_eq!(rows.len(), 2);
@@ -1308,6 +1402,107 @@ mod tests {
                 "{argument:?} was not named in its own rejection: {error}"
             );
         }
+    }
+
+    #[test]
+    fn forget_needs_a_matching_pattern_in_either_order_around_dry_run() {
+        assert_eq!(
+            forget_request(&["--matching".to_string(), "keepassxc".to_string()])
+                .expect("a bare pattern")
+                .pattern,
+            "keepassxc"
+        );
+
+        let leading = forget_request(&[
+            "--matching".to_string(),
+            "keepassxc".to_string(),
+            "--dry-run".to_string(),
+        ])
+        .expect("pattern then dry-run");
+        assert_eq!(leading.pattern, "keepassxc");
+        assert!(leading.dry_run);
+
+        let trailing = forget_request(&[
+            "--dry-run".to_string(),
+            "--matching".to_string(),
+            "keepassxc".to_string(),
+        ])
+        .expect("dry-run then pattern");
+        assert_eq!(trailing.pattern, "keepassxc");
+        assert!(trailing.dry_run);
+    }
+
+    #[test]
+    fn forget_without_a_pattern_is_refused_rather_than_matching_everything() {
+        let error = forget_request(&[]).expect_err("no pattern").to_string();
+        assert!(error.contains("--matching"), "{error}");
+
+        let error = forget_request(&["--matching".to_string()])
+            .expect_err("a flag with nothing after it")
+            .to_string();
+        assert!(error.contains("--matching"), "{error}");
+
+        let error = forget_request(&["--matching".to_string(), String::new()])
+            .expect_err("an empty pattern would match every stored row")
+            .to_string();
+        assert!(error.contains("non-empty"), "{error}");
+    }
+
+    #[test]
+    fn an_unrecognised_forget_argument_is_refused_rather_than_ignored() {
+        for argument in [
+            vec!["--matches".to_string(), "keepassxc".to_string()],
+            vec![
+                "--matching".to_string(),
+                "keepassxc".to_string(),
+                "--older-than".to_string(),
+                "7".to_string(),
+            ],
+        ] {
+            let error = forget_request(&argument)
+                .expect_err("should be rejected")
+                .to_string();
+            assert!(
+                error.starts_with("unexpected argument"),
+                "{argument:?} was not named in its own rejection: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn forget_reports_are_worded_for_forget_not_for_prune() {
+        assert_eq!(
+            render_forget_preview(1),
+            "1 activity segment is matched by it. Nothing was deleted.\n"
+        );
+        assert_eq!(
+            render_forget_preview(0),
+            "0 activity segments are matched by it. Nothing was deleted.\n"
+        );
+        assert_eq!(
+            render_forget(&pruned(3, None)),
+            "Deleted 3 activity segments.\n"
+        );
+
+        let report = render_forget(&pruned(7, Some("another process is reading it")));
+        assert!(
+            report.starts_with("Deleted 7 activity segments.\n"),
+            "the deletion has already committed and cannot be reported as a failure: {report}"
+        );
+        assert!(
+            report.contains("still readable in the database file")
+                && report.contains("another process is reading it")
+                && report.contains("Running forget again"),
+            "the reader has to learn what is left, why, and what clears it: {report}"
+        );
+    }
+
+    #[test]
+    fn the_help_text_documents_forgetting_by_pattern() {
+        let output = run(Vec::<String>::new()).expect("help should succeed");
+
+        assert!(output.contains("daytrace forget"), "{output}");
+        assert!(output.contains("--matching"), "{output}");
     }
 
     #[test]
