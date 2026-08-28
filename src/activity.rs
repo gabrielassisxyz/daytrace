@@ -98,3 +98,35 @@ pub struct TimelineSegment {
     pub ended_at: i64,
     pub snapshot: ActivitySnapshot,
 }
+
+/// What one player was reporting, decoded from a stored `kind = 'media'` row.
+///
+/// A type of its own rather than another shape squeezed through `ActivitySnapshot`: that type
+/// carries `workspace` and `monitor`, which mean nothing for a track, and its `ActivityKind`
+/// falls back silently to `Unknown` for a value it does not recognize. Reading a media row
+/// through that path would decode it as an unrecognized window and render it as one, with
+/// nothing to say otherwise. A distinct type makes that path unreachable rather than merely
+/// untaken.
+///
+/// Read by the media half of a day's activity; nothing writes one yet, so this is dead code in
+/// the binary until the capture loop that polls MPRIS lands and the query that reads it back
+/// gains a caller in the reporting layer.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaSnapshot {
+    pub player: Option<String>,
+    pub title: Option<String>,
+    pub artist: Option<String>,
+    pub album: Option<String>,
+    pub item_url: Option<String>,
+}
+
+/// A media segment: a stretch during which one player was reporting the same track, mirroring
+/// `TimelineSegment` for the desktop side without sharing its shape.
+#[allow(dead_code)]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MediaSegment {
+    pub started_at: i64,
+    pub ended_at: i64,
+    pub snapshot: MediaSnapshot,
+}
