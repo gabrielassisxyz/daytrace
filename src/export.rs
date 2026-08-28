@@ -321,7 +321,7 @@ mod tests {
             &[MediaSegment {
                 started_at: 1_784_000_000,
                 ended_at: 1_784_000_600,
-                snapshot: crate::activity::MediaSnapshot {
+                snapshot: MediaSnapshot {
                     player: None,
                     title: None,
                     artist: None,
