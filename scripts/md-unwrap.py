@@ -366,6 +366,13 @@ def main() -> int:
     total_files = total_paras = 0
 
     for repo in repos:
+        # A file path is the obvious next call after --check names one file per
+        # still-wrapped path, but the positionals are repository directories. Refuse
+        # it here: is_work_tree would report "not a git working tree" — false for a
+        # file inside a working tree — and exit 0, so the caller got no signal.
+        if os.path.isfile(repo):
+            print(f"error {repo}: positional must be a repository directory, not a file", file=sys.stderr)
+            return 2
         if not is_work_tree(repo):
             print(f"skip {repo}: not a git working tree", file=sys.stderr)
             continue
