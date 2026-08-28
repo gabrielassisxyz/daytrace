@@ -108,6 +108,23 @@ mod tests {
         );
     }
 
+    /// The README env-var and command gates read `README.md` against the source; neither
+    /// reads this generated string, so a source-side change to what capture does can drift
+    /// here silently unless something reads the rendered unit itself.
+    #[test]
+    fn the_unit_description_names_both_capture_sources() {
+        let rendered = unit();
+        let description = directives_in(&rendered, "[Unit]")
+            .into_iter()
+            .find(|line| line.starts_with("Description="))
+            .expect("a Description directive");
+
+        assert!(
+            description.contains("media"),
+            "the unit description still describes only desktop capture: {description}"
+        );
+    }
+
     #[test]
     fn the_unit_runs_the_binary_that_rendered_it() {
         assert_directive(
