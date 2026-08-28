@@ -130,7 +130,7 @@ mod tests {
     use super::parse_active_window;
     use crate::activity::{ActivityKind, ActivitySnapshot};
     use crate::config::Blacklist;
-    use crate::storage::Store;
+    use crate::storage::{Lane, Store};
 
     #[test]
     fn parses_active_hyprland_window() {
@@ -342,7 +342,7 @@ mod tests {
         store
             .record_observation(120, 120, &sensitive_snapshot)
             .expect("record sensitive browser title");
-        store.close_open(150).expect("close");
+        store.close_open(150, &Lane::Desktop).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
         assert_eq!(rows.len(), 2);
