@@ -11,12 +11,13 @@ It is a small Rust CLI and daemon that records active-window changes on Hyprland
 - No screenshots.
 - No clipboard capture.
 - No page-content capture.
-- No keystroke capture: an input device is read only for the timestamp of an event, to detect idle and AFK, never for a key, button, or pointer value.
-- Sensitive URLs and tokens are redacted before storage.
-- Browser window titles are stored like other titles: addresses and `keyword=value` secrets are redacted, but the page name is kept.
+- No keystroke capture: an input device is read only for the timestamp of an event, to detect idle and AFK, never for a key, button, or pointer value. These are permanently out of scope, not pending.
+- Free text such as a window title, a track title or an artist goes through one redaction scan: an address inside it is replaced whole, and a `keyword=value` secret loses its value.
+- A field that is itself an address, such as a played track's URL, goes through a different scan: the address is kept, and only its sensitive query or fragment parameters (`token`, `key`, `secret`, `password`, `code`) are stripped. Running the free-text scan over an address would replace the whole value and refuse to say what was played.
+- Browser window titles are stored like other titles: the page name is kept, redacted by the same free-text scan as every other title.
 - Browser private and incognito windows are skipped when Hyprland exposes a recognizable private-mode title marker.
-- Media is recorded by name, the same as a window: title, every artist, album and address are read from whichever player is playing over the user D-Bus (MPRIS), redacted the same way a window title is, and stored in a lane of its own rather than folded into the desktop timeline.
-- Domain and application blacklists exist from the first capture milestone, and cover media too: an application entry matches the player, and a domain entry matches the address.
+- Media is recorded by name: title, every artist, album and the address of what was playing, read from whichever player is playing over the user D-Bus (MPRIS), and stored in a lane of its own rather than folded into the desktop timeline.
+- Domain and application blacklists exist from the first capture milestone, and cover media too: an application entry matches the player, and a domain entry matches the address. They are how a user excludes what they do not want recorded, open by default and closed case by case.
 - Stored activity has a retention window, the last `90` days by default, applied on demand by `daytrace prune` and never automatically.
 - Logs are easy to delete and export.
 
@@ -34,7 +35,7 @@ daytrace start
 
 AFK tracking requires read access to at least one `/dev/input/event*` device. If no readable input devices are available, `daytrace start` exits instead of recording misleading activity.
 
-Media polling requires `busctl`, the systemd D-Bus client, on `PATH`. It runs on its own interval, separate from the desktop poll, because a track change matters far less often than a window change and the check costs a subprocess per player on the bus. A machine with no `busctl`, or no player ever running, is unaffected beyond that: media polling fails or finds nothing, is logged, and the desktop side of capture keeps running.
+Media polling has two runtime prerequisites: `busctl`, the systemd D-Bus client, on `PATH`, and a reachable user D-Bus session. Nothing changes at the Cargo level; the dependency is a subprocess call, not a linked crate. It runs on its own interval, separate from the desktop poll, because a track change matters far less often than a window change and the check costs a subprocess per player on the bus. Without `busctl`, without a reachable bus, media polling fails outright; a machine with both but no player ever running finds nothing. Either way the failure is logged as a rate-limited warning rather than one line per poll, and the desktop side of capture keeps running unaffected.
 
 One capture process runs per database. A second `daytrace start` is refused and names the process already running, rather than doubling capture: each process reads its own configuration, so a blacklist set in one shell is invisible to the other, and the process without it would record what the other one exists to skip. The claim is a lock on `daytrace.db.lock`, held beside the database for as long as the daemon runs and released by the kernel when it exits, so an unclean shutdown leaves nothing to clean up. Two daemons on different databases are not duplicates and both run.
 
@@ -141,7 +142,9 @@ Totals sum seconds and round once, so a minute spread over several short visits 
 
 `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
 
-There is no browser extension, so browser private and incognito detection is best-effort from the Hyprland window title alone, and a browser that does not mark a private window in its title is not detected at all. With the wholesale redaction removed, a missed private window writes the page name into the store; that is the one case where the browser kept no history of its own to compare against. The residual is accepted rather than hidden.
+There is no browser extension, so browser private and incognito detection is best-effort from the Hyprland window title alone, and a browser that does not mark a private window in its title is not detected at all. A missed private window writes the page name into the store, the same as any other window; that is the one case where the browser kept no history of its own to compare against, and it is accepted rather than hidden.
+
+Media has no equivalent detector at all. MPRIS carries no private-window signal, so a media row from a browser names what was playing regardless of which window it played in, whether or not the window title detector recognized that window as private. The window side is unaffected by this: a recognized private window is still skipped whole, and only a missed one writes its title into the store. Media does not get that protection either way, which is the residual this section is about. The blacklists are how a user closes it: an application entry excludes a player, and a domain entry excludes a site, private window or not.
 
 A day that held media gains a section below the desktop timeline and its totals:
 
