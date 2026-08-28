@@ -2,7 +2,7 @@ use crate::activity::{ActivityKind, ActivitySnapshot, TimelineSegment};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Store {
     conn: Connection,
@@ -187,6 +187,58 @@ pub struct Pruned {
 /// resolve it to the present: the report draws it as reaching now, so pruning has to treat it as
 /// reaching now too, which keeps it until a daemon start writes it a real end. Reading it as its
 /// own start instead would delete a block the same store had just printed as covering today.
+/// How long `Store::open` lets `enable_wal` keep trying, matched to the connection's own
+/// `busy_timeout` so that one wait does not silently outlast the other. It is a parameter of
+/// `enable_wal` rather than a constant it reads, so a test can exhaust it in milliseconds: the
+/// branch that gives up is the one that must not quietly hand back a database still in rollback
+/// mode, and a guard that has to wait five seconds to reach that branch does not get written.
+const WAL_CONVERSION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Puts the database this connection opened into WAL mode, waiting out a competing conversion.
+///
+/// WHY this is not the plain `PRAGMA journal_mode = WAL` it replaces: converting the journal
+/// takes a brief exclusive lock on the whole database, and SQLite does not run the busy handler
+/// for a journal-mode change. So that one pragma returned `SQLITE_BUSY` the instant another
+/// connection held the file, while every other write on the same connection waited out
+/// `busy_timeout` as intended. Two commands opening a database that was not yet in WAL therefore
+/// raced, and one of them failed with `failed to enable WAL: database is locked`.
+///
+/// The window is only open while the file is still in rollback mode, which is the first time it
+/// is created and any moment after something leaves it that way. Setting the mode a database is
+/// already in is a no-op that takes no lock, so an open against an established database is
+/// unaffected either way and needs no special case here.
+fn enable_wal(conn: &Connection, budget: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) if is_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("failed to enable WAL: {error}")),
+        }
+    }
+}
+
+/// The journal mode the database is in, lowercased by SQLite itself. Test-only: production no
+/// longer reads the mode, because setting the mode a database is already in costs nothing.
+#[cfg(test)]
+fn journal_mode(conn: &Connection) -> Result<String, String> {
+    conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .map_err(|error| format!("failed to read the journal mode: {error}"))
+}
+
+/// Whether the error is the lock contention this retry exists for, as opposed to a corrupt file
+/// or a permission problem, which retrying would only turn into a five-second pause.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::DatabaseBusy
+                || inner.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
 const ENDED_BEFORE_CUTOFF: &str = "COALESCE(ended_at, last_seen_at, ?2) < ?1";
 
 impl Store {
@@ -201,8 +253,7 @@ impl Store {
             Connection::open(&db_path).map_err(|error| format!("failed to open DB: {error}"))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|error| format!("failed to set DB busy timeout: {error}"))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|error| format!("failed to enable WAL: {error}"))?;
+        enable_wal(&conn, WAL_CONVERSION_BUDGET)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|error| format!("failed to set synchronous=NORMAL: {error}"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -2699,6 +2750,138 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn an_open_store_is_always_in_wal_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        let store = Store::open(&db, None).expect("open");
+
+        // Read back rather than trusting the conversion: a retry that gave up would otherwise
+        // return a perfectly usable store sitting in rollback mode, and nothing would say so.
+        assert_eq!(
+            super::journal_mode(&store.conn).expect("read the journal mode"),
+            "wal"
+        );
+    }
+
+    #[test]
+    fn a_conversion_that_never_gets_the_lock_says_so_instead_of_downgrading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        let writer = Connection::open(&db).expect("writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take the reserved lock");
+
+        let conn = Connection::open(&db).expect("connection");
+        let outcome = super::enable_wal(&conn, Duration::from_millis(100));
+
+        // Giving up is allowed; giving up quietly is not. A caller that gets `Ok` here goes on
+        // to use a database still in rollback mode, and nothing anywhere says the guarantee the
+        // rest of this file is written against no longer holds.
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|message| message.starts_with("failed to enable WAL")),
+            "exhausting the budget must be reported: {outcome:?}"
+        );
+        assert_ne!(
+            super::journal_mode(&conn).expect("read the journal mode"),
+            "wal"
+        );
+        writer.execute_batch("ROLLBACK").expect("release the lock");
+    }
+
+    #[test]
+    fn a_contended_conversion_waits_for_the_lock_instead_of_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        // A writer holding the rollback-mode file denies the exclusive lock the conversion
+        // needs, then lets go. The bare pragma this replaced does not wait: it fails the moment
+        // the lock is refused, because SQLite runs no busy handler for a journal-mode change.
+        // Releasing after a beat is what makes the test decide between waiting and failing
+        // rather than between a fast machine and a slow one.
+        let holder_db = db.clone();
+        let (holding, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let writer = Connection::open(&holder_db).expect("writer");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("take the reserved lock");
+            holding.send(()).expect("announce the lock");
+            std::thread::sleep(Duration::from_millis(250));
+            writer.execute_batch("ROLLBACK").expect("release the lock");
+        });
+
+        held.recv().expect("wait until the lock is actually held");
+        let store = Store::open(&db, None).expect("open while the file is held, then released");
+        assert_eq!(
+            super::journal_mode(&store.conn).expect("read the journal mode"),
+            "wal"
+        );
+        holder.join().expect("holder");
+    }
+
+    #[test]
+    fn many_connections_converting_the_journal_at_once_all_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        // Seeded through a plain connection, so the file is in rollback mode and every thread
+        // below is one of the connections trying to convert it. That is the only window in
+        // which the conversion can be contended at all.
+        seed_current_schema(&db);
+
+        let threads = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let db = db.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&db, None).map(|store| {
+                        super::journal_mode(&store.conn).expect("read the journal mode")
+                    })
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let mode = handle.join().expect("thread").expect("open");
+            assert_eq!(mode, "wal");
+        }
+    }
+
+    #[test]
+    fn opening_an_established_wal_database_needs_no_lock_of_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let first = Store::open(&db, None).expect("first open");
+
+        // Held for the whole call, and never released: setting the mode a database is already
+        // in takes no lock, so the second open must come back anyway. This is what says the
+        // conversion has no special case to skip: if it needed the lock, this would spend the
+        // whole retry budget and fail.
+        let writer = Connection::open(&db).expect("writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take the reserved lock");
+
+        let second = Store::open(&db, None).expect("second open while the file is held");
+        assert_eq!(
+            super::journal_mode(&second.conn).expect("read the journal mode"),
+            "wal"
+        );
+        writer.execute_batch("ROLLBACK").expect("release the lock");
+        drop(first);
     }
 
     #[test]
