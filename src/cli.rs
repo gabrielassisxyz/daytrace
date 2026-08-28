@@ -6,7 +6,7 @@ use crate::input::InputActivity;
 use crate::lock::CaptureLock;
 use crate::media::{BusctlClient, MediaSource, PlayerOutcome, PlayingMedia};
 use crate::service::render_user_unit;
-use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
+use crate::session::{PowerGapWatch, PoweredDownGap, SessionClock, SystemSessionClock};
 use crate::storage::{CaptureStore, Lane, Pruned, Store};
 use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
@@ -266,96 +266,62 @@ fn run_daemon(config: Config) -> Result<(), String> {
     store.close_stale_open_segments()?;
 
     let session_clock = SystemSessionClock;
-    let mut power_gaps = PowerGapWatch::default();
-    let mut pending_gaps = PendingGaps::default();
-    let mut streak = FailureStreak::default();
-    let mut media_store_streak = FailureStreak::default();
-    let mut media_source_log = MediaSourceFailureLog::default();
-
-    // Both start due, so the daemon polls each source once on its first wake rather than
-    // waiting out a full interval before the first observation.
-    let mut desktop_deadline = Instant::now();
-    let mut media_deadline = Instant::now();
+    let sources = WakeSources {
+        desktop: &hyprland,
+        media: &media_source,
+        session_clock: &session_clock,
+    };
+    let mut wake_state = CaptureWakeState::new(Instant::now());
 
     while running.load(Ordering::Relaxed) {
-        wait_until(&running, desktop_deadline.min(media_deadline));
+        wait_until(
+            &running,
+            wake_state.desktop_deadline.min(wake_state.media_deadline),
+        );
         if !running.load(Ordering::Relaxed) {
             break;
         }
-        let now = Instant::now();
-        let desktop_due = now >= desktop_deadline;
-        let media_due = now >= media_deadline;
-
-        // The clock is read through the watch on every wake, whichever source is due, so a gap
-        // that just ended is queued before either source's write below rather than only on a
-        // desktop tick: the gap floor reads every lane, and a media row written first would move
-        // it forward and truncate the gap that had just been measured.
-        let session = power_gaps.observe(&session_clock);
-        let observed_at = session.observed_at;
-        if let Some(gap) = session.powered_down_gap {
-            pending_gaps.push(gap);
-        }
-
-        if desktop_due {
-            // Idle is only detectable once the threshold has already passed, so the transition
-            // is dated back to the last input rather than to the moment it was noticed. Dating
-            // it to now credited the whole threshold window to whichever window still held
-            // focus, which inflated that one application by up to the threshold on every single
-            // absence.
-            let last_input = input_activity.last_activity_at();
-            let idle_since = (observed_at - last_input >= config.idle_after.as_secs() as i64)
-                .then_some(last_input);
-
-            match capture_once(
-                &mut store,
-                &hyprland,
-                &config.blacklist,
-                observed_at,
-                idle_since,
-                // Already queued above: passing it again here would double-queue the same
-                // stretch. `capture_once` flushes the queue itself, which is also what gives a
-                // failed flush the same retry tolerance an ordinary desktop failure gets, through
-                // `streak` below, rather than ending the daemon on the first busy write.
-                None,
-                &mut pending_gaps,
-            ) {
-                // Only a poll that actually reached the desktop is evidence that it is reachable.
-                Ok(Observed::Desktop) => streak.record_success(),
-                Ok(Observed::Idle) => {}
-                Err(error) => match streak.record_failure() {
-                    Some(count) => eprintln!(
-                        "daytrace: observation failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
-                    ),
-                    None => {
-                        return Err(format!(
-                            "capture failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
-                        ));
-                    }
-                },
-            }
-            desktop_deadline = next_poll_deadline(desktop_deadline, now, config.poll_interval);
-        } else {
-            // A media-only wake: nothing else is going to flush a queued gap this time around,
-            // so it happens here instead, on the same retry tolerance a flush failure gets when
-            // `capture_once` runs it.
-            flush_pending_gaps(&mut store, &mut pending_gaps, &mut streak)?;
-        }
-
-        if media_due {
-            handle_media_wake(
-                &mut store,
-                &media_source,
-                &config.blacklist,
-                observed_at,
-                &mut media_source_log,
-                &mut media_store_streak,
-            )?;
-            media_deadline = next_poll_deadline(media_deadline, now, config.media_poll_interval);
-        }
+        run_capture_wake(
+            &mut store,
+            &sources,
+            &config,
+            input_activity.last_activity_at(),
+            Instant::now(),
+            &mut wake_state,
+        )?;
     }
 
-    store.close_open(unix_now(), &Lane::Desktop)?;
-    store.close_open_media_lanes_at_last_seen()
+    close_capture_lanes(&mut store, unix_now())
+}
+
+/// Everything one wake carries over to the next: the two failure streaks, the media source's own
+/// log, the gaps still owed, and the two poll deadlines. Gathered here, apart from the real
+/// collaborators, so a test can construct one wake's memory without the signal handler, the
+/// capture lock or the input-device watcher `run_daemon` sets up around it.
+struct CaptureWakeState {
+    power_gaps: PowerGapWatch,
+    pending_gaps: PendingGaps,
+    streak: FailureStreak,
+    media_store_streak: FailureStreak,
+    media_source_log: MediaSourceFailureLog,
+    desktop_deadline: Instant,
+    media_deadline: Instant,
+}
+
+impl CaptureWakeState {
+    /// Both deadlines start due, so the first wake polls each source once rather than waiting
+    /// out a full interval before the first observation.
+    fn new(now: Instant) -> Self {
+        Self {
+            power_gaps: PowerGapWatch::default(),
+            pending_gaps: PendingGaps::default(),
+            streak: FailureStreak::default(),
+            media_store_streak: FailureStreak::default(),
+            media_source_log: MediaSourceFailureLog::default(),
+            desktop_deadline: now,
+            media_deadline: now,
+        }
+    }
 }
 
 /// How many consecutive failed observations end the daemon.
@@ -617,6 +583,115 @@ fn handle_media_wake(
     }
 }
 
+/// The boundaries one wake reaches through, gathered so a test can hand over a fake for every
+/// one of them without touching `run_daemon`'s own setup: the real signal handler, capture lock
+/// and input-device watcher that nothing about a single wake needs.
+struct WakeSources<'a> {
+    desktop: &'a dyn ActiveWindowSource,
+    media: &'a dyn MediaSource,
+    session_clock: &'a dyn SessionClock,
+}
+
+/// One wake of the capture loop: read the session clock, flush whatever gap is already owed,
+/// then run whichever source is due. `run_daemon` reduces to acquiring the real desktop source,
+/// media source, session clock and store, and calling this in a loop.
+///
+/// The gap flush runs before either source is given a chance to write: it is queued from the
+/// session clock above, and then flushed either inside `capture_once` when the desktop poll is
+/// due or explicitly here when it is not, in both cases strictly before that wake's media poll.
+/// A gap flushed after a source had already written would let a media row move the gap floor
+/// forward and silently truncate the very stretch the flush exists to record. The desktop and
+/// media polls are otherwise independent: a desktop failure that does not exhaust its streak
+/// falls through to the media check rather than returning early, so one source's outage never
+/// suppresses the other's poll on the same wake.
+fn run_capture_wake(
+    store: &mut dyn CaptureStore,
+    sources: &WakeSources,
+    config: &Config,
+    last_activity_at: i64,
+    now: Instant,
+    state: &mut CaptureWakeState,
+) -> Result<(), String> {
+    let desktop_due = now >= state.desktop_deadline;
+    let media_due = now >= state.media_deadline;
+
+    // The clock is read through the watch on every wake, whichever source is due, so a gap that
+    // just ended is queued before either source's write below rather than only on a desktop
+    // tick: the gap floor reads every lane, and a media row written first would move it forward
+    // and truncate the gap that had just been measured.
+    let session = state.power_gaps.observe(sources.session_clock);
+    let observed_at = session.observed_at;
+    if let Some(gap) = session.powered_down_gap {
+        state.pending_gaps.push(gap);
+    }
+
+    if desktop_due {
+        // Idle is only detectable once the threshold has already passed, so the transition is
+        // dated back to the last input rather than to the moment it was noticed. Dating it to
+        // now credited the whole threshold window to whichever window still held focus, which
+        // inflated that one application by up to the threshold on every single absence.
+        let idle_since = (observed_at - last_activity_at >= config.idle_after.as_secs() as i64)
+            .then_some(last_activity_at);
+
+        match capture_once(
+            store,
+            sources.desktop,
+            &config.blacklist,
+            observed_at,
+            idle_since,
+            // Already queued above: passing it again here would double-queue the same stretch.
+            // `capture_once` flushes the queue itself, which is also what gives a failed flush
+            // the same retry tolerance an ordinary desktop failure gets, through `state.streak`
+            // below, rather than ending the daemon on the first busy write.
+            None,
+            &mut state.pending_gaps,
+        ) {
+            // Only a poll that actually reached the desktop is evidence that it is reachable.
+            Ok(Observed::Desktop) => state.streak.record_success(),
+            Ok(Observed::Idle) => {}
+            Err(error) => match state.streak.record_failure() {
+                Some(count) => eprintln!(
+                    "daytrace: observation failed ({count}/{MAX_CONSECUTIVE_FAILURES}): {error}"
+                ),
+                None => {
+                    return Err(format!(
+                        "capture failed {MAX_CONSECUTIVE_FAILURES} times in a row, giving up: {error}"
+                    ));
+                }
+            },
+        }
+        state.desktop_deadline =
+            next_poll_deadline(state.desktop_deadline, now, config.poll_interval);
+    } else {
+        // A media-only wake: nothing else is going to flush a queued gap this time around, so
+        // it happens here instead, on the same retry tolerance a flush failure gets when
+        // `capture_once` runs it.
+        flush_pending_gaps(store, &mut state.pending_gaps, &mut state.streak)?;
+    }
+
+    if media_due {
+        handle_media_wake(
+            store,
+            sources.media,
+            &config.blacklist,
+            observed_at,
+            &mut state.media_source_log,
+            &mut state.media_store_streak,
+        )?;
+        state.media_deadline =
+            next_poll_deadline(state.media_deadline, now, config.media_poll_interval);
+    }
+
+    Ok(())
+}
+
+/// Close both lanes on the way out, so a shutdown mid-wake leaves neither open behind it: the
+/// desktop lane at the moment of shutdown, and every open media lane at its own last-seen time.
+fn close_capture_lanes(store: &mut dyn CaptureStore, closed_at: i64) -> Result<(), String> {
+    store.close_open(closed_at, &Lane::Desktop)?;
+    store.close_open_media_lanes_at_last_seen()
+}
+
 /// Redact a `Playing` outcome's free-text fields and address before it reaches storage.
 ///
 /// The boundary a raw MPRIS reading crosses on its way into the store, mirroring where the
@@ -814,25 +889,27 @@ fn segments(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppError, FailureStreak, MAX_CONSECUTIVE_FAILURES, MediaSourceFailureLog, Observed,
-        PendingGaps, capture_media_once, capture_once, flush_pending_gaps, forget_request,
-        handle_media_wake, next_poll_deadline, prune_is_dry_run, render_forget,
-        render_forget_preview, render_preview, render_prune, requested_day, run,
-        sanitize_media_outcome,
+        AppError, CaptureWakeState, FailureStreak, MAX_CONSECUTIVE_FAILURES, MediaSourceFailureLog,
+        Observed, PendingGaps, WakeSources, capture_media_once, capture_once, close_capture_lanes,
+        flush_pending_gaps, forget_request, handle_media_wake, next_poll_deadline,
+        prune_is_dry_run, render_forget, render_forget_preview, render_preview, render_prune,
+        requested_day, run, run_capture_wake, sanitize_media_outcome,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
-    use crate::config::Blacklist;
+    use crate::config::{Blacklist, Config};
     use crate::desktop::ActiveWindowSource;
     use crate::media::fakes::ScriptedMediaSource;
-    use crate::media::{PlayerOutcome, PlayingMedia};
-    use crate::session::PoweredDownGap;
+    use crate::media::{MediaSource, PlayerOutcome, PlayingMedia};
+    use crate::session::{ClockReading, PoweredDownGap, SessionClock};
     use crate::storage::CaptureStore;
     use crate::storage::Lane;
     use crate::storage::Pruned;
     use crate::storage::Store;
     use chrono::NaiveDate;
     use std::cell::RefCell;
-    use std::time::Duration;
+    use std::path::PathBuf;
+    use std::rc::Rc;
+    use std::time::{Duration, Instant};
 
     fn pruned(deleted: u64, still_in_the_file: Option<&str>) -> Pruned {
         Pruned {
@@ -2486,6 +2563,244 @@ mod tests {
             Some(3),
             "the desktop streak must still read as three failures in a row: a media write \
              succeeding does not touch it"
+        );
+    }
+
+    /// One call, one line, in call order, shared across every fake a wake test builds. An
+    /// ordering guarantee is a statement about which call happened before which other call, and
+    /// this is the only thing that can tell the two apart: two rows in a real store carry no
+    /// record of which write reached it first.
+    type CallLog = Rc<RefCell<Vec<&'static str>>>;
+
+    /// A desktop boundary that logs the one call a wake gives it before answering with a fixed
+    /// response.
+    struct LoggingWindowSource {
+        log: CallLog,
+        response: RefCell<Option<Result<Option<ActivitySnapshot>, String>>>,
+    }
+
+    impl LoggingWindowSource {
+        fn new(log: CallLog, response: Result<Option<ActivitySnapshot>, String>) -> Self {
+            Self {
+                log,
+                response: RefCell::new(Some(response)),
+            }
+        }
+    }
+
+    impl ActiveWindowSource for LoggingWindowSource {
+        fn active_snapshot(
+            &self,
+            _blacklist: &Blacklist,
+        ) -> Result<Option<ActivitySnapshot>, String> {
+            self.log.borrow_mut().push("desktop_source");
+            self.response.borrow_mut().take().expect("polled once")
+        }
+    }
+
+    /// A media boundary that logs the one call a wake gives it, the same way.
+    struct LoggingMediaSource {
+        log: CallLog,
+        response: RefCell<Option<Result<Vec<PlayerOutcome>, String>>>,
+    }
+
+    impl LoggingMediaSource {
+        fn new(log: CallLog, response: Result<Vec<PlayerOutcome>, String>) -> Self {
+            Self {
+                log,
+                response: RefCell::new(Some(response)),
+            }
+        }
+    }
+
+    impl MediaSource for LoggingMediaSource {
+        fn poll(&self, _blacklist: &Blacklist) -> Result<Vec<PlayerOutcome>, String> {
+            self.log.borrow_mut().push("media_source");
+            self.response.borrow_mut().take().expect("polled once")
+        }
+    }
+
+    /// A storage boundary that logs every call it receives instead of keeping rows: the three
+    /// ordering guarantees under test are entirely about call order, which two rows sharing a
+    /// timestamp cannot distinguish.
+    struct LoggingStore {
+        log: CallLog,
+    }
+
+    impl LoggingStore {
+        fn new(log: CallLog) -> Self {
+            Self { log }
+        }
+    }
+
+    impl CaptureStore for LoggingStore {
+        fn record_observation(
+            &mut self,
+            _starts_at: i64,
+            _seen_at: i64,
+            _snapshot: &ActivitySnapshot,
+        ) -> Result<(), String> {
+            self.log.borrow_mut().push("record_observation");
+            Ok(())
+        }
+
+        fn record_powered_down_gap(
+            &mut self,
+            _started_at: i64,
+            _ended_at: i64,
+        ) -> Result<(), String> {
+            self.log.borrow_mut().push("record_powered_down_gap");
+            Ok(())
+        }
+
+        fn close_open(&mut self, _ended_at: i64, lane: &Lane) -> Result<(), String> {
+            self.log.borrow_mut().push(match lane {
+                Lane::Desktop => "close_open_desktop",
+                Lane::Media(_) => "close_open_media",
+            });
+            Ok(())
+        }
+
+        fn record_media_poll(
+            &mut self,
+            _observed_at: i64,
+            _outcomes: &[PlayerOutcome],
+        ) -> Result<(), String> {
+            self.log.borrow_mut().push("record_media_poll");
+            Ok(())
+        }
+
+        fn close_open_media_lanes_at_last_seen(&mut self) -> Result<(), String> {
+            self.log
+                .borrow_mut()
+                .push("close_open_media_lanes_at_last_seen");
+            Ok(())
+        }
+    }
+
+    /// A session clock that always answers the same reading. A wake test seeds any gap it needs
+    /// straight into `CaptureWakeState.pending_gaps`, so `PowerGapWatch` never has an earlier
+    /// reading to compare this one against and this never has to fabricate a transition.
+    struct FixedSessionClock {
+        wall: i64,
+    }
+
+    impl SessionClock for FixedSessionClock {
+        fn read(&self) -> ClockReading {
+            ClockReading {
+                wall: self.wall,
+                monotonic: Duration::ZERO,
+                boottime: Duration::ZERO,
+            }
+        }
+    }
+
+    /// A `Config` carrying only the fields a wake reads: the poll intervals, the idle threshold
+    /// and the blacklist. The path fields are unused by a wake and stay empty.
+    fn wake_config() -> Config {
+        Config {
+            db_path: PathBuf::new(),
+            secure_data_dir: None,
+            idle_after: Duration::from_secs(300),
+            poll_interval: Duration::from_secs(1),
+            media_poll_interval: Duration::from_secs(5),
+            retention_days: 90,
+            blacklist: Blacklist::default(),
+        }
+    }
+
+    #[test]
+    fn a_media_only_wake_flushes_a_pending_gap_before_polling_media() {
+        let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+        let mut store = LoggingStore::new(Rc::clone(&log));
+        let desktop = LoggingWindowSource::new(Rc::clone(&log), Ok(None));
+        let media = LoggingMediaSource::new(Rc::clone(&log), Ok(vec![]));
+        let clock = FixedSessionClock { wall: 1_000 };
+        let config = wake_config();
+
+        // Desktop is not due this wake; only media is. That is exactly the wake
+        // `flush_pending_gaps` documents itself as existing for: nothing else is going to flush
+        // the queued gap, so this wake has to.
+        let mut state = CaptureWakeState::new(Instant::now() + Duration::from_secs(60));
+        state.media_deadline = Instant::now();
+        state.pending_gaps.push(PoweredDownGap {
+            started_at: 900,
+            ended_at: 950,
+        });
+        let sources = WakeSources {
+            desktop: &desktop,
+            media: &media,
+            session_clock: &clock,
+        };
+
+        run_capture_wake(
+            &mut store,
+            &sources,
+            &config,
+            1_000,
+            Instant::now(),
+            &mut state,
+        )
+        .expect("wake succeeds");
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            [
+                "record_powered_down_gap",
+                "media_source",
+                "record_media_poll"
+            ],
+            "the gap already owed must be flushed before the media source is polled, and the \
+             desktop source, not due this wake, must not be touched at all"
+        );
+    }
+
+    #[test]
+    fn a_desktop_failure_does_not_suppress_the_media_poll_on_the_same_wake() {
+        let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+        let mut store = LoggingStore::new(Rc::clone(&log));
+        let desktop =
+            LoggingWindowSource::new(Rc::clone(&log), Err("hyprctl activewindow failed".into()));
+        let media = LoggingMediaSource::new(Rc::clone(&log), Ok(vec![]));
+        let clock = FixedSessionClock { wall: 1_000 };
+        let config = wake_config();
+        // Both due, so a wake that let the desktop failure cut it short would never reach media.
+        let mut state = CaptureWakeState::new(Instant::now());
+        let sources = WakeSources {
+            desktop: &desktop,
+            media: &media,
+            session_clock: &clock,
+        };
+
+        run_capture_wake(
+            &mut store,
+            &sources,
+            &config,
+            1_000,
+            Instant::now(),
+            &mut state,
+        )
+        .expect("a single desktop failure, well under the giving-up threshold, is not fatal");
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["desktop_source", "media_source", "record_media_poll"],
+            "the media source must still be polled on a wake where the desktop source failed"
+        );
+    }
+
+    #[test]
+    fn shutdown_closes_both_the_desktop_and_the_media_lanes() {
+        let log: CallLog = Rc::new(RefCell::new(Vec::new()));
+        let mut store = LoggingStore::new(Rc::clone(&log));
+
+        close_capture_lanes(&mut store, 1_000).expect("shutdown succeeds");
+
+        assert_eq!(
+            log.borrow().as_slice(),
+            ["close_open_desktop", "close_open_media_lanes_at_last_seen"],
+            "shutdown must close the desktop lane and every open media lane, not only one of \
+             the two"
         );
     }
 }
