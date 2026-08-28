@@ -6,7 +6,7 @@ use crate::input::InputActivity;
 use crate::lock::CaptureLock;
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SystemSessionClock};
-use crate::storage::{CaptureStore, Pruned, Store};
+use crate::storage::{CaptureStore, Lane, Pruned, Store};
 use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
 use std::env;
@@ -306,7 +306,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
         wait_for_next_poll(&running, config.poll_interval);
     }
 
-    store.close_open(unix_now())
+    store.close_open(unix_now(), &Lane::Desktop)
 }
 
 /// How many consecutive failed observations end the daemon.
@@ -413,7 +413,7 @@ fn capture_once(
 
     match snapshot {
         Some(snapshot) => store.record_observation(starts_at, observed_at, &snapshot)?,
-        None => store.close_open(observed_at)?,
+        None => store.close_open(observed_at, &Lane::Desktop)?,
     }
     Ok(observed)
 }
@@ -582,6 +582,7 @@ mod tests {
     use crate::desktop::ActiveWindowSource;
     use crate::session::PoweredDownGap;
     use crate::storage::CaptureStore;
+    use crate::storage::Lane;
     use crate::storage::Pruned;
     use crate::storage::Store;
     use chrono::NaiveDate;
@@ -659,8 +660,8 @@ mod tests {
             self.inner.record_powered_down_gap(started_at, ended_at)
         }
 
-        fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
-            self.inner.close_open(ended_at)
+        fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
+            self.inner.close_open(ended_at, lane)
         }
     }
 
@@ -702,7 +703,7 @@ mod tests {
             &mut pending_gaps,
         )
         .expect("the recovered query is recorded");
-        store.close_open(120).expect("close");
+        store.close_open(120, &Lane::Desktop).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
         assert_eq!(rows.len(), 1);
@@ -746,7 +747,7 @@ mod tests {
             &mut pending_gaps,
         )
         .expect("idle detected");
-        store.close_open(1400).expect("close");
+        store.close_open(1400, &Lane::Desktop).expect("close");
 
         let rows = store.timeline_between(0, 2000, 2000).expect("timeline");
         assert_eq!(rows.len(), 2);

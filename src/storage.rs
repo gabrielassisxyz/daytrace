@@ -1,13 +1,47 @@
-use crate::activity::{ActivityKind, ActivitySnapshot, TimelineSegment};
+use crate::activity::{
+    ActivityKind, ActivitySnapshot, MediaSegment, MediaSnapshot, TimelineSegment,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior, params};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 pub struct Store {
     conn: Connection,
     db_path: PathBuf,
     secure_data_dir: Option<PathBuf>,
+}
+
+/// Which open segment a storage operation acts on.
+///
+/// Never a string a caller spells out: before this, every function that touched "the open
+/// segment" meant whatever single row `ended_at IS NULL` matched, which was safe only while
+/// desktop was the sole source. With a second source able to hold its own open row, the same
+/// query would close, float or read across both without anyone asking it to. Each operation
+/// that must not do that takes one of these instead, and the one place a player's bus name
+/// becomes the column value it is stored and matched by is `Lane::column_value`, so no call
+/// site assembles that prefix itself.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum Lane {
+    Desktop,
+    /// A player's own lane, keyed by its full MPRIS bus name rather than the normalized player
+    /// key, so that two instances of the same player never collide in one lane.
+    ///
+    /// Nothing writes a media row yet, so this variant is only ever constructed in tests until
+    /// the capture loop that polls MPRIS lands.
+    #[allow(dead_code)]
+    Media(String),
+}
+
+impl Lane {
+    const DESKTOP_COLUMN_VALUE: &'static str = "desktop";
+
+    fn column_value(&self) -> String {
+        match self {
+            Lane::Desktop => Self::DESKTOP_COLUMN_VALUE.to_string(),
+            Lane::Media(bus_name) => format!("media:{bus_name}"),
+        }
+    }
 }
 
 /// The storage boundary a poll writes through.
@@ -25,7 +59,7 @@ pub trait CaptureStore {
 
     fn record_powered_down_gap(&mut self, started_at: i64, ended_at: i64) -> Result<(), String>;
 
-    fn close_open(&mut self, ended_at: i64) -> Result<(), String>;
+    fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String>;
 }
 
 impl CaptureStore for Store {
@@ -42,8 +76,8 @@ impl CaptureStore for Store {
         Store::record_powered_down_gap(self, started_at, ended_at)
     }
 
-    fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
-        Store::close_open(self, ended_at)
+    fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
+        Store::close_open(self, ended_at, lane)
     }
 }
 
@@ -189,6 +223,58 @@ pub struct Pruned {
 /// resolve it to the present: the report draws it as reaching now, so pruning has to treat it as
 /// reaching now too, which keeps it until a daemon start writes it a real end. Reading it as its
 /// own start instead would delete a block the same store had just printed as covering today.
+/// How long `Store::open` lets `enable_wal` keep trying, matched to the connection's own
+/// `busy_timeout` so that one wait does not silently outlast the other. It is a parameter of
+/// `enable_wal` rather than a constant it reads, so a test can exhaust it in milliseconds: the
+/// branch that gives up is the one that must not quietly hand back a database still in rollback
+/// mode, and a guard that has to wait five seconds to reach that branch does not get written.
+const WAL_CONVERSION_BUDGET: Duration = Duration::from_secs(5);
+
+/// Puts the database this connection opened into WAL mode, waiting out a competing conversion.
+///
+/// WHY this is not the plain `PRAGMA journal_mode = WAL` it replaces: converting the journal
+/// takes a brief exclusive lock on the whole database, and SQLite does not run the busy handler
+/// for a journal-mode change. So that one pragma returned `SQLITE_BUSY` the instant another
+/// connection held the file, while every other write on the same connection waited out
+/// `busy_timeout` as intended. Two commands opening a database that was not yet in WAL therefore
+/// raced, and one of them failed with `failed to enable WAL: database is locked`.
+///
+/// The window is only open while the file is still in rollback mode, which is the first time it
+/// is created and any moment after something leaves it that way. Setting the mode a database is
+/// already in is a no-op that takes no lock, so an open against an established database is
+/// unaffected either way and needs no special case here.
+fn enable_wal(conn: &Connection, budget: Duration) -> Result<(), String> {
+    let deadline = Instant::now() + budget;
+    loop {
+        match conn.pragma_update(None, "journal_mode", "WAL") {
+            Ok(()) => return Ok(()),
+            Err(error) if is_busy(&error) && Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(25));
+            }
+            Err(error) => return Err(format!("failed to enable WAL: {error}")),
+        }
+    }
+}
+
+/// The journal mode the database is in, lowercased by SQLite itself. Test-only: production no
+/// longer reads the mode, because setting the mode a database is already in costs nothing.
+#[cfg(test)]
+fn journal_mode(conn: &Connection) -> Result<String, String> {
+    conn.pragma_query_value(None, "journal_mode", |row| row.get::<_, String>(0))
+        .map_err(|error| format!("failed to read the journal mode: {error}"))
+}
+
+/// Whether the error is the lock contention this retry exists for, as opposed to a corrupt file
+/// or a permission problem, which retrying would only turn into a five-second pause.
+fn is_busy(error: &rusqlite::Error) -> bool {
+    matches!(
+        error,
+        rusqlite::Error::SqliteFailure(inner, _)
+            if inner.code == rusqlite::ErrorCode::DatabaseBusy
+                || inner.code == rusqlite::ErrorCode::DatabaseLocked
+    )
+}
+
 const ENDED_BEFORE_CUTOFF: &str = "COALESCE(ended_at, last_seen_at, ?2) < ?1";
 
 /// Which segments `forget` matches: a case-insensitive substring of `?1` against every field a
@@ -215,8 +301,7 @@ impl Store {
             Connection::open(&db_path).map_err(|error| format!("failed to open DB: {error}"))?;
         conn.busy_timeout(Duration::from_secs(5))
             .map_err(|error| format!("failed to set DB busy timeout: {error}"))?;
-        conn.pragma_update(None, "journal_mode", "WAL")
-            .map_err(|error| format!("failed to enable WAL: {error}"))?;
+        enable_wal(&conn, WAL_CONVERSION_BUDGET)?;
         conn.pragma_update(None, "synchronous", "NORMAL")
             .map_err(|error| format!("failed to set synchronous=NORMAL: {error}"))?;
         conn.pragma_update(None, "foreign_keys", "ON")
@@ -238,6 +323,12 @@ impl Store {
     /// case that matters: the daemon only learns the machine went idle once the threshold has
     /// already elapsed, so `starts_at` is when input actually stopped while `seen_at` stays
     /// the current time and keeps the segment's progress moving.
+    ///
+    /// Always the desktop lane: `ActivitySnapshot` has no media variant, so there is no other
+    /// lane this call could mean. Scoping `load_open_segment` and `last_accounted_instant` to
+    /// it here, rather than leaving them read whatever is open, is what keeps a window change
+    /// from closing an open media row or a media row's progress from moving this floor, idle
+    /// included, since idle is recorded through this same path.
     pub fn record_observation(
         &mut self,
         starts_at: i64,
@@ -245,7 +336,7 @@ impl Store {
         snapshot: &ActivitySnapshot,
     ) -> Result<(), String> {
         if !snapshot.is_recordable() {
-            self.close_open(seen_at)?;
+            self.close_open(seen_at, &Lane::Desktop)?;
             return Ok(());
         }
 
@@ -258,14 +349,14 @@ impl Store {
             .conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(|error| format!("failed to start transaction: {error}"))?;
-        let open = load_open_segment(&tx)?;
+        let open = load_open_segment(&tx, &Lane::Desktop)?;
 
         // A backdated start may not reach behind time that is already accounted for, or the
         // new segment overlaps an existing one and the day adds up to more than it lasted.
         // The floor is the last boundary written, whether that is a closed segment's end or
         // the open segment's start; the open segment's own progress is deliberately excluded,
         // since displacing it is exactly what a backdated start is for.
-        let begins_at = match last_accounted_instant(&tx)? {
+        let begins_at = match last_accounted_instant(&tx, &Lane::Desktop)? {
             Some(floor) => starts_at.max(floor),
             None => starts_at,
         };
@@ -308,6 +399,10 @@ impl Store {
     /// that was open when the machine stopped is closed at the same instant, so the application
     /// that happened to hold focus does not absorb the whole stretch, and the poll that follows
     /// opens a fresh segment, which is the marker a resume otherwise has none of.
+    ///
+    /// Deliberately not lane-scoped: the closing `UPDATE` below reaches every open row, media
+    /// included, because a machine that is off stops the music. This is the one close that is
+    /// meant to touch every lane at once.
     pub fn record_powered_down_gap(
         &mut self,
         started_at: i64,
@@ -350,25 +445,31 @@ impl Store {
         self.secure_permissions()
     }
 
-    pub fn close_open(&mut self, ended_at: i64) -> Result<(), String> {
+    /// Close the row open in `lane`, leaving every other lane's open row untouched.
+    pub fn close_open(&mut self, ended_at: i64, lane: &Lane) -> Result<(), String> {
         // `unix_now` is wall clock, not monotonic: an NTP step backwards between observations
         // would otherwise store an end that precedes the segment's start. `record_observation`
         // and `insert_segment` already clamp their progress markers, so this path has to match.
         self.conn
             .execute(
                 "UPDATE activity_segments SET ended_at = MAX(?1, started_at), \
-                 last_seen_at = MAX(?1, started_at) WHERE ended_at IS NULL",
-                params![ended_at],
+                 last_seen_at = MAX(?1, started_at) WHERE ended_at IS NULL AND lane = ?2",
+                params![ended_at, lane.column_value()],
             )
-            .map_err(|error| format!("failed to close open segments: {error}"))?;
+            .map_err(|error| format!("failed to close the open segment in the lane: {error}"))?;
         self.secure_permissions()
     }
 
-    /// Close whatever the previous run left open, at the last moment it was observed.
+    /// Close whatever the previous run left open, at the last moment it was observed: every
+    /// lane, each at its own marker.
     ///
     /// The daemon can die without closing anything: a crash, a reboot, an OOM kill. Falling
     /// back to `started_at` used to discard the entire stretch, so an afternoon spent in one
     /// window disappeared from the timeline. `last_seen_at` bounds the loss to a single poll.
+    ///
+    /// Deliberately not lane-scoped: it is already a per-row update, closing each open row at
+    /// its own marker rather than at one shared instant, so a second lane left open by the same
+    /// crash needs no change here to be recovered correctly beside the first.
     pub fn close_stale_open_segments(&mut self) -> Result<(), String> {
         self.conn
             .execute(
@@ -548,48 +649,48 @@ impl Store {
         Ok(())
     }
 
+    /// The stored desktop segments intersecting `[start, end)`, excluding every media lane.
+    ///
+    /// What `today` and `export` both read through, neither of which reads media yet, and the
+    /// exclusion is what keeps a media row out of a report that has no way to show it apart
+    /// from a window. Delegates to `desktop_segments_in` so a caller that also wants the media
+    /// side, `Store::day_activity`, can read both against one snapshot instead of two.
     pub fn timeline_between(
         &self,
         start: i64,
         end: i64,
         now: i64,
     ) -> Result<Vec<TimelineSegment>, String> {
-        let mut stmt = self
+        desktop_segments_in(&self.conn, start, end, now)
+    }
+
+    /// The desktop segments and the media segments intersecting `[start, end)`, read against
+    /// one snapshot.
+    ///
+    /// Two reads rather than one filtered read, because a media row cannot decode through the
+    /// desktop query without `ActivitySnapshot` growing a shape that means nothing for a track.
+    /// One transaction rather than two independent statements, because the daemon writes every
+    /// second: two separate reads could hand a caller desktop state from before a poll beside
+    /// media state from after it, a pair that describes no instant that ever existed. A
+    /// DEFERRED transaction's snapshot is fixed at its first statement, so the desktop read
+    /// below has to run first for the guarantee to cover both.
+    ///
+    /// Nothing calls this yet, since the reporting layer that would is a later bead, so it is
+    /// dead code in the binary until then.
+    #[allow(dead_code)]
+    pub fn day_activity(
+        &self,
+        start: i64,
+        end: i64,
+        now: i64,
+    ) -> Result<(Vec<TimelineSegment>, Vec<MediaSegment>), String> {
+        let tx = self
             .conn
-            .prepare(
-                // A segment still open reads as ending at its last observation, and only a row
-                // with no observation recorded falls back to the moment of the read. Resolving
-                // straight to that moment let a segment the daemon never closed grow without
-                // bound: five minutes left open by a crash reported as a full day, on its own
-                // day and on every day since, and an export stated that as fact. Recovery at
-                // the next daemon start writes the same value, so this only anticipates it.
-                "SELECT started_at, COALESCE(ended_at, last_seen_at, ?3), kind, app_class, title, workspace, monitor
-                 FROM activity_segments
-                 WHERE started_at < ?2 AND COALESCE(ended_at, last_seen_at, ?3) > ?1
-                 ORDER BY started_at ASC, id ASC",
-            )
-            .map_err(|error| format!("failed to prepare timeline query: {error}"))?;
-
-        let rows = stmt
-            .query_map(params![start, end, now], |row| {
-                let started_at = row.get::<_, i64>(0)?.max(start);
-                let ended_at = row.get::<_, i64>(1)?.min(end);
-                Ok(TimelineSegment {
-                    started_at,
-                    ended_at,
-                    snapshot: ActivitySnapshot {
-                        kind: ActivityKind::from_str(&row.get::<_, String>(2)?),
-                        app_class: row.get(3)?,
-                        title: row.get(4)?,
-                        workspace: row.get(5)?,
-                        monitor: row.get(6)?,
-                    },
-                })
-            })
-            .map_err(|error| format!("failed to read timeline rows: {error}"))?;
-
-        rows.collect::<Result<Vec<_>, _>>()
-            .map_err(|error| format!("failed to materialize timeline: {error}"))
+            .unchecked_transaction()
+            .map_err(|error| format!("failed to start the read transaction: {error}"))?;
+        let desktop = desktop_segments_in(&tx, start, end, now)?;
+        let media = media_segments_in(&tx, start, end, now)?;
+        Ok((desktop, media))
     }
 
     fn migrate(&mut self) -> Result<(), String> {
@@ -873,14 +974,15 @@ fn sqlite_artifact_paths(db_path: &Path) -> [PathBuf; 3] {
     ]
 }
 
-fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
+/// The open row in `lane`, or `None` if that lane has nothing open.
+fn load_open_segment(conn: &Connection, lane: &Lane) -> Result<Option<OpenSegment>, String> {
     conn.query_row(
         "SELECT id, started_at, kind, app_class, title, workspace, monitor
          FROM activity_segments
-         WHERE ended_at IS NULL
+         WHERE ended_at IS NULL AND lane = ?1
          ORDER BY id DESC
          LIMIT 1",
-        [],
+        params![lane.column_value()],
         |row| {
             Ok(OpenSegment {
                 id: row.get(0)?,
@@ -896,21 +998,23 @@ fn load_open_segment(conn: &Connection) -> Result<Option<OpenSegment>, String> {
         },
     )
     .optional()
-    .map_err(|error| format!("failed to load open segment: {error}"))
+    .map_err(|error| format!("failed to load the open segment in the lane: {error}"))
 }
 
-/// The latest instant the timeline already accounts for, or `None` on an empty store.
+/// The latest instant `lane` already accounts for, or `None` if that lane holds nothing.
 ///
 /// `COALESCE(ended_at, started_at)` deliberately reads the open segment as its start rather
 /// than its progress: a segment still running is the one a backdated transition is entitled
-/// to cut short, while everything already closed is settled.
-fn last_accounted_instant(conn: &Connection) -> Result<Option<i64>, String> {
+/// to cut short, while everything already closed is settled. Scoped to `lane` because a
+/// backdated desktop transition may not be floored by a media row's progress, and the reverse:
+/// each lane's own displaceable start is a fact about that lane alone.
+fn last_accounted_instant(conn: &Connection, lane: &Lane) -> Result<Option<i64>, String> {
     conn.query_row(
-        "SELECT MAX(COALESCE(ended_at, started_at)) FROM activity_segments",
-        [],
+        "SELECT MAX(COALESCE(ended_at, started_at)) FROM activity_segments WHERE lane = ?1",
+        params![lane.column_value()],
         |row| row.get::<_, Option<i64>>(0),
     )
-    .map_err(|error| format!("failed to read the last accounted instant: {error}"))
+    .map_err(|error| format!("failed to read the last accounted instant for the lane: {error}"))
 }
 
 /// The latest instant a powered-down gap may be backdated to, or `None` on an empty store.
@@ -919,6 +1023,11 @@ fn last_accounted_instant(conn: &Connection) -> Result<Option<i64>, String> {
 /// ended, so an open segment's progress marker is already time the daemon demonstrably observed.
 /// Flooring a gap at the marker would credit that time to an absence it is not part of, so the
 /// floor is the open segment's progress (`last_seen_at`) rather than its start.
+///
+/// Deliberately global rather than lane-scoped: a gap closes every lane, so its floor has to be
+/// evidence from every lane. Scoped by lane, a gap could be backdated behind an open media
+/// row's `last_seen_at` and then close that row before the last instant the daemon
+/// demonstrably observed it, truncating a media segment behind observed time.
 fn last_accounted_instant_for_gap(conn: &Connection) -> Result<Option<i64>, String> {
     conn.query_row(
         "SELECT MAX(COALESCE(ended_at, last_seen_at, started_at)) FROM activity_segments",
@@ -926,6 +1035,98 @@ fn last_accounted_instant_for_gap(conn: &Connection) -> Result<Option<i64>, Stri
         |row| row.get::<_, Option<i64>>(0),
     )
     .map_err(|error| format!("failed to read the last accounted instant for a gap: {error}"))
+}
+
+/// The stored desktop segments intersecting `[start, end)`.
+///
+/// A segment still open reads as ending at its last observation, and only a row with no
+/// observation recorded falls back to `now`. Resolving straight to `now` let a segment the
+/// daemon never closed grow without bound: five minutes left open by a crash reported as a
+/// full day, on its own day and on every day since, and an export stated that as fact.
+/// Recovery at the next daemon start writes the same value, so this only anticipates it.
+fn desktop_segments_in(
+    conn: &Connection,
+    start: i64,
+    end: i64,
+    now: i64,
+) -> Result<Vec<TimelineSegment>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT started_at, COALESCE(ended_at, last_seen_at, ?3), kind, app_class, title, workspace, monitor
+             FROM activity_segments
+             WHERE lane = 'desktop' AND started_at < ?2 AND COALESCE(ended_at, last_seen_at, ?3) > ?1
+             ORDER BY started_at ASC, id ASC",
+        )
+        .map_err(|error| format!("failed to prepare timeline query: {error}"))?;
+
+    let rows = stmt
+        .query_map(params![start, end, now], |row| {
+            let started_at = row.get::<_, i64>(0)?.max(start);
+            let ended_at = row.get::<_, i64>(1)?.min(end);
+            Ok(TimelineSegment {
+                started_at,
+                ended_at,
+                snapshot: ActivitySnapshot {
+                    kind: ActivityKind::from_str(&row.get::<_, String>(2)?),
+                    app_class: row.get(3)?,
+                    title: row.get(4)?,
+                    workspace: row.get(5)?,
+                    monitor: row.get(6)?,
+                },
+            })
+        })
+        .map_err(|error| format!("failed to read timeline rows: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to materialize timeline: {error}"))
+}
+
+/// The stored media segments intersecting `[start, end)`, resolving a day exactly as
+/// `desktop_segments_in` does: the same day clipping, and the same
+/// `COALESCE(ended_at, last_seen_at, now)` fallback for a row a crash left open.
+///
+/// Matched by `lane GLOB 'media:?*'` rather than `kind = 'media'`: the two agree by the
+/// schema's own CHECK constraint, and matching the lane keeps this query and
+/// `desktop_segments_in`'s `lane = 'desktop'` reading the same column for the same reason.
+///
+/// Nothing calls this yet outside `Store::day_activity`, itself uncalled until the reporting
+/// layer lands, so it is dead code in the binary until then.
+#[allow(dead_code)]
+fn media_segments_in(
+    conn: &Connection,
+    start: i64,
+    end: i64,
+    now: i64,
+) -> Result<Vec<MediaSegment>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT started_at, COALESCE(ended_at, last_seen_at, ?3), app_class, title, artist, album, item_url
+             FROM activity_segments
+             WHERE lane GLOB 'media:?*' AND started_at < ?2 AND COALESCE(ended_at, last_seen_at, ?3) > ?1
+             ORDER BY started_at ASC, id ASC",
+        )
+        .map_err(|error| format!("failed to prepare media timeline query: {error}"))?;
+
+    let rows = stmt
+        .query_map(params![start, end, now], |row| {
+            let started_at = row.get::<_, i64>(0)?.max(start);
+            let ended_at = row.get::<_, i64>(1)?.min(end);
+            Ok(MediaSegment {
+                started_at,
+                ended_at,
+                snapshot: MediaSnapshot {
+                    player: row.get(2)?,
+                    title: row.get(3)?,
+                    artist: row.get(4)?,
+                    album: row.get(5)?,
+                    item_url: row.get(6)?,
+                },
+            })
+        })
+        .map_err(|error| format!("failed to read media timeline rows: {error}"))?;
+
+    rows.collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to materialize media timeline: {error}"))
 }
 
 /// Insert one segment. `ended_at` is `None` for a segment still in progress, which is what
@@ -959,8 +1160,8 @@ fn insert_segment(
 
 #[cfg(test)]
 mod tests {
-    use super::Store;
-    use crate::activity::{ActivitySnapshot, TimelineSegment};
+    use super::{Lane, Store};
+    use crate::activity::{ActivitySnapshot, MediaSnapshot, TimelineSegment};
     use rusqlite::{Connection, params};
     use std::fs;
     use std::path::{Path, PathBuf};
@@ -992,7 +1193,7 @@ mod tests {
         store
             .record_observation(120, 120, &browser)
             .expect("change");
-        store.close_open(150).expect("close");
+        store.close_open(150, &Lane::Desktop).expect("close");
 
         let rows = store.timeline_between(0, 200, 200).expect("timeline");
         assert_eq!(
@@ -1027,7 +1228,7 @@ mod tests {
             .record_observation(1000, 1000, &active)
             .expect("insert");
         store
-            .close_open(900)
+            .close_open(900, &Lane::Desktop)
             .expect("close with stepped-back clock");
 
         let conn = rusqlite::Connection::open(dir.path().join("daytrace.db")).expect("readback");
@@ -1060,7 +1261,9 @@ mod tests {
         store
             .record_observation(1000, 1000, &active)
             .expect("insert");
-        store.close_open(1500).expect("ordinary close");
+        store
+            .close_open(1500, &Lane::Desktop)
+            .expect("ordinary close");
 
         let conn = rusqlite::Connection::open(dir.path().join("daytrace.db")).expect("readback");
         let ended_at: i64 = conn
@@ -1096,7 +1299,9 @@ mod tests {
         store
             .record_observation(800, 800, &idle)
             .expect("backdated start");
-        store.close_open(700).expect("stepped-back close");
+        store
+            .close_open(700, &Lane::Desktop)
+            .expect("stepped-back close");
 
         let conn = rusqlite::Connection::open(dir.path().join("daytrace.db")).expect("readback");
         let inverted: i64 = conn
@@ -1358,7 +1563,9 @@ mod tests {
                 )
                 .expect("record");
         }
-        store.close_open(first_at + count * 10).expect("close");
+        store
+            .close_open(first_at + count * 10, &Lane::Desktop)
+            .expect("close");
     }
 
     /// Every stored title, in insertion order, for a `forget` test that has to see which rows
@@ -1428,11 +1635,15 @@ mod tests {
         store
             .record_observation(100, 100, &outside)
             .expect("old segment");
-        store.close_open(200).expect("close the old segment");
+        store
+            .close_open(200, &Lane::Desktop)
+            .expect("close the old segment");
         store
             .record_observation(1_000, 1_000, &inside)
             .expect("recent segment");
-        store.close_open(1_100).expect("close the recent segment");
+        store
+            .close_open(1_100, &Lane::Desktop)
+            .expect("close the recent segment");
 
         let pruned = store
             .prune_segments_ended_before(500, 2_000)
@@ -1452,7 +1663,7 @@ mod tests {
         store
             .record_observation(400, 400, &window_snapshot("across-the-boundary"))
             .expect("record");
-        store.close_open(600).expect("close");
+        store.close_open(600, &Lane::Desktop).expect("close");
 
         let pruned = store
             .prune_segments_ended_before(500, 1_000)
@@ -1526,11 +1737,15 @@ mod tests {
         store
             .record_observation(100, 100, &window_snapshot("outside-the-window"))
             .expect("old segment");
-        store.close_open(200).expect("close the old segment");
+        store
+            .close_open(200, &Lane::Desktop)
+            .expect("close the old segment");
         store
             .record_observation(1_000, 1_000, &window_snapshot("inside-the-window"))
             .expect("recent segment");
-        store.close_open(1_100).expect("close the recent segment");
+        store
+            .close_open(1_100, &Lane::Desktop)
+            .expect("close the recent segment");
 
         let removable = store
             .count_segments_ended_before(500, 2_000)
@@ -3073,6 +3288,138 @@ mod tests {
     }
 
     #[test]
+    fn an_open_store_is_always_in_wal_mode() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        let store = Store::open(&db, None).expect("open");
+
+        // Read back rather than trusting the conversion: a retry that gave up would otherwise
+        // return a perfectly usable store sitting in rollback mode, and nothing would say so.
+        assert_eq!(
+            super::journal_mode(&store.conn).expect("read the journal mode"),
+            "wal"
+        );
+    }
+
+    #[test]
+    fn a_conversion_that_never_gets_the_lock_says_so_instead_of_downgrading() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        let writer = Connection::open(&db).expect("writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take the reserved lock");
+
+        let conn = Connection::open(&db).expect("connection");
+        let outcome = super::enable_wal(&conn, Duration::from_millis(100));
+
+        // Giving up is allowed; giving up quietly is not. A caller that gets `Ok` here goes on
+        // to use a database still in rollback mode, and nothing anywhere says the guarantee the
+        // rest of this file is written against no longer holds.
+        assert!(
+            outcome
+                .as_ref()
+                .is_err_and(|message| message.starts_with("failed to enable WAL")),
+            "exhausting the budget must be reported: {outcome:?}"
+        );
+        assert_ne!(
+            super::journal_mode(&conn).expect("read the journal mode"),
+            "wal"
+        );
+        writer.execute_batch("ROLLBACK").expect("release the lock");
+    }
+
+    #[test]
+    fn a_contended_conversion_waits_for_the_lock_instead_of_failing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        seed_current_schema(&db);
+
+        // A writer holding the rollback-mode file denies the exclusive lock the conversion
+        // needs, then lets go. The bare pragma this replaced does not wait: it fails the moment
+        // the lock is refused, because SQLite runs no busy handler for a journal-mode change.
+        // Releasing after a beat is what makes the test decide between waiting and failing
+        // rather than between a fast machine and a slow one.
+        let holder_db = db.clone();
+        let (holding, held) = std::sync::mpsc::channel();
+        let holder = std::thread::spawn(move || {
+            let writer = Connection::open(&holder_db).expect("writer");
+            writer
+                .execute_batch("BEGIN IMMEDIATE")
+                .expect("take the reserved lock");
+            holding.send(()).expect("announce the lock");
+            std::thread::sleep(Duration::from_millis(250));
+            writer.execute_batch("ROLLBACK").expect("release the lock");
+        });
+
+        held.recv().expect("wait until the lock is actually held");
+        let store = Store::open(&db, None).expect("open while the file is held, then released");
+        assert_eq!(
+            super::journal_mode(&store.conn).expect("read the journal mode"),
+            "wal"
+        );
+        holder.join().expect("holder");
+    }
+
+    #[test]
+    fn many_connections_converting_the_journal_at_once_all_succeed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        // Seeded through a plain connection, so the file is in rollback mode and every thread
+        // below is one of the connections trying to convert it. That is the only window in
+        // which the conversion can be contended at all.
+        seed_current_schema(&db);
+
+        let threads = 8;
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(threads));
+        let handles: Vec<_> = (0..threads)
+            .map(|_| {
+                let db = db.clone();
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    Store::open(&db, None).map(|store| {
+                        super::journal_mode(&store.conn).expect("read the journal mode")
+                    })
+                })
+            })
+            .collect();
+
+        for handle in handles {
+            let mode = handle.join().expect("thread").expect("open");
+            assert_eq!(mode, "wal");
+        }
+    }
+
+    #[test]
+    fn opening_an_established_wal_database_needs_no_lock_of_its_own() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let first = Store::open(&db, None).expect("first open");
+
+        // Held for the whole call, and never released: setting the mode a database is already
+        // in takes no lock, so the second open must come back anyway. This is what says the
+        // conversion has no special case to skip: if it needed the lock, this would spend the
+        // whole retry budget and fail.
+        let writer = Connection::open(&db).expect("writer");
+        writer
+            .execute_batch("BEGIN IMMEDIATE")
+            .expect("take the reserved lock");
+
+        let second = Store::open(&db, None).expect("second open while the file is held");
+        assert_eq!(
+            super::journal_mode(&second.conn).expect("read the journal mode"),
+            "wal"
+        );
+        writer.execute_batch("ROLLBACK").expect("release the lock");
+        drop(first);
+    }
+
+    #[test]
     fn two_connections_migrating_a_pre_media_database_at_once_both_succeed() {
         let dir = tempfile::tempdir().expect("tempdir");
         let db = dir.path().join("daytrace.db");
@@ -3367,5 +3714,594 @@ mod tests {
             "the lane index must stay a partial unique index: {}",
             lane.1
         );
+    }
+
+    /// Insert an open media row directly, the way nothing in production can yet: nothing
+    /// writes one, so every media fixture below goes straight through the connection.
+    fn insert_open_media_row(
+        conn: &Connection,
+        started_at: i64,
+        last_seen_at: Option<i64>,
+        bus_name: &str,
+    ) {
+        conn.execute(
+            &format!(
+                "INSERT INTO activity_segments
+                    (started_at, last_seen_at, kind, app_class, title, lane)
+                 VALUES ({started_at}, {}, 'media', 'spotify', 'Track', 'media:{bus_name}')",
+                last_seen_at
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "NULL".to_string()),
+            ),
+            [],
+        )
+        .expect("insert an open media row");
+    }
+
+    #[test]
+    fn a_players_lane_is_built_from_its_bus_name_in_the_one_place_that_formats_it() {
+        assert_eq!(Lane::Desktop.column_value(), "desktop");
+        assert_eq!(
+            Lane::Media("org.mpris.MediaPlayer2.spotify".to_string()).column_value(),
+            "media:org.mpris.MediaPlayer2.spotify"
+        );
+        assert_eq!(
+            Lane::Media("org.mpris.MediaPlayer2.brave.instance834645".to_string()).column_value(),
+            "media:org.mpris.MediaPlayer2.brave.instance834645",
+            "two instances of the same player must not collide: the lane is built from the \
+             full bus name, not the normalized key"
+        );
+    }
+
+    // CRITERION 1: closing one lane leaves every other lane's open row untouched, in both
+    // directions: a desktop close and a media close.
+
+    #[test]
+    fn closing_the_desktop_lane_leaves_every_media_lane_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("insert desktop row");
+        insert_open_media_row(&store.conn, 100, None, "spotify");
+        insert_open_media_row(&store.conn, 100, None, "brave");
+
+        store
+            .close_open(200, &Lane::Desktop)
+            .expect("close the desktop lane");
+
+        let desktop_ended_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE lane = 'desktop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("desktop row");
+        let open_media_lanes: i64 = store
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM activity_segments WHERE kind = 'media' AND ended_at IS NULL",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count open media rows");
+        assert_eq!(desktop_ended_at, 200, "the desktop lane must close");
+        assert_eq!(
+            open_media_lanes, 2,
+            "closing the desktop lane must leave every media lane open"
+        );
+    }
+
+    #[test]
+    fn closing_one_media_lane_leaves_the_desktop_lane_and_the_other_media_lane_open() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("insert desktop row");
+        insert_open_media_row(&store.conn, 100, None, "spotify");
+        insert_open_media_row(&store.conn, 100, None, "brave");
+
+        store
+            .close_open(200, &Lane::Media("spotify".to_string()))
+            .expect("close only the spotify lane");
+
+        let spotify_ended_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE lane = 'media:spotify'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("spotify row");
+        let brave_ended_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE lane = 'media:brave'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("brave row");
+        let desktop_ended_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE lane = 'desktop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("desktop row");
+        assert_eq!(
+            spotify_ended_at,
+            Some(200),
+            "the named media lane must close"
+        );
+        assert_eq!(
+            brave_ended_at, None,
+            "closing one media lane must leave a second media lane open"
+        );
+        assert_eq!(
+            desktop_ended_at, None,
+            "closing a media lane must leave the desktop lane open"
+        );
+    }
+
+    // CRITERION 2: a stored `kind = 'media'` row decodes as media, correctly, and never
+    // reaches the desktop path's unknown-kind fallback.
+
+    #[test]
+    fn a_stored_media_row_decodes_as_media_and_never_through_the_desktop_path() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, artist, album, item_url, lane)
+                 VALUES (100, 200, 'media', 'spotify', 'A Fictional Title', 'A Fictional Artist',
+                         'A Fictional Album', 'https://open.spotify.com/track/1',
+                         'media:org.mpris.MediaPlayer2.spotify')",
+                [],
+            )
+            .expect("insert media row");
+
+        let desktop = store
+            .timeline_between(0, 1_000, 1_000)
+            .expect("desktop read");
+        assert!(
+            desktop.is_empty(),
+            "a media row must never reach the desktop read, which is the only path that could \
+             decode it as ActivityKind::Unknown: {desktop:?}"
+        );
+
+        let (_, media) = store.day_activity(0, 1_000, 1_000).expect("day activity");
+        assert_eq!(media.len(), 1);
+        assert_eq!(
+            media[0].snapshot,
+            MediaSnapshot {
+                player: Some("spotify".to_string()),
+                title: Some("A Fictional Title".to_string()),
+                artist: Some("A Fictional Artist".to_string()),
+                album: Some("A Fictional Album".to_string()),
+                item_url: Some("https://open.spotify.com/track/1".to_string()),
+            },
+            "the media read must decode every stored field, not merely detect the row"
+        );
+    }
+
+    // CRITERION 3: an open media row does not move the floor a backdated desktop observation
+    // clamps to, and the reverse.
+
+    #[test]
+    fn a_backdated_desktop_observation_is_not_floored_by_an_open_media_rows_start() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("first-window"))
+            .expect("insert");
+        // An open media row started well after the desktop floor: a lane-scoped floor must not
+        // reach it, where an unscoped `MAX` over every row would.
+        insert_open_media_row(&store.conn, 5_000, None, "spotify");
+
+        store
+            .record_observation(50, 50, &window_snapshot("second-window"))
+            .expect("backdated observation");
+
+        let first_ended_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE app_class = 'first-window'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the displaced segment back");
+        assert_eq!(
+            first_ended_at, 100,
+            "the backdated observation must floor at the desktop segment's own start, not at \
+             the open media row's later start"
+        );
+    }
+
+    #[test]
+    fn last_accounted_instant_for_a_media_lane_ignores_the_desktop_floor() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let store = Store::open(&db, None).expect("store");
+
+        // A closed desktop row far ahead of the media lane's own boundary.
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments (started_at, ended_at, kind, app_class, title)
+                 VALUES (100, 9_000, 'window', 'app', 'title')",
+                [],
+            )
+            .expect("insert desktop row");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (200, 300, 'media', 'spotify', 'Track', 'media:spotify')",
+                [],
+            )
+            .expect("insert media row");
+
+        let floor = super::last_accounted_instant(&store.conn, &Lane::Media("spotify".to_string()))
+            .expect("read the media lane's floor");
+        assert_eq!(
+            floor,
+            Some(300),
+            "the media lane's floor must come from its own row, not the desktop row ending at \
+             9000"
+        );
+    }
+
+    // CRITERION 4: the gap floor stays global: a gap is not backdated behind an open media
+    // row's progress marker.
+
+    #[test]
+    fn the_gap_floor_is_not_backdated_behind_an_open_media_rows_progress_marker() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("insert");
+        // A media row observed later than any desktop row.
+        insert_open_media_row(&store.conn, 100, Some(4_000), "spotify");
+
+        store
+            .record_powered_down_gap(200, 9_000)
+            .expect("record the gap");
+
+        let gap_started_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT started_at FROM activity_segments WHERE kind = 'suspended'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read the gap back");
+        assert_eq!(
+            gap_started_at, 4_000,
+            "the gap must floor at the media row's own progress marker, not backdate behind it"
+        );
+    }
+
+    // CRITERION 5: a powered-down gap closes every lane at the same instant; idle closes only
+    // the desktop lane.
+
+    #[test]
+    fn a_powered_down_gap_closes_every_lane_at_the_same_instant() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("insert");
+        insert_open_media_row(&store.conn, 100, None, "spotify");
+
+        store
+            .record_powered_down_gap(500, 9_000)
+            .expect("record the gap");
+
+        let desktop_ended_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'window'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("desktop row");
+        let media_ended_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'media'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("media row");
+        assert_eq!(
+            desktop_ended_at, media_ended_at,
+            "a powered-down gap must close every lane at the same instant"
+        );
+        assert_eq!(desktop_ended_at, 500);
+    }
+
+    #[test]
+    fn idle_closes_the_desktop_lane_and_leaves_an_open_media_segment_untouched() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("insert");
+        insert_open_media_row(&store.conn, 100, None, "spotify");
+
+        // Input stopping while audio continues is exactly what listening without touching the
+        // keyboard looks like, which is the case this layer exists to tell apart.
+        store
+            .record_observation(200, 200, &ActivitySnapshot::idle())
+            .expect("idle");
+
+        let media_ended_at: Option<i64> = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'media'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("media row");
+        assert_eq!(
+            media_ended_at, None,
+            "idle must leave an open media segment untouched"
+        );
+        let open_desktop_kind: String = store
+            .conn
+            .query_row(
+                "SELECT kind FROM activity_segments WHERE ended_at IS NULL AND lane = 'desktop'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("open desktop row");
+        assert_eq!(open_desktop_kind, "idle");
+    }
+
+    // CRITERION 6: crash recovery closes each lane's open row at its own `last_seen_at`. This
+    // holds by construction, since `close_stale_open_segments` is already a per-row update with
+    // no lane filter; the test is a regression guard against a later rewrite that closes every
+    // lane at one shared instant, and against this bead scoping it by lane by mistake.
+
+    #[test]
+    fn crash_recovery_closes_each_lanes_open_row_at_its_own_last_seen_at() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("terminal"))
+            .expect("insert");
+        store
+            .record_observation(300, 300, &window_snapshot("terminal"))
+            .expect("heartbeat");
+        insert_open_media_row(&store.conn, 100, Some(250), "spotify");
+
+        store
+            .close_stale_open_segments()
+            .expect("recover every lane");
+
+        let desktop_ended_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'window'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("desktop row");
+        let media_ended_at: i64 = store
+            .conn
+            .query_row(
+                "SELECT ended_at FROM activity_segments WHERE kind = 'media'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("media row");
+        assert_eq!(
+            desktop_ended_at, 300,
+            "the desktop row must close at its own last_seen_at"
+        );
+        assert_eq!(
+            media_ended_at, 250,
+            "the media row must close at its own last_seen_at, not the desktop lane's"
+        );
+    }
+
+    // CRITERION 7: the desktop read returns no media row and the media read returns no
+    // desktop row.
+
+    #[test]
+    fn the_desktop_read_and_the_media_read_never_cross_lanes() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .record_observation(100, 100, &window_snapshot("desktop-app"))
+            .expect("insert desktop row");
+        store
+            .close_open(200, &Lane::Desktop)
+            .expect("close desktop");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (100, 200, 'media', 'spotify', 'Track', 'media:spotify')",
+                [],
+            )
+            .expect("insert media row");
+
+        let (desktop, media) = store.day_activity(0, 1_000, 1_000).expect("day activity");
+        assert_eq!(
+            desktop.len(),
+            1,
+            "the desktop read must not include the media row"
+        );
+        assert_eq!(
+            desktop[0].snapshot.app_class.as_deref(),
+            Some("desktop-app")
+        );
+        assert_eq!(
+            media.len(),
+            1,
+            "the media read must not include the desktop row"
+        );
+        assert_eq!(media[0].snapshot.player.as_deref(), Some("spotify"));
+    }
+
+    // CRITERION 8: the desktop read and the media read share ONE SQLite snapshot.
+
+    #[test]
+    fn the_desktop_read_and_the_media_read_share_one_snapshot() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = dir.path().join("daytrace.db");
+        let store = Store::open(&db, None).expect("store");
+
+        // A second connection to read through, so a commit made on it is visible to every new
+        // read but not to a transaction already holding an earlier snapshot.
+        let reader = Connection::open(&db).expect("reader connection");
+        let tx = reader
+            .unchecked_transaction()
+            .expect("begin the read transaction");
+
+        // The first statement in a DEFERRED transaction is what fixes its snapshot, so the
+        // desktop read has to run before the write below for the guarantee under test to mean
+        // anything.
+        let desktop_before =
+            super::desktop_segments_in(&tx, 0, 1_000, 1_000).expect("desktop read");
+        assert!(desktop_before.is_empty());
+
+        insert_open_media_row(&store.conn, 100, None, "spotify");
+
+        let media_through_the_same_tx =
+            super::media_segments_in(&tx, 0, 1_000, 1_000).expect("media read through the same tx");
+        assert!(
+            media_through_the_same_tx.is_empty(),
+            "a read through the earlier snapshot must not see a row committed after the first \
+             read: {media_through_the_same_tx:?}"
+        );
+
+        drop(tx);
+        let media_after = super::media_segments_in(&reader, 0, 1_000, 1_000).expect("fresh read");
+        assert_eq!(
+            media_after.len(),
+            1,
+            "a fresh read must see the row the earlier transaction could not"
+        );
+    }
+
+    // CRITERION 9: the media read resolves a day exactly as the desktop read does: an open
+    // row reads as ending at its `last_seen_at`, clipped to the day boundary identically.
+
+    #[test]
+    fn the_media_read_resolves_an_open_row_and_a_day_boundary_exactly_as_the_desktop_read_does() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        // Both rows start before the day boundary, stay open, and were last observed at the
+        // same instant after it.
+        store
+            .record_observation(-100, -100, &window_snapshot("late-night-app"))
+            .expect("insert");
+        store
+            .record_observation(-100, 400, &window_snapshot("late-night-app"))
+            .expect("heartbeat past the boundary");
+        insert_open_media_row(&store.conn, -100, Some(400), "spotify");
+
+        let (desktop, media) = store.day_activity(0, 1_000, 10_000).expect("day activity");
+        assert_eq!(desktop.len(), 1);
+        assert_eq!(
+            (desktop[0].started_at, desktop[0].ended_at),
+            (0, 400),
+            "the desktop row must clip to the day boundary and resolve its open end at \
+             last_seen_at rather than at now"
+        );
+        assert_eq!(media.len(), 1);
+        assert_eq!(
+            (media[0].started_at, media[0].ended_at),
+            (0, 400),
+            "the media read must resolve the same open row and the same day boundary \
+             identically to the desktop read"
+        );
+    }
+
+    // CRITERION 10: a media row constructed directly through the store appears in neither
+    // `today` nor `export`, both of which read through `timeline_between`.
+
+    #[test]
+    fn a_media_row_never_appears_in_the_desktop_timeline_that_today_and_export_read() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (100, 200, 'media', 'spotify', 'Track', 'media:spotify')",
+                [],
+            )
+            .expect("insert media row");
+        store
+            .record_observation(300, 300, &window_snapshot("desktop-app"))
+            .expect("insert desktop row");
+        store.close_open(400, &Lane::Desktop).expect("close");
+
+        let rows = store.timeline_between(0, 1_000, 1_000).expect("timeline");
+        assert_eq!(
+            rows.len(),
+            1,
+            "the media row must not appear in the read today and export share: {rows:?}"
+        );
+        assert_eq!(rows[0].snapshot.app_class.as_deref(), Some("desktop-app"));
+    }
+
+    // CRITERION 11: prune deletes a media row outside the retention window and keeps one
+    // inside it, through the same predicate desktop rows already use.
+
+    #[test]
+    fn pruning_deletes_a_media_row_outside_the_window_and_keeps_one_inside_it() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (0, 100, 'media', 'spotify', 'Old Track', 'media:spotify')",
+                [],
+            )
+            .expect("insert an old media row");
+        store
+            .conn
+            .execute(
+                "INSERT INTO activity_segments
+                    (started_at, ended_at, kind, app_class, title, lane)
+                 VALUES (1_000, 1_100, 'media', 'spotify', 'Recent Track', 'media:spotify')",
+                [],
+            )
+            .expect("insert a recent media row");
+
+        let pruned = store
+            .prune_segments_ended_before(500, 2_000)
+            .expect("prune");
+
+        assert_eq!(pruned.deleted, 1);
+        let remaining_title: String = store
+            .conn
+            .query_row("SELECT title FROM activity_segments", [], |row| row.get(0))
+            .expect("remaining row");
+        assert_eq!(remaining_title, "Recent Track");
     }
 }
