@@ -8,7 +8,9 @@ use crate::media::{BusctlClient, MediaSource, PlayerOutcome, PlayingMedia};
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SessionClock, SystemSessionClock};
 use crate::storage::{CaptureStore, Lane, Pruned, Store};
-use crate::timeline::{day_bounds, local_date, render_narrative_day, retention_cutoff, unix_now};
+use crate::timeline::{
+    day_bounds, local_date, render_day, render_narrative_day, retention_cutoff, unix_now,
+};
 use chrono::NaiveDate;
 use std::env;
 use std::fmt;
@@ -29,7 +31,7 @@ daytrace
 
 Usage:
   daytrace start
-  daytrace today [--date YYYY-MM-DD]
+  daytrace today [--raw] [--date YYYY-MM-DD]
   daytrace export [--date YYYY-MM-DD]
   daytrace prune [--dry-run]
   daytrace forget --matching <text> [--dry-run]
@@ -113,9 +115,9 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, AppError> {
         // The arguments are read before the environment, so a mistyped flag is reported as
         // itself rather than as whatever the configuration complains about first.
         [arg, rest @ ..] if arg == "today" => {
-            let requested = requested_day(rest)?;
-            let (date, segments, media) = stored_day(&Config::from_env()?, requested)?;
-            render_narrative_day(date, &segments, &media).map_err(AppError::from)
+            let request = today_request(rest)?;
+            let (date, segments, media) = stored_day(&Config::from_env()?, request.date)?;
+            render_today(&request, date, &segments, &media).map_err(AppError::from)
         }
         [arg, rest @ ..] if arg == "export" => {
             let requested = requested_day(rest)?;
@@ -170,6 +172,55 @@ fn requested_day(args: &[String]) -> Result<Option<NaiveDate>, AppError> {
             "unexpected arguments: {}",
             args.join(" ")
         ))),
+    }
+}
+
+/// What `today`'s arguments named: whether the pre-aggregation report was asked for, and which
+/// day.
+#[derive(Debug, Eq, PartialEq)]
+struct TodayRequest {
+    raw: bool,
+    date: Option<NaiveDate>,
+}
+
+/// Parse `today`'s arguments: an optional `--raw` in either position around `--date`, itself
+/// still accepted in both its spellings.
+///
+/// `--raw` is pulled out of the argument list before the rest reaches `requested_day`, rather
+/// than folded into that function's own match arms, so `--date`'s two spellings and its
+/// rejections stay defined in exactly one place, the one `export` already reaches by calling
+/// `requested_day` directly. `export` never sees `--raw` stripped out this way, which is why it
+/// already rejects the flag as an unexpected argument without needing a change of its own.
+fn today_request(args: &[String]) -> Result<TodayRequest, AppError> {
+    let mut raw = false;
+    let mut rest: Vec<String> = Vec::with_capacity(args.len());
+    for arg in args {
+        if !raw && arg == "--raw" {
+            raw = true;
+        } else {
+            rest.push(arg.clone());
+        }
+    }
+    let date = requested_day(&rest)?;
+    Ok(TodayRequest { raw, date })
+}
+
+/// `today`'s own output: the narrative by default, or `render_day`'s pre-aggregation report,
+/// unchanged since before that narrative existed, when `--raw` asked for it.
+///
+/// Pulled out of the dispatch arm so the fixture-driven test below can call it directly against
+/// one store's own segments and media, rather than having to go through `Config::from_env` and
+/// a database path read from the process environment to reach it.
+fn render_today(
+    request: &TodayRequest,
+    date: NaiveDate,
+    segments: &[TimelineSegment],
+    media: &[MediaSegment],
+) -> Result<String, String> {
+    if request.raw {
+        render_day(date, segments, media)
+    } else {
+        render_narrative_day(date, segments, media)
     }
 }
 
@@ -939,10 +990,11 @@ fn segments(count: u64) -> String {
 mod tests {
     use super::{
         AppError, CaptureWakeState, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, PendingGaps,
-        RateLimitedFailureLog, WakeSources, capture_media_once, capture_once, close_capture_lanes,
-        flush_pending_gaps, forget_request, handle_media_wake, next_poll_deadline,
-        prune_is_dry_run, render_forget, render_forget_preview, render_preview, render_prune,
-        requested_day, run, run_capture_wake, sanitize_media_outcome,
+        RateLimitedFailureLog, TodayRequest, WakeSources, capture_media_once, capture_once,
+        close_capture_lanes, day_bounds, flush_pending_gaps, forget_request, handle_media_wake,
+        next_poll_deadline, prune_is_dry_run, render_day, render_forget, render_forget_preview,
+        render_preview, render_prune, render_today, requested_day, run, run_capture_wake,
+        sanitize_media_outcome, today_request,
     };
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::{Blacklist, Config};
@@ -1818,6 +1870,152 @@ mod tests {
             .expect_err("should be rejected")
             .to_string();
         assert_eq!(error, "unexpected argument: yesterday");
+    }
+
+    #[test]
+    fn no_today_argument_asks_for_the_aggregated_default_day() {
+        let request = today_request(&[]).expect("no argument");
+        assert!(!request.raw, "bare today must not be the raw report");
+        assert_eq!(request.date, None);
+    }
+
+    #[test]
+    fn raw_alone_asks_for_the_raw_report_and_the_default_day() {
+        let request = today_request(&["--raw".to_string()]).expect("--raw alone");
+        assert!(request.raw);
+        assert_eq!(request.date, None);
+    }
+
+    #[test]
+    fn raw_combines_with_date_in_both_spellings_and_either_order() {
+        let expected = NaiveDate::from_ymd_opt(2026, 7, 20);
+
+        for argument in [
+            vec![
+                "--raw".to_string(),
+                "--date".to_string(),
+                "2026-07-20".to_string(),
+            ],
+            vec![
+                "--date".to_string(),
+                "2026-07-20".to_string(),
+                "--raw".to_string(),
+            ],
+            vec!["--raw".to_string(), "--date=2026-07-20".to_string()],
+            vec!["--date=2026-07-20".to_string(), "--raw".to_string()],
+        ] {
+            let request = today_request(&argument).unwrap_or_else(|error| {
+                panic!("{argument:?} should have been accepted, got {error}")
+            });
+            assert!(request.raw, "failed for {argument:?}");
+            assert_eq!(request.date, expected, "failed for {argument:?}");
+        }
+    }
+
+    #[test]
+    fn an_unknown_flag_on_today_is_still_a_usage_error_with_raw_in_the_mix() {
+        let error = today_request(&["--raw".to_string(), "--bogus".to_string()])
+            .expect_err("should be rejected")
+            .to_string();
+        assert_eq!(error, "unexpected argument: --bogus");
+    }
+
+    #[test]
+    fn raw_on_export_is_a_usage_error() {
+        // export was never aggregated, so the flag has nothing to opt out of; it reaches
+        // `requested_day` unstripped and is rejected exactly as any other unknown argument.
+        let error = requested_day(&["--raw".to_string()])
+            .expect_err("should be rejected")
+            .to_string();
+        assert_eq!(error, "unexpected argument: --raw");
+    }
+
+    /// The golden test the bead asks for: `--raw`'s output has to equal a real call to
+    /// `render_day`, not a hand-typed expectation, for segments and media read back through one
+    /// store. The fixture folds a foreign focus shorter than five seconds into the block around
+    /// it and carries a media segment, so the raw and aggregated reports actually disagree on
+    /// this day rather than passing by coincidence on a day too plain to tell them apart.
+    #[test]
+    fn raw_reproduces_render_days_own_output_for_a_day_read_back_through_one_store() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let day = NaiveDate::from_ymd_opt(2026, 7, 20).expect("valid date");
+        let (start, end) = day_bounds(day).expect("bounds");
+
+        store
+            .record_observation(
+                start,
+                start + 600,
+                &ActivitySnapshot::window(
+                    Some("kitty".to_string()),
+                    Some("editing".to_string()),
+                    None,
+                    None,
+                ),
+            )
+            .expect("seed kitty");
+        store
+            .record_observation(
+                start + 600,
+                start + 603,
+                &ActivitySnapshot::window(
+                    Some("rofi".to_string()),
+                    Some("quick check".to_string()),
+                    None,
+                    None,
+                ),
+            )
+            .expect("seed the foreign focus");
+        store
+            .record_observation(
+                start + 603,
+                start + 1_200,
+                &ActivitySnapshot::window(
+                    Some("kitty".to_string()),
+                    Some("editing".to_string()),
+                    None,
+                    None,
+                ),
+            )
+            .expect("seed kitty again");
+        store
+            .close_open(start + 1_200, &Lane::Desktop)
+            .expect("close the desktop lane");
+        store
+            .record_media_poll(start + 100, &[playing("bus-spotify", "Track title")])
+            .expect("seed media");
+        store
+            .close_open_media_lanes_at_last_seen()
+            .expect("close the media lane");
+
+        let (segments, media) = store
+            .day_activity(start, end, start + 1_200)
+            .expect("day activity");
+        let expected = render_day(day, &segments, &media).expect("render_day");
+
+        let raw = TodayRequest {
+            raw: true,
+            date: Some(day),
+        };
+        let actual = render_today(&raw, day, &segments, &media).expect("render_today raw");
+        assert_eq!(
+            actual, expected,
+            "the raw flag must reach render_day untouched"
+        );
+
+        // The fixture has to actually exercise the difference, or the assertion above would
+        // still pass if --raw silently fell back to the narrative.
+        let aggregated = TodayRequest {
+            raw: false,
+            date: Some(day),
+        };
+        let narrative =
+            render_today(&aggregated, day, &segments, &media).expect("render_today aggregated");
+        assert_ne!(
+            actual, narrative,
+            "the fixture must exercise a day the two renderers disagree on, or this test cannot \
+             tell --raw apart from the aggregated default"
+        );
     }
 
     #[test]

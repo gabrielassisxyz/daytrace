@@ -172,11 +172,9 @@ fn application_totals_from_blocks(blocks: &[Block]) -> Vec<ApplicationTotal> {
 /// twice over, and a total that summed both would claim more than the day held. Reconciling
 /// them into one narrative is the aggregation layer's job, not this one's.
 ///
-/// `today` renders `render_narrative_day` instead as of the aggregation layer; this stays for
-/// `today --raw` to print byte for byte, which is a later bead in that layer, and for the tests
-/// that check the aggregated view against it. `#[allow(dead_code)]` because that flag does not
-/// exist yet, so nothing in the production binary reaches this until it does.
-#[allow(dead_code)]
+/// `today` renders `render_narrative_day` by default as of the aggregation layer; `today --raw`
+/// reaches this one instead, printing byte for byte what `today` printed before that layer
+/// existed, and the tests that check the aggregated view against it call it directly too.
 pub fn render_day(
     date: NaiveDate,
     segments: &[TimelineSegment],
