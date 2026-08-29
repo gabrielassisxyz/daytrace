@@ -267,8 +267,11 @@ fn background_media_for(block: &Block, media: &[MediaSegment]) -> Option<Backgro
     }
 
     // Longest overlap first, tie broken by player name so the same day reads the same way
-    // twice, the same rule `.3` already applies when two titles tie on duration.
-    overlap_by_player.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    // twice, through the one rule every name comparison in the report uses.
+    overlap_by_player.sort_by(|a, b| {
+        b.1.cmp(&a.1)
+            .then_with(|| crate::timeline::tie_break_by_name(&a.0, &b.0))
+    });
     let (player, _) = overlap_by_player.remove(0);
     Some(BackgroundMedia {
         player,
@@ -296,7 +299,10 @@ impl Block {
             }
         }
 
-        durations.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+        durations.sort_by(|a, b| {
+            b.1.cmp(&a.1)
+                .then_with(|| crate::timeline::tie_break_by_name(&a.0, &b.0))
+        });
 
         if durations.len() <= TITLE_PART_CAP {
             return durations
@@ -696,8 +702,11 @@ mod tests {
 
     #[test]
     fn a_duration_tie_between_titles_breaks_by_title_text() {
+        // "Zulu" capitalised on purpose: window titles arrive in whichever case the page or
+        // application chose, and raw byte order would sort it above "alpha" as an unrelated
+        // group instead of folding it into the same alphabetical list.
         let segments = vec![
-            window_segment(0, 10, "firefox", "zulu"),
+            window_segment(0, 10, "firefox", "Zulu"),
             window_segment(10, 20, "firefox", "alpha"),
         ];
         let block = &build_narrative(&segments).blocks[0];
@@ -712,7 +721,35 @@ mod tests {
                     duration_seconds: 10,
                 },
                 TitlePart::Title {
-                    title: "zulu".to_string(),
+                    title: "Zulu".to_string(),
+                    duration_seconds: 10,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_duration_tie_between_titles_differing_only_in_case_orders_the_same_way_totals_do() {
+        // `Inbox` and `inbox` fold to the same key, so the fold alone leaves them tied on
+        // duration too: this exercises the fallback to raw bytes, the same rule the
+        // per-application totals use for two applications differing only in case.
+        let segments = vec![
+            window_segment(0, 10, "firefox", "inbox"),
+            window_segment(10, 20, "firefox", "Inbox"),
+        ];
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(
+            parts,
+            vec![
+                TitlePart::Title {
+                    title: "Inbox".to_string(),
+                    duration_seconds: 10,
+                },
+                TitlePart::Title {
+                    title: "inbox".to_string(),
                     duration_seconds: 10,
                 },
             ]
@@ -885,6 +922,29 @@ mod tests {
             Some(BackgroundMedia {
                 player: "spotify".to_string(),
                 other_player_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn two_players_tying_on_overlap_break_it_the_way_every_other_name_tie_breaks() {
+        // The pair is chosen so the two rules disagree, which is the only way this test can fail:
+        // raw byte order puts `Zoom` first because every capital sorts below every lowercase
+        // letter, while folding the case first puts `brave` there. A pair the two rules agree on
+        // would pass whichever comparator ran.
+        let mut narrative = build_narrative(&one_day_block());
+        let media = vec![
+            media_segment(0, 90, Some("Zoom")),
+            media_segment(0, 90, Some("brave")),
+        ];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "brave".to_string(),
+                other_player_count: 1,
             })
         );
     }
