@@ -114,9 +114,10 @@ Useful environment overrides:
 ```sh
 daytrace today
 daytrace today --date 2026-07-20
+daytrace today --raw --date 2026-07-20
 ```
 
-`daytrace today` groups the day's desktop activity into blocks and prints them in order, then totals the day by application from those blocks, so the report answers both what happened in order and what consumed the day. A block is a run of consecutive desktop activity that stayed on one application; a foreign focus shorter than five seconds is folded into the block around it rather than reported as an interruption, so a quick alt-tab does not break a forty-minute block of writing into three rows. A block with more than one distinct title lists its five longest beneath it, longest first, with anything past the fifth rolled into one remainder line. A block line names the application and, where a media player overlapped it for at least a minute, what was playing behind it; the workspace and monitor a raw row carries are not shown, since a block can span several of each, and they are still in `daytrace export`:
+`daytrace today` groups the day's desktop activity into blocks and prints them in order, then totals the day by application from those blocks, so the report answers both what happened in order and what consumed the day. A block is a run of consecutive desktop activity that stayed on one application; a foreign focus shorter than five seconds is folded into the block around it rather than reported as an interruption, so a quick alt-tab does not break a forty-minute block of writing into three rows. A block with more than one distinct title lists its five longest beneath it, longest first, with anything past the fifth rolled into one remainder line. A block line names the application and, where a media player overlapped it for at least a minute, what was playing behind it; the workspace and monitor a raw row carries are not shown, since a block can span several of each, and they come back in `daytrace today --raw` and in `daytrace export`:
 
 ```text
 Timeline for 2026-07-20
@@ -146,6 +147,25 @@ Media playing
 ```
 
 A block that a media player overlapped by at least a minute carries the player's name as a suffix, `, spotify playing in the background`, with `and N more` appended when other players also cleared that floor; a track heard for a few seconds explains nothing about the block and is left out of the suffix, though it still gets its own row in `Media playing` below. Naming a player never moves a second between blocks: the desktop lane alone decides where the day's time went, and media is a fact riding along rather than a second claim on it.
+
+`daytrace today --raw` prints the report exactly as it read before blocks existed: one row per stored desktop segment, and `Time per application` totalled from those rows rather than from the blocks above. It is the record a block's own totals can be checked against by hand, and it is where a foreign focus a block folded into its neighbour comes back as a row of its own, workspace and monitor included:
+
+```text
+Timeline for 2026-07-20
+09:10-09:24  14m     ghostty - tmux workspace 3, monitor 1
+09:24-09:24  3s      rofi - quick check
+09:24-09:34  10m     ghostty - tmux workspace 3, monitor 1
+09:34-09:50  16m     firefox - Inbox - Brave
+09:50-10:06  16m     AFK
+
+Time per application
+   24m  ghostty
+   16m  AFK
+   16m  firefox
+    3s  rofi
+```
+
+`Time per application` can therefore disagree with the aggregated default by at most the seconds a swallowed foreign focus moved to the block around it: here `rofi` holds three seconds of its own instead of vanishing into `ghostty`'s twenty-four minutes. `Media playing` and its union total are identical on both paths; `--raw` changes the timeline and the per-application totals only.
 
 A span shorter than a minute reports the seconds it lasted. Rounding it to the nearest minute called it `0m`, and with one-second polling a stretch of rapid window switching became a column of identical zeroes crowding out the blocks that held the day. A segment that lasted no time at all reads as `0s`, which says what happened instead of looking like a duration lost to rounding: a focus change with no input during an idle wait closes the displaced window at the instant it opened, and startup recovery does the same to a segment the daemon only ever observed once, which is the last application focused before it died.
 
