@@ -341,7 +341,10 @@ fn format_title_part(part: &TitlePart) -> String {
 fn title_part_text(part: &TitlePart) -> String {
     match part {
         TitlePart::Title { title, .. } => title.clone(),
-        TitlePart::Remainder { title_count, .. } => format!("other ({title_count} titles)"),
+        TitlePart::Remainder { title_count, .. } => {
+            let noun = if *title_count == 1 { "title" } else { "titles" };
+            format!("other ({title_count} {noun})")
+        }
     }
 }
 
@@ -508,9 +511,10 @@ mod tests {
     use super::{
         ApplicationTotal, application_totals, application_totals_from_blocks, day_bounds,
         local_date, media_playing_seconds, render_day, render_narrative_day, retention_cutoff,
+        title_part_text,
     };
     use crate::activity::{ActivitySnapshot, MediaSegment, MediaSnapshot, TimelineSegment};
-    use crate::narrative::build_day;
+    use crate::narrative::{TitlePart, build_day};
     use chrono::NaiveDate;
 
     fn idle_segment(started_at: i64, ended_at: i64) -> TimelineSegment {
@@ -1226,7 +1230,7 @@ mod tests {
                 "             1m        title 2",
                 "             1m        title 3",
                 "             1m        title 4",
-                "             1m        other (1 titles)",
+                "             1m        other (1 title)",
                 "",
                 "Time per application",
                 "    6m  firefox",
@@ -1235,6 +1239,29 @@ mod tests {
             .join("\n"),
             "actual rendering: {rendered}"
         );
+    }
+
+    /// A remainder standing for exactly one title reads the singular noun, not the plural
+    /// fixed string the bug shipped with.
+    #[test]
+    fn remainder_text_at_one_title_is_singular() {
+        let part = TitlePart::Remainder {
+            duration_seconds: 60,
+            title_count: 1,
+        };
+
+        assert_eq!(title_part_text(&part), "other (1 title)");
+    }
+
+    /// A remainder standing for more than one title keeps the plural noun.
+    #[test]
+    fn remainder_text_at_two_titles_is_plural() {
+        let part = TitlePart::Remainder {
+            duration_seconds: 60,
+            title_count: 2,
+        };
+
+        assert_eq!(title_part_text(&part), "other (2 titles)");
     }
 
     #[test]
