@@ -122,9 +122,7 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
     totals
 }
 
-/// Longest first, and equal totals by name so the same day reads the same way twice. The name
-/// comparison ignores case: application classes arrive in whichever case the compositor
-/// reports, and raw byte order would sort every capitalised one above every lowercase one.
+/// Longest first, and equal totals by name so the same day reads the same way twice.
 ///
 /// Shared between `application_totals` (raw segments) and `application_totals_from_blocks`
 /// (the narrative), so the two orderings cannot drift apart from each other independently.
@@ -132,13 +130,23 @@ fn sort_totals_longest_first(totals: &mut [ApplicationTotal]) {
     totals.sort_by(|left, right| {
         Reverse(left.seconds)
             .cmp(&Reverse(right.seconds))
-            .then_with(|| {
-                left.label
-                    .to_lowercase()
-                    .cmp(&right.label.to_lowercase())
-                    .then_with(|| left.label.cmp(&right.label))
-            })
+            .then_with(|| tie_break_by_name(&left.label, &right.label))
     });
+}
+
+/// Break a tie between two names the same way wherever a report has to order names: fold case
+/// first, then fall back to raw bytes for names that still tie after folding. Application
+/// classes arrive in whichever case the compositor reports, and raw byte order would sort every
+/// capitalised one above every lowercase one, which reads as two unrelated groups rather than
+/// one alphabetical list; window titles are if anything more mixed in case, so the same hazard
+/// and the same fix apply there.
+///
+/// Shared by the per-application totals above and by `narrative::Block::title_parts`, so a
+/// report cannot place `Firefox` above `firefox` in one list and below it in the other.
+pub(crate) fn tie_break_by_name(left: &str, right: &str) -> std::cmp::Ordering {
+    left.to_lowercase()
+        .cmp(&right.to_lowercase())
+        .then_with(|| left.cmp(right))
 }
 
 /// `Time per application`, totalled from the blocks rather than the raw segments.
@@ -734,11 +742,15 @@ mod tests {
     fn applications_holding_equal_time_are_ordered_by_name() {
         // Mixed case on purpose: compositors report classes such as `Zed` and `firefox` side
         // by side, and ordering them by raw bytes puts every capitalised name above every
-        // lowercase one, which reads as an ordering nobody chose.
+        // lowercase one, which reads as an ordering nobody chose. `Firefox` and `firefox` push
+        // further: they fold to the same key, so the fold alone leaves them tied and the
+        // fallback to raw bytes is what has to pick a deterministic order between them.
         let totals = application_totals(&[
             segment(0, 600, "Zed"),
             segment(600, 1200, "alacritty"),
             segment(1200, 1800, "Brave"),
+            segment(1800, 2400, "firefox"),
+            segment(2400, 3000, "Firefox"),
         ]);
 
         assert_eq!(
@@ -746,6 +758,8 @@ mod tests {
             vec![
                 total("alacritty", 600),
                 total("Brave", 600),
+                total("Firefox", 600),
+                total("firefox", 600),
                 total("Zed", 600)
             ],
             "a tie must be ordered by name and never reshuffle between runs"
