@@ -147,6 +147,100 @@ fn block_label(segment: &TimelineSegment) -> &str {
     }
 }
 
+/// A block prints at most this many distinct titles as their own line; anything past the cap
+/// rolls into one remainder. Measured against the live store rather than guessed: see the bead
+/// this constant belongs to.
+const TITLE_PART_CAP: usize = 5;
+
+/// What a title part calls a segment whose title was never recorded.
+///
+/// The same string `src/timeline.rs:280` already prints for that segment, rather than a new one
+/// from the "unknown app" family: the raw report keeps rendering these rows once the aggregated
+/// timeline exists beside it, and one fact under two names across two views of the same day is
+/// the confusion both views exist to avoid.
+const MISSING_TITLE: &str = "untitled";
+
+/// One line under a block: a distinct title with its own duration, or the remainder standing in
+/// for every title past `TITLE_PART_CAP`.
+///
+/// No renderer calls this yet (that lands in a later bead), hence the `#[allow(dead_code)]`
+/// below on every item that only a renderer would reach.
+#[derive(Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub enum TitlePart {
+    Title {
+        title: String,
+        duration_seconds: i64,
+    },
+    Remainder {
+        duration_seconds: i64,
+        title_count: usize,
+    },
+}
+
+impl TitlePart {
+    #[allow(dead_code)]
+    pub fn duration_seconds(&self) -> i64 {
+        match self {
+            TitlePart::Title {
+                duration_seconds, ..
+            } => *duration_seconds,
+            TitlePart::Remainder {
+                duration_seconds, ..
+            } => *duration_seconds,
+        }
+    }
+}
+
+impl Block {
+    /// This block's distinct titles, longest first, at most `TITLE_PART_CAP` of them, with a
+    /// duration tie broken by title text so the same day reads the same way twice.
+    ///
+    /// A title repeated inside the block, even with a different title between its two
+    /// occurrences, becomes one part whose duration is their sum: the pairing is by title text,
+    /// not by position. Every segment in the block contributes to exactly one part, so the parts
+    /// sum to the block's own duration exactly, remainder included. Nothing here can produce
+    /// two parts covering the same segment, or a part covering none.
+    #[allow(dead_code)]
+    pub fn title_parts(&self) -> Vec<TitlePart> {
+        let mut durations: Vec<(String, i64)> = Vec::new();
+        for segment in &self.segments {
+            let title = segment.snapshot.title.as_deref().unwrap_or(MISSING_TITLE);
+            let duration = segment.ended_at - segment.started_at;
+            match durations.iter_mut().find(|(existing, _)| existing == title) {
+                Some((_, total)) => *total += duration,
+                None => durations.push((title.to_string(), duration)),
+            }
+        }
+
+        durations.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+        if durations.len() <= TITLE_PART_CAP {
+            return durations
+                .into_iter()
+                .map(|(title, duration_seconds)| TitlePart::Title {
+                    title,
+                    duration_seconds,
+                })
+                .collect();
+        }
+
+        let remainder_titles = durations.split_off(TITLE_PART_CAP);
+        let mut parts: Vec<TitlePart> = durations
+            .into_iter()
+            .map(|(title, duration_seconds)| TitlePart::Title {
+                title,
+                duration_seconds,
+            })
+            .collect();
+        parts.push(TitlePart::Remainder {
+            duration_seconds: remainder_titles.iter().map(|(_, duration)| duration).sum(),
+            title_count: remainder_titles.len(),
+        });
+        parts
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,6 +519,158 @@ mod tests {
         assert_eq!(block.segments.len(), 5);
     }
 
+    fn window_segment_no_title(started_at: i64, ended_at: i64, app: &str) -> TimelineSegment {
+        TimelineSegment {
+            started_at,
+            ended_at,
+            snapshot: ActivitySnapshot::window(Some(app.to_string()), None, None, None),
+        }
+    }
+
+    #[test]
+    fn a_block_with_eleven_distinct_titles_truncates_to_five_plus_a_remainder() {
+        let segments: Vec<TimelineSegment> = (0..11)
+            .map(|index| {
+                window_segment(
+                    index * 10,
+                    index * 10 + 10,
+                    "firefox",
+                    &format!("title {index}"),
+                )
+            })
+            .collect();
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(parts.len(), 6);
+        let Some(TitlePart::Remainder {
+            duration_seconds,
+            title_count,
+        }) = parts.last()
+        else {
+            panic!("expected the last part to be the remainder: {parts:?}");
+        };
+        assert_eq!(*title_count, 6);
+        let block_seconds = block.ended_at - block.started_at;
+        let parts_seconds: i64 = parts.iter().map(TitlePart::duration_seconds).sum();
+        assert_eq!(parts_seconds, block_seconds);
+        assert!(*duration_seconds > 0);
+    }
+
+    #[test]
+    fn a_block_with_five_distinct_titles_carries_no_remainder() {
+        let segments: Vec<TimelineSegment> = (0..5)
+            .map(|index| {
+                window_segment(
+                    index * 10,
+                    index * 10 + 10,
+                    "firefox",
+                    &format!("title {index}"),
+                )
+            })
+            .collect();
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(parts.len(), 5);
+        assert!(
+            !parts
+                .iter()
+                .any(|part| matches!(part, TitlePart::Remainder { .. })),
+            "{parts:?}"
+        );
+    }
+
+    #[test]
+    fn a_repeated_title_sums_across_an_interruption_by_another_title() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "inbox"),
+            window_segment(10, 25, "firefox", "docs"),
+            window_segment(25, 40, "firefox", "inbox"),
+        ];
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(parts.len(), 2);
+        assert_eq!(
+            parts[0],
+            TitlePart::Title {
+                title: "inbox".to_string(),
+                duration_seconds: 25,
+            }
+        );
+        assert_eq!(
+            parts[1],
+            TitlePart::Title {
+                title: "docs".to_string(),
+                duration_seconds: 15,
+            }
+        );
+    }
+
+    #[test]
+    fn a_duration_tie_between_titles_breaks_by_title_text() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "zulu"),
+            window_segment(10, 20, "firefox", "alpha"),
+        ];
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(
+            parts,
+            vec![
+                TitlePart::Title {
+                    title: "alpha".to_string(),
+                    duration_seconds: 10,
+                },
+                TitlePart::Title {
+                    title: "zulu".to_string(),
+                    duration_seconds: 10,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn a_block_with_one_distinct_title_carries_one_part() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "inbox"),
+            window_segment(10, 20, "firefox", "inbox"),
+        ];
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(
+            parts,
+            vec![TitlePart::Title {
+                title: "inbox".to_string(),
+                duration_seconds: 20,
+            }]
+        );
+    }
+
+    #[test]
+    fn a_segment_with_no_title_becomes_an_untitled_part_rather_than_being_dropped() {
+        let segments = vec![window_segment_no_title(0, 10, "firefox")];
+        let block = &build_narrative(&segments).blocks[0];
+
+        let parts = block.title_parts();
+
+        assert_eq!(
+            parts,
+            vec![TitlePart::Title {
+                title: "untitled".to_string(),
+                duration_seconds: 10,
+            }]
+        );
+    }
+
     /// The invariant this whole layer rests on: whatever segments are grouped into, the result
     /// must be ordered and non-overlapping, must cover exactly the seconds the input covered,
     /// and must never reach outside the day it was built for. Each of the three has to be
@@ -474,6 +720,48 @@ mod tests {
         }
     }
 
+    /// The invariant `.3` adds on top of `.1`/`.2`: however a block's segments are split into
+    /// title parts, the parts must sum to exactly the block's own duration. Breaking that has
+    /// to turn this test red before the bead is accepted; dropping the remainder is the way the
+    /// bead itself names, and this generator produces blocks past the five-title cap for a
+    /// dropped remainder to actually be missed rather than merely unexercised.
+    #[test]
+    fn title_parts_sum_to_the_block_they_belong_to() {
+        let day_start: i64 = 1_785_000_000;
+        let day_end: i64 = day_start + 86_400;
+        let mut state: u64 = 0x6e61_7272_6174_6976;
+        let mut saw_a_remainder = false;
+
+        for _ in 0..200 {
+            let segments = generated_desktop_segments(&mut state, day_start, day_end);
+            let narrative = build_narrative(&segments);
+
+            for block in &narrative.blocks {
+                let parts = block.title_parts();
+                let parts_seconds: i64 = parts.iter().map(TitlePart::duration_seconds).sum();
+                let block_seconds = block.ended_at - block.started_at;
+                assert_eq!(
+                    parts_seconds, block_seconds,
+                    "block [{}, {}) parts covered {parts_seconds}s: {parts:?}",
+                    block.started_at, block.ended_at
+                );
+                assert!(parts.len() <= TITLE_PART_CAP + 1, "{parts:?}");
+                if parts
+                    .iter()
+                    .any(|part| matches!(part, TitlePart::Remainder { .. }))
+                {
+                    saw_a_remainder = true;
+                }
+            }
+        }
+
+        assert!(
+            saw_a_remainder,
+            "200 generated days never produced a block past the five-title cap; \
+             the remainder branch went unexercised"
+        );
+    }
+
     /// A small, dependency-free linear congruential generator, the same one `src/timeline.rs`
     /// uses for its own property test: many varied inputs are needed, not a cryptographically
     /// sound source, and pulling in a fuzzing crate for one test would ask every future audit
@@ -494,22 +782,35 @@ mod tests {
         day_end: i64,
     ) -> Vec<TimelineSegment> {
         let labels = ["firefox", "zed", "AFK", "Suspended"];
+        // A small pool rather than a title unique per segment: real focus revisits the same
+        // handful of pages and buffers, and the title-parts property test needs blocks that
+        // repeat a title (to exercise the summed-duration path) as well as blocks that exceed
+        // the five-title cap (to exercise the remainder), neither of which a pool of one or a
+        // pool of hundreds would produce with any regularity.
+        let titles = [
+            "title 0", "title 1", "title 2", "title 3", "title 4", "title 5", "title 6", "title 7",
+        ];
         let mut segments = Vec::new();
         let mut cursor = day_start;
+        let mut previous_label: Option<&str> = None;
         while cursor < day_end {
             // One run in six opens a gap instead of a segment, so the generator exercises the
-            // boundary the "gap breaks a block" rule exists for, not only unbroken runs.
+            // boundary the "gap breaks a block" rule exists for, not only unbroken runs. A gap
+            // also ends any run of the same label: the daemon being down is not a continuation
+            // of what came before it.
             if lcg_next(state).is_multiple_of(6) {
                 let gap = 1 + (lcg_next(state) % 120) as i64;
                 cursor = (cursor + gap).min(day_end);
+                previous_label = None;
                 continue;
             }
-            // Duration and label both come from this one draw rather than two separate calls:
-            // an LCG's low bits cycle far faster than its high bits, so `% labels.len()` alone
-            // (a power of two) walked the four labels in a near-fixed rotation and the swallow
-            // branch below never once lined up with a matching pair of neighbours. Reading the
-            // label from the top bits and the swallow branch from a distinct, lower bit range
-            // keeps the two independent of each other.
+            // Duration, label, stickiness and title all come from this one draw rather than
+            // separate calls: an LCG's low bits cycle far faster than its high bits, so
+            // `% labels.len()` alone (a power of two) walked the four labels in a near-fixed
+            // rotation and the swallow branch below never once lined up with a matching pair of
+            // neighbours. Every field below is read from its own bit range, all distinct and
+            // clear of the lowest dozen bits `% 3_600` and `% 8` consume, so none of them can
+            // fall into that same lock-step.
             let raw = lcg_next(state);
             // One run in eight lands near the swallow threshold instead of the full range, so
             // the generator exercises swallowing itself, not only the grouping it sits on top of.
@@ -519,13 +820,22 @@ mod tests {
                 1 + (raw % 3_600) as i64
             };
             let end = (cursor + duration).min(day_end);
-            let label = labels[(raw >> 62) as usize];
+            // About half the time, focus stays on whatever it was on last instead of drawing
+            // fresh: a label picked independently every segment averages a run of about one
+            // segment, too short for a block to ever accumulate more than a handful of titles.
+            let stays_on_previous_label = (raw >> 48) & 0b1 == 1;
+            let label = match (stays_on_previous_label, previous_label) {
+                (true, Some(label)) => label,
+                _ => labels[(raw >> 62) as usize],
+            };
+            previous_label = Some(label);
+            let title = titles[((raw >> 50) & 0b111) as usize];
             let segment = match label {
                 "AFK" => idle_segment(cursor, end),
                 // A suspended stretch is a first-class label the criteria name beside AFK, and it
                 // is the one that produces the longest real blocks, so the generator has to emit it.
                 "Suspended" => suspended_segment(cursor, end),
-                _ => window_segment(cursor, end, label, "a title"),
+                _ => window_segment(cursor, end, label, title),
             };
             segments.push(segment);
             cursor = end;
