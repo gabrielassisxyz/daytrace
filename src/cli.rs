@@ -40,7 +40,7 @@ Usage:
 
 Commands:
   start         Start the desktop and media activity capture daemon.
-  today         Print a chronological activity timeline, by default for today.
+  today         Print the day as an aggregated timeline of blocks, by default for today.
   export        Print one day of stored activity as JSON, by default today.
   prune         Delete stored activity from before the retention window.
   forget        Delete stored activity whose app, title, artist, album or address matches text.
