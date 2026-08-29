@@ -2,7 +2,7 @@ use crate::activity::{ActivitySnapshot, MediaSegment, TimelineSegment};
 use crate::config::{Blacklist, Config, redact_address, redact_title};
 use crate::desktop::{ActiveWindowSource, HyprlandClient};
 use crate::export::render_day_export;
-use crate::input::InputActivity;
+use crate::input::{InputActivity, InputObservation};
 use crate::lock::CaptureLock;
 use crate::media::{BusctlClient, MediaSource, PlayerOutcome, PlayingMedia};
 use crate::service::render_user_unit;
@@ -285,7 +285,7 @@ fn run_daemon(config: Config) -> Result<(), String> {
             &mut store,
             &sources,
             &config,
-            input_activity.last_activity_at(),
+            input_activity.observation(),
             Instant::now(),
             &mut wake_state,
         )?;
@@ -294,8 +294,8 @@ fn run_daemon(config: Config) -> Result<(), String> {
     close_capture_lanes(&mut store, unix_now())
 }
 
-/// Everything one wake carries over to the next: the two failure streaks, the media source's own
-/// log, the gaps still owed, and the two poll deadlines. Gathered here, apart from the real
+/// Everything one wake carries over to the next: the failure streaks, the two rate-limited logs,
+/// the gaps still owed, and the two poll deadlines. Gathered here, apart from the real
 /// collaborators, so a test can construct one wake's memory without the signal handler, the
 /// capture lock or the input-device watcher `run_daemon` sets up around it.
 struct CaptureWakeState {
@@ -303,7 +303,9 @@ struct CaptureWakeState {
     pending_gaps: PendingGaps,
     streak: FailureStreak,
     media_store_streak: FailureStreak,
-    media_source_log: MediaSourceFailureLog,
+    media_source_log: RateLimitedFailureLog,
+    input_streak: FailureStreak,
+    input_observation_log: RateLimitedFailureLog,
     desktop_deadline: Instant,
     media_deadline: Instant,
 }
@@ -317,7 +319,9 @@ impl CaptureWakeState {
             pending_gaps: PendingGaps::default(),
             streak: FailureStreak::default(),
             media_store_streak: FailureStreak::default(),
-            media_source_log: MediaSourceFailureLog::default(),
+            media_source_log: RateLimitedFailureLog::default(),
+            input_streak: FailureStreak::default(),
+            input_observation_log: RateLimitedFailureLog::default(),
             desktop_deadline: now,
             media_deadline: now,
         }
@@ -546,7 +550,7 @@ fn handle_media_wake(
     source: &dyn MediaSource,
     blacklist: &Blacklist,
     observed_at: i64,
-    media_source_log: &mut MediaSourceFailureLog,
+    media_source_log: &mut RateLimitedFailureLog,
     media_store_streak: &mut FailureStreak,
 ) -> Result<(), String> {
     let outcome = capture_media_once(store, source, blacklist, observed_at);
@@ -592,6 +596,47 @@ struct WakeSources<'a> {
     session_clock: &'a dyn SessionClock,
 }
 
+/// The idle-since timestamp `capture_once` should use this desktop poll, or `Err` once input
+/// cannot be observed at all for too long to keep going.
+///
+/// While no watcher is alive, `last_activity_at` is a frozen clock rather than evidence of a
+/// quiet machine, so idle is never derived from it here: the caller gets `None`, which makes
+/// `capture_once` record whatever the desktop source itself reports instead of manufacturing
+/// AFK. The condition is logged rate-limited, the way a media source outage already is, and fed
+/// into `streak` on the same threshold and shape the compositor's own sustained-failure path
+/// uses, so a permanently lost input device ends capture instead of silently recording a day
+/// that never happened.
+fn idle_since_or_give_up(
+    input: InputObservation,
+    observed_at: i64,
+    idle_after: Duration,
+    streak: &mut FailureStreak,
+    log: &mut RateLimitedFailureLog,
+) -> Result<Option<i64>, String> {
+    if !input.is_observing() {
+        if let Some(count) = log.record_failure() {
+            eprintln!("daytrace: no input device observable ({count}): idle cannot be verified");
+        }
+        return match streak.record_failure() {
+            Some(_) => Ok(None),
+            None => Err(format!(
+                "no input device observable for {MAX_CONSECUTIVE_FAILURES} polls in a row, \
+                 giving up"
+            )),
+        };
+    }
+
+    if log.record_success() {
+        eprintln!("daytrace: input observation recovered");
+    }
+    streak.record_success();
+
+    Ok(
+        (observed_at - input.last_activity_at >= idle_after.as_secs() as i64)
+            .then_some(input.last_activity_at),
+    )
+}
+
 /// One wake of the capture loop: read the session clock, flush whatever gap is already owed,
 /// then run whichever source is due. `run_daemon` reduces to acquiring the real desktop source,
 /// media source, session clock and store, and calling this in a loop.
@@ -608,7 +653,7 @@ fn run_capture_wake(
     store: &mut dyn CaptureStore,
     sources: &WakeSources,
     config: &Config,
-    last_activity_at: i64,
+    input: InputObservation,
     now: Instant,
     state: &mut CaptureWakeState,
 ) -> Result<(), String> {
@@ -630,8 +675,13 @@ fn run_capture_wake(
         // dated back to the last input rather than to the moment it was noticed. Dating it to
         // now credited the whole threshold window to whichever window still held focus, which
         // inflated that one application by up to the threshold on every single absence.
-        let idle_since = (observed_at - last_activity_at >= config.idle_after.as_secs() as i64)
-            .then_some(last_activity_at);
+        let idle_since = idle_since_or_give_up(
+            input,
+            observed_at,
+            config.idle_after,
+            &mut state.input_streak,
+            &mut state.input_observation_log,
+        )?;
 
         match capture_once(
             store,
@@ -711,26 +761,25 @@ fn sanitize_media_outcome(outcome: PlayerOutcome) -> PlayerOutcome {
     }
 }
 
-/// How often a media SOURCE failure that never ends the daemon still earns a line in the log.
+/// How often a failure that never ends the daemon on its own still earns a line in the log.
 ///
-/// Unlike `FailureStreak`, this never gives up: no player on the bus is the ordinary state of
-/// the machine, and a source that stays broken degrades media alone, forever, rather than ending
-/// capture. Logging every failure of an outage with no upper bound would fill the log at the
-/// poll interval for as long as the outage lasts, so only the first failure and every
-/// `LOG_PERIOD`-th one after it get a line. A count rather than a period, so the bound needs no
-/// clock seam to test.
-const MEDIA_SOURCE_LOG_PERIOD: u32 = 60;
+/// Used for both a media source outage and a stretch with no input watcher alive: unlike
+/// `FailureStreak`, neither of those gives up by itself, so logging every poll of an outage with
+/// no upper bound would fill the log at the poll interval for as long as it lasts. Only the
+/// first failure and every `LOG_PERIOD`-th one after it get a line. A count rather than a
+/// period, so the bound needs no clock seam to test.
+const FAILURE_LOG_PERIOD: u32 = 60;
 
 #[derive(Debug, Default)]
-struct MediaSourceFailureLog {
+struct RateLimitedFailureLog {
     consecutive: u32,
 }
 
-impl MediaSourceFailureLog {
+impl RateLimitedFailureLog {
     /// The failure count worth logging, or `None` when this one is not.
     fn record_failure(&mut self) -> Option<u32> {
         self.consecutive += 1;
-        (self.consecutive == 1 || self.consecutive.is_multiple_of(MEDIA_SOURCE_LOG_PERIOD))
+        (self.consecutive == 1 || self.consecutive.is_multiple_of(FAILURE_LOG_PERIOD))
             .then_some(self.consecutive)
     }
 
@@ -889,8 +938,8 @@ fn segments(count: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        AppError, CaptureWakeState, FailureStreak, MAX_CONSECUTIVE_FAILURES, MediaSourceFailureLog,
-        Observed, PendingGaps, WakeSources, capture_media_once, capture_once, close_capture_lanes,
+        AppError, CaptureWakeState, FailureStreak, MAX_CONSECUTIVE_FAILURES, Observed, PendingGaps,
+        RateLimitedFailureLog, WakeSources, capture_media_once, capture_once, close_capture_lanes,
         flush_pending_gaps, forget_request, handle_media_wake, next_poll_deadline,
         prune_is_dry_run, render_forget, render_forget_preview, render_preview, render_prune,
         requested_day, run, run_capture_wake, sanitize_media_outcome,
@@ -898,6 +947,7 @@ mod tests {
     use crate::activity::{ActivitySnapshot, TimelineSegment};
     use crate::config::{Blacklist, Config};
     use crate::desktop::ActiveWindowSource;
+    use crate::input::InputObservation;
     use crate::media::fakes::ScriptedMediaSource;
     use crate::media::{MediaSource, PlayerOutcome, PlayingMedia};
     use crate::session::{ClockReading, PoweredDownGap, SessionClock};
@@ -2290,7 +2340,7 @@ mod tests {
     #[test]
     fn media_source_failures_are_logged_at_one_sixty_and_every_period_after_then_once_on_recovery()
     {
-        let mut log = MediaSourceFailureLog::default();
+        let mut log = RateLimitedFailureLog::default();
         let logged: Vec<u32> = (1..=121_u32).filter_map(|_| log.record_failure()).collect();
         assert_eq!(
             logged,
@@ -2303,7 +2353,7 @@ mod tests {
             "a success following a failure streak owes a recovery line"
         );
         assert!(
-            !MediaSourceFailureLog::default().record_success(),
+            !RateLimitedFailureLog::default().record_success(),
             "a source that was never broken has nothing to announce"
         );
     }
@@ -2377,7 +2427,7 @@ mod tests {
         let mut store = FlakyMediaStore::new(inner, u32::MAX);
         let source = ScriptedMediaSource::new(vec![Ok(vec![]); MAX_CONSECUTIVE_FAILURES as usize]);
         let blacklist = Blacklist::default();
-        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_source_log = RateLimitedFailureLog::default();
         let mut media_store_streak = FailureStreak::default();
 
         for count in 1..MAX_CONSECUTIVE_FAILURES {
@@ -2414,7 +2464,7 @@ mod tests {
         let blacklist = Blacklist::default();
         let mut pending_gaps = PendingGaps::default();
         let mut streak = FailureStreak::default();
-        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_source_log = RateLimitedFailureLog::default();
         let mut media_store_streak = FailureStreak::default();
 
         for count in 1..MAX_CONSECUTIVE_FAILURES {
@@ -2470,7 +2520,7 @@ mod tests {
         let blacklist = Blacklist::default();
         let mut pending_gaps = PendingGaps::default();
         let mut streak = FailureStreak::default();
-        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_source_log = RateLimitedFailureLog::default();
         let mut media_store_streak = FailureStreak::default();
 
         for count in 1..=121 {
@@ -2509,7 +2559,7 @@ mod tests {
         let inner = Store::open(dir.path().join("daytrace.db"), None).expect("store");
         let mut store = FlakyMediaStore::new(inner, 5);
         let blacklist = Blacklist::default();
-        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_source_log = RateLimitedFailureLog::default();
         let mut media_store_streak = FailureStreak::default();
 
         for count in 1..=5 {
@@ -2545,7 +2595,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
         let blacklist = Blacklist::default();
-        let mut media_source_log = MediaSourceFailureLog::default();
+        let mut media_source_log = RateLimitedFailureLog::default();
         let mut media_store_streak = FailureStreak::default();
         let media_source = ScriptedMediaSource::new(vec![Ok(vec![])]);
         handle_media_wake(
@@ -2709,6 +2759,16 @@ mod tests {
         }
     }
 
+    /// An `InputObservation` with one watcher alive, the ordinary case every wake test that is
+    /// not itself about input loss wants: `last_activity_at` is trustworthy and idle is derived
+    /// from it normally.
+    fn observing(last_activity_at: i64) -> InputObservation {
+        InputObservation {
+            last_activity_at,
+            watchers_alive: 1,
+        }
+    }
+
     #[test]
     fn a_media_only_wake_flushes_a_pending_gap_before_polling_media() {
         let log: CallLog = Rc::new(RefCell::new(Vec::new()));
@@ -2737,7 +2797,7 @@ mod tests {
             &mut store,
             &sources,
             &config,
-            1_000,
+            observing(1_000),
             Instant::now(),
             &mut state,
         )
@@ -2776,7 +2836,7 @@ mod tests {
             &mut store,
             &sources,
             &config,
-            1_000,
+            observing(1_000),
             Instant::now(),
             &mut state,
         )
@@ -2786,6 +2846,131 @@ mod tests {
             log.borrow().as_slice(),
             ["desktop_source", "media_source", "record_media_poll"],
             "the media source must still be polled on a wake where the desktop source failed"
+        );
+    }
+
+    #[test]
+    fn idle_is_not_recorded_while_no_input_watcher_is_alive() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        let desktop = ScriptedWindowSource::new(vec![Ok(Some(window.clone()))]);
+        let media = ScriptedMediaSource::new(Vec::new());
+        let clock = FixedSessionClock { wall: 100_000 };
+        let config = wake_config();
+        let mut state = CaptureWakeState::new(Instant::now());
+        state.media_deadline = Instant::now() + Duration::from_secs(3600);
+        let sources = WakeSources {
+            desktop: &desktop,
+            media: &media,
+            session_clock: &clock,
+        };
+        // Frozen far enough in the past that a trusted timestamp would read as idle several
+        // times over; zero watchers alive is what must stop that reading from being recorded.
+        let input = InputObservation {
+            last_activity_at: 0,
+            watchers_alive: 0,
+        };
+
+        run_capture_wake(
+            &mut store,
+            &sources,
+            &config,
+            input,
+            Instant::now(),
+            &mut state,
+        )
+        .expect("a single missing-watcher wake is well under the giving-up threshold");
+        store.close_open(200_000, &Lane::Desktop).expect("close");
+
+        let rows = store
+            .timeline_between(0, 200_000, 200_000)
+            .expect("timeline");
+        assert!(
+            rows.iter()
+                .all(|row| row.snapshot != ActivitySnapshot::idle()),
+            "idle must never be recorded while no input watcher can vouch for it: {rows:?}"
+        );
+        assert!(
+            rows.iter().any(|row| row.snapshot == window),
+            "the desktop's own report must still be recorded instead of manufactured AFK: \
+             {rows:?}"
+        );
+    }
+
+    #[test]
+    fn sustained_input_loss_ends_capture_without_ever_recording_a_fabricated_idle_stretch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut store = Store::open(dir.path().join("daytrace.db"), None).expect("store");
+        let window = ActivitySnapshot::window(
+            Some("ghostty".to_string()),
+            Some("tmux".to_string()),
+            None,
+            None,
+        );
+        let responses = (0..MAX_CONSECUTIVE_FAILURES)
+            .map(|_| Ok(Some(window.clone())))
+            .collect();
+        let desktop = ScriptedWindowSource::new(responses);
+        let media = ScriptedMediaSource::new(Vec::new());
+        let clock = FixedSessionClock { wall: 100_000 };
+        let config = wake_config();
+        let mut state = CaptureWakeState::new(Instant::now());
+        state.media_deadline = Instant::now() + Duration::from_secs(3600);
+        let sources = WakeSources {
+            desktop: &desktop,
+            media: &media,
+            session_clock: &clock,
+        };
+        let input = InputObservation {
+            last_activity_at: 0,
+            watchers_alive: 0,
+        };
+
+        for expected in 1..MAX_CONSECUTIVE_FAILURES {
+            // Forced due on every iteration: this loop is proving the input-loss streak, not
+            // the desktop poll schedule, and letting the schedule gate it would starve every
+            // wake after the first since none of these calls actually waits out an interval.
+            state.desktop_deadline = Instant::now();
+            run_capture_wake(
+                &mut store,
+                &sources,
+                &config,
+                input,
+                Instant::now(),
+                &mut state,
+            )
+            .unwrap_or_else(|error| panic!("must not give up at wake {expected}: {error}"));
+        }
+
+        state.desktop_deadline = Instant::now();
+        let error = run_capture_wake(
+            &mut store,
+            &sources,
+            &config,
+            input,
+            Instant::now(),
+            &mut state,
+        )
+        .expect_err("sustained input loss must end capture rather than keep guessing");
+        assert!(
+            error.contains("input device"),
+            "the failure must name what gave up: {error}"
+        );
+
+        store.close_open(200_000, &Lane::Desktop).expect("close");
+        let rows = store
+            .timeline_between(0, 200_000, 200_000)
+            .expect("timeline");
+        assert!(
+            rows.iter()
+                .all(|row| row.snapshot != ActivitySnapshot::idle()),
+            "no wake in this run may have recorded idle as fact: {rows:?}"
         );
     }
 
