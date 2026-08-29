@@ -144,3 +144,26 @@ fn an_unknown_flag_on_today_alongside_raw_still_exits_two() {
         "the error has to name the unrecognised flag: {stderr}"
     );
 }
+
+#[test]
+fn the_built_in_help_describes_today_as_an_aggregated_timeline() {
+    // The narrative bead moved `today` from printing stored segments one row apiece to
+    // grouping them into blocks; the built-in help has no other gate over its own prose, so
+    // this is what would catch it describing a report the command no longer prints.
+    let output = Command::new(env!("CARGO_BIN_EXE_daytrace"))
+        .arg("help")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run daytrace help");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert!(
+        output.status.success(),
+        "daytrace help must succeed: {stdout}"
+    );
+    assert!(
+        stdout.contains("aggregated"),
+        "the help text must describe today as printing an aggregated timeline, not a list of \
+         stored segments: {stdout}"
+    );
+}
