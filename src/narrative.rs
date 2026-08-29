@@ -4,7 +4,7 @@
 //! produces an owned value. Nothing calls this module yet, so deleting it returns the tool to
 //! its current behaviour.
 
-use crate::activity::{ActivityKind, TimelineSegment};
+use crate::activity::{ActivityKind, MediaSegment, TimelineSegment};
 
 /// A run of consecutive desktop segments that share one application label.
 #[derive(Debug, Eq, PartialEq)]
@@ -14,6 +14,22 @@ pub struct Block {
     pub started_at: i64,
     pub ended_at: i64,
     pub segments: Vec<TimelineSegment>,
+    /// Set by `attach_background_media`, never by grouping or swallowing. `None` until that
+    /// pass runs, and still `None` afterward for a block no player cleared the floor on.
+    pub background: Option<BackgroundMedia>,
+}
+
+/// A block's background media: the player that overlapped it longest, and how many other
+/// players also cleared `BACKGROUND_MEDIA_FLOOR_SECONDS`.
+///
+/// One value per block, not a list: decision 1 keeps the desktop lane the sole holder of a
+/// block's time and media a single secondary fact riding along, the same shape the browser
+/// layer's own competing-source problem will need a table for later, not this one.
+#[derive(Debug, Eq, PartialEq)]
+#[allow(dead_code)]
+pub struct BackgroundMedia {
+    pub player: String,
+    pub other_player_count: usize,
 }
 
 /// A foreign focus shorter than this is swallowed into the block around it, provided the
@@ -72,6 +88,7 @@ fn group_into_blocks(segments: &[TimelineSegment]) -> Vec<Block> {
                 started_at: segment.started_at,
                 ended_at: segment.ended_at,
                 segments: vec![segment.clone()],
+                background: None,
             });
         }
     }
@@ -192,6 +209,85 @@ impl TitlePart {
     }
 }
 
+/// Below this overlap with a block, in seconds, a media segment does not explain the block: a
+/// track heard for four seconds while the block was about something else is noise, not context.
+/// Measured against the media layer's own tests rather than observed overlap, since the store
+/// this layer was designed against predates the media schema and holds no media rows at all.
+const BACKGROUND_MEDIA_FLOOR_SECONDS: i64 = 60;
+
+/// What a background fact calls a media segment whose player was never recorded, matching the
+/// fallback `src/timeline.rs:206` already renders for the same case in the `Media playing`
+/// section, so the two views of a day agree on the name.
+const UNKNOWN_PLAYER: &str = "unknown player";
+
+/// Attach background media to every block: the player whose total overlap with the block is
+/// longest, provided it clears `BACKGROUND_MEDIA_FLOOR_SECONDS`, and how many other players also
+/// cleared it. A block no player reaches the floor on keeps `background: None`.
+///
+/// Must run after grouping and swallowing have settled the block boundaries: overlap is measured
+/// against each block's final `started_at`/`ended_at`, and swallowing changes both by merging
+/// blocks together, so a background computed before it ran would be measured against a boundary
+/// the block no longer has.
+///
+/// Media never contributes time: this only ever writes `block.background`. `started_at`,
+/// `ended_at` and `segments` are read, never assigned, so no block's duration, no title part and
+/// no per-application total sourced from either can change here, whatever the media contains.
+#[allow(dead_code)]
+pub fn attach_background_media(blocks: &mut [Block], media: &[MediaSegment]) {
+    for block in blocks.iter_mut() {
+        block.background = background_media_for(block, media);
+    }
+}
+
+/// A media segment's overlap with a block never depends on which one started or ended first, or
+/// on either extending past the other: it is the length of their shared instants alone, clamped
+/// to zero when they do not share any, so a segment entirely outside the block cannot go negative
+/// and read as a floor-clearing overlap by accident.
+fn overlap_seconds(block: &Block, media: &MediaSegment) -> i64 {
+    let start = block.started_at.max(media.started_at);
+    let end = block.ended_at.min(media.ended_at);
+    (end - start).max(0)
+}
+
+/// The one background fact a block carries, or `None` when no player's total overlap with the
+/// block clears the floor.
+///
+/// A player's overlap is summed across every one of its media segments that overlaps the block,
+/// not taken from its single longest segment: two consecutive tracks from the same player are
+/// one continuous stretch of that player playing behind the block, the same reasoning `.3`
+/// already applies to a title repeated across an interruption.
+fn background_media_for(block: &Block, media: &[MediaSegment]) -> Option<BackgroundMedia> {
+    let mut overlap_by_player: Vec<(String, i64)> = Vec::new();
+    for segment in media {
+        let overlap = overlap_seconds(block, segment);
+        if overlap <= 0 {
+            continue;
+        }
+        let player = segment.snapshot.player.as_deref().unwrap_or(UNKNOWN_PLAYER);
+        match overlap_by_player
+            .iter_mut()
+            .find(|(existing, _)| existing == player)
+        {
+            Some((_, total)) => *total += overlap,
+            None => overlap_by_player.push((player.to_string(), overlap)),
+        }
+    }
+
+    overlap_by_player.retain(|(_, total)| *total >= BACKGROUND_MEDIA_FLOOR_SECONDS);
+    if overlap_by_player.is_empty() {
+        return None;
+    }
+
+    // Longest overlap first, tie broken by player name so the same day reads the same way
+    // twice, the same rule `.3` already applies when two titles tie on duration.
+    overlap_by_player.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let (player, _) = overlap_by_player.remove(0);
+    Some(BackgroundMedia {
+        player,
+        other_player_count: overlap_by_player.len(),
+    })
+}
+
 impl Block {
     /// This block's distinct titles, longest first, at most `TITLE_PART_CAP` of them, with a
     /// duration tie broken by title text so the same day reads the same way twice.
@@ -244,7 +340,7 @@ impl Block {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::activity::ActivitySnapshot;
+    use crate::activity::{ActivitySnapshot, MediaSnapshot};
 
     fn window_segment(started_at: i64, ended_at: i64, app: &str, title: &str) -> TimelineSegment {
         TimelineSegment {
@@ -671,6 +767,178 @@ mod tests {
         );
     }
 
+    fn media_segment(started_at: i64, ended_at: i64, player: Option<&str>) -> MediaSegment {
+        MediaSegment {
+            started_at,
+            ended_at,
+            snapshot: MediaSnapshot {
+                player: player.map(str::to_string),
+                title: None,
+                artist: None,
+                album: None,
+                item_url: None,
+            },
+        }
+    }
+
+    /// A single block spanning the whole day, so every test below only has to vary the media
+    /// segment: overlap with a block that never itself changes is what each of these checks.
+    fn one_day_block() -> Vec<TimelineSegment> {
+        vec![window_segment(0, 3_600, "firefox", "a")]
+    }
+
+    #[test]
+    fn an_overlap_of_fifty_nine_seconds_does_not_attach() {
+        let mut narrative = build_narrative(&one_day_block());
+        let media = vec![media_segment(0, 59, Some("spotify"))];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(narrative.blocks[0].background, None);
+    }
+
+    #[test]
+    fn an_overlap_of_sixty_seconds_attaches() {
+        let mut narrative = build_narrative(&one_day_block());
+        let media = vec![media_segment(0, 60, Some("spotify"))];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "spotify".to_string(),
+                other_player_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn the_longest_overlap_among_three_qualifying_players_is_named() {
+        let mut narrative = build_narrative(&one_day_block());
+        let media = vec![
+            media_segment(0, 60, Some("spotify")),
+            media_segment(0, 90, Some("brave")),
+            media_segment(0, 75, Some("mpv")),
+        ];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "brave".to_string(),
+                other_player_count: 2,
+            })
+        );
+    }
+
+    #[test]
+    fn a_media_segment_spanning_three_blocks_attaches_only_to_the_ones_it_clears_the_floor_on() {
+        let segments = vec![
+            window_segment(0, 100, "firefox", "a"),
+            window_segment(100, 130, "zed", "b"),
+            window_segment(130, 300, "kitty", "c"),
+        ];
+        let mut narrative = build_narrative(&segments);
+        // 0-100 in the first block (100s, clears), 100-130 in the second (30s, does not), and
+        // 130-190 in the third (60s, clears exactly).
+        let media = vec![media_segment(0, 190, Some("spotify"))];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "spotify".to_string(),
+                other_player_count: 0,
+            })
+        );
+        assert_eq!(narrative.blocks[1].background, None);
+        assert_eq!(
+            narrative.blocks[2].background,
+            Some(BackgroundMedia {
+                player: "spotify".to_string(),
+                other_player_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn an_afk_block_takes_background_media_like_an_application_block() {
+        let mut narrative = build_narrative(&[idle_segment(0, 3_600)]);
+        let media = vec![media_segment(0, 60, Some("spotify"))];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(narrative.blocks[0].label, "AFK");
+        assert_eq!(narrative.blocks[0].started_at, 0);
+        assert_eq!(narrative.blocks[0].ended_at, 3_600);
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "spotify".to_string(),
+                other_player_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_suspended_block_takes_background_media_with_no_special_case() {
+        let mut narrative = build_narrative(&[suspended_segment(0, 3_600)]);
+        let media = vec![media_segment(0, 60, Some("spotify"))];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(narrative.blocks[0].label, "Suspended");
+        assert_eq!(narrative.blocks[0].started_at, 0);
+        assert_eq!(narrative.blocks[0].ended_at, 3_600);
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "spotify".to_string(),
+                other_player_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn a_media_segment_with_no_player_name_attaches_under_the_media_sections_fallback() {
+        let mut narrative = build_narrative(&one_day_block());
+        let media = vec![media_segment(0, 60, None)];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(
+            narrative.blocks[0].background,
+            Some(BackgroundMedia {
+                player: "unknown player".to_string(),
+                other_player_count: 0,
+            })
+        );
+    }
+
+    #[test]
+    fn attaching_media_changes_no_blocks_duration_no_parts_duration_and_no_segments() {
+        let segments = one_day_block();
+        let mut narrative = build_narrative(&segments);
+        let before_started_at = narrative.blocks[0].started_at;
+        let before_ended_at = narrative.blocks[0].ended_at;
+        let before_parts = narrative.blocks[0].title_parts();
+        let before_segment_count = narrative.blocks[0].segments.len();
+        // Deliberately outside the block on both sides, so a bug that let media widen a block
+        // rather than merely describe it would move started_at or ended_at here.
+        let media = vec![media_segment(-1_000, 10_000, Some("spotify"))];
+
+        attach_background_media(&mut narrative.blocks, &media);
+
+        assert_eq!(narrative.blocks[0].started_at, before_started_at);
+        assert_eq!(narrative.blocks[0].ended_at, before_ended_at);
+        assert_eq!(narrative.blocks[0].title_parts(), before_parts);
+        assert_eq!(narrative.blocks[0].segments.len(), before_segment_count);
+        assert!(narrative.blocks[0].background.is_some());
+    }
+
     /// The invariant this whole layer rests on: whatever segments are grouped into, the result
     /// must be ordered and non-overlapping, must cover exactly the seconds the input covered,
     /// and must never reach outside the day it was built for. Each of the three has to be
@@ -762,6 +1030,116 @@ mod tests {
         );
     }
 
+    /// The invariant `.4` adds on top of `.1`/`.2`/`.3`: attaching media moves no block's
+    /// boundary or segments and changes no title part, whatever the media contains. The review
+    /// of the parent bead found its own containment check close to vacuous, since grouping only
+    /// ever copies timestamps from input segments; `attach_background_media` is the first place
+    /// in this module that computes an instant rather than copying one, so this generator has to
+    /// produce media that overlaps block boundaries, spans several blocks, and starts before and
+    /// ends after the day for that computation to actually be exercised, not merely present.
+    /// Break it on purpose by letting a block's `ended_at` widen to a media segment's own bound
+    /// and see it turn red before accepting the bead.
+    #[test]
+    fn attaching_media_changes_no_block_and_no_title_part() {
+        let day_start: i64 = 1_785_000_000;
+        let day_end: i64 = day_start + 86_400;
+        let mut desktop_state: u64 = 0x6e61_7272_6174_6976;
+        let mut media_state: u64 = 0x6d65_6469_615f_7374;
+        let mut saw_out_of_bounds_media = false;
+        let mut saw_a_multi_block_attachment = false;
+        let mut saw_an_attachment = false;
+
+        for _ in 0..200 {
+            let segments = generated_desktop_segments(&mut desktop_state, day_start, day_end);
+            let media = generated_media_segments(&mut media_state, day_start, day_end);
+            let mut narrative = build_narrative(&segments);
+
+            let before: Vec<(i64, i64, usize)> = narrative
+                .blocks
+                .iter()
+                .map(|block| (block.started_at, block.ended_at, block.segments.len()))
+                .collect();
+            let before_parts: Vec<Vec<TitlePart>> =
+                narrative.blocks.iter().map(Block::title_parts).collect();
+
+            attach_background_media(&mut narrative.blocks, &media);
+
+            let after: Vec<(i64, i64, usize)> = narrative
+                .blocks
+                .iter()
+                .map(|block| (block.started_at, block.ended_at, block.segments.len()))
+                .collect();
+            assert_eq!(
+                before, after,
+                "attaching media moved a block's boundary or its segments"
+            );
+
+            let after_parts: Vec<Vec<TitlePart>> =
+                narrative.blocks.iter().map(Block::title_parts).collect();
+            assert_eq!(
+                before_parts, after_parts,
+                "attaching media changed a block's title parts"
+            );
+
+            for pair in narrative.blocks.windows(2) {
+                assert!(
+                    pair[0].ended_at <= pair[1].started_at,
+                    "blocks out of order or overlapping after attaching media: {pair:?}"
+                );
+            }
+            for block in &narrative.blocks {
+                assert!(
+                    block.started_at >= day_start && block.ended_at <= day_end,
+                    "block [{}, {}) reaches outside the day after attaching media",
+                    block.started_at,
+                    block.ended_at
+                );
+            }
+
+            if media
+                .iter()
+                .any(|segment| segment.started_at < day_start || segment.ended_at > day_end)
+            {
+                saw_out_of_bounds_media = true;
+            }
+            for segment in &media {
+                let clearing_blocks = narrative
+                    .blocks
+                    .iter()
+                    .filter(|block| {
+                        overlap_seconds(block, segment) >= BACKGROUND_MEDIA_FLOOR_SECONDS
+                    })
+                    .count();
+                if clearing_blocks >= 2 {
+                    saw_a_multi_block_attachment = true;
+                }
+            }
+            if narrative
+                .blocks
+                .iter()
+                .any(|block| block.background.is_some())
+            {
+                saw_an_attachment = true;
+            }
+        }
+
+        assert!(
+            saw_out_of_bounds_media,
+            "200 generated days never produced media outside the day; the out-of-bounds path \
+             went unexercised"
+        );
+        assert!(
+            saw_a_multi_block_attachment,
+            "200 generated days never produced one media segment clearing the floor on two \
+             blocks at once; the multi-block path went unexercised"
+        );
+        assert!(
+            saw_an_attachment,
+            "200 generated days never produced a single background attachment; \
+             attach_background_media went unexercised"
+        );
+    }
+
     /// A small, dependency-free linear congruential generator, the same one `src/timeline.rs`
     /// uses for its own property test: many varied inputs are needed, not a cryptographically
     /// sound source, and pulling in a fuzzing crate for one test would ask every future audit
@@ -839,6 +1217,59 @@ mod tests {
             };
             segments.push(segment);
             cursor = end;
+        }
+        segments
+    }
+
+    /// Media segments walking a window wider than the day on both sides, the way a stored media
+    /// row actually can: its own timestamps are never clipped to the day a report asks for, so
+    /// the first and last rows of a real day routinely start before it or end after it. Duration
+    /// is drawn from a wide range so a segment often spans several blocks, and occasionally from
+    /// a narrow one so it lands on either side of the sixty-second floor rather than always
+    /// clearing it by a wide margin.
+    fn generated_media_segments(
+        state: &mut u64,
+        day_start: i64,
+        day_end: i64,
+    ) -> Vec<MediaSegment> {
+        let players = ["spotify", "brave", "mpv"];
+        let mut segments = Vec::new();
+        let mut cursor = day_start - 3_600;
+        let stop_at = day_end + 3_600;
+        while cursor < stop_at {
+            let raw = lcg_next(state);
+            // One run in eight lands near the sixty-second floor instead of the wide range, so
+            // the generator exercises both sides of it rather than only clearing it by minutes.
+            let duration = if (raw >> 58) & 0b111 == 0 {
+                1 + (raw % 120) as i64
+            } else {
+                1 + (raw % 5_000) as i64
+            };
+            let end = cursor + duration;
+            // Read from the top bits rather than `% players.len()`: an LCG's low bits cycle far
+            // faster than its high bits under a power-of-two modulus, the defect that made the
+            // desktop generator's own label draw walk a near-fixed rotation before it was moved
+            // here too. One slot in four stands for a media row with no player name at all.
+            let player = players.get((raw >> 62) as usize);
+            segments.push(MediaSegment {
+                started_at: cursor,
+                ended_at: end,
+                snapshot: MediaSnapshot {
+                    player: player.map(|name| name.to_string()),
+                    title: None,
+                    artist: None,
+                    album: None,
+                    item_url: None,
+                },
+            });
+            // A gap between tracks about a quarter of the time, so segments are not always
+            // touching: a real player stops between tracks too.
+            let gap = if (raw >> 45) & 0b11 == 0 {
+                1 + ((raw >> 20) % 600) as i64
+            } else {
+                0
+            };
+            cursor = end + gap;
         }
         segments
     }
