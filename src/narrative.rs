@@ -1,8 +1,8 @@
 //! Groups a day's desktop segments into narrative blocks: consecutive segments that share one
-//! application label, then absorbs a short foreign focus back into the block around it. Read-time
-//! and stateless, it consumes the desktop slice `Store::day_activity` already returns and
-//! produces an owned value. Nothing calls this module yet, so deleting it returns the tool to
-//! its current behaviour.
+//! application label, then absorbs a short foreign focus back into the block around it and
+//! attaches whichever media held the background. Read-time and stateless, it consumes the two
+//! slices `Store::day_activity` already returns and produces an owned value that
+//! `timeline::render_narrative_day` walks to render `daytrace today`.
 
 use crate::activity::{ActivityKind, MediaSegment, TimelineSegment};
 
@@ -26,7 +26,6 @@ pub struct Block {
 /// block's time and media a single secondary fact riding along, the same shape the browser
 /// layer's own competing-source problem will need a table for later, not this one.
 #[derive(Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub struct BackgroundMedia {
     pub player: String,
     pub other_player_count: usize,
@@ -58,12 +57,25 @@ pub struct Narrative {
 /// An unordered or overlapping vector is not rejected, it is grouped as given, so a caller that
 /// merges or filters before calling has to preserve both properties itself.
 ///
-/// No renderer calls this yet (that lands in a later bead), hence the `#[allow(dead_code)]`.
-#[allow(dead_code)]
+/// Media never plays a part here: attaching it is `attach_background_media`, run separately once
+/// these boundaries have settled. `build_day` is the one call that runs both in order.
 pub fn build_narrative(segments: &[TimelineSegment]) -> Narrative {
     let blocks = group_into_blocks(segments);
     let blocks = swallow_short_foreign_blocks(blocks);
     Narrative { blocks }
+}
+
+/// Build one day's narrative from the two slices `Store::day_activity` returns: group and
+/// swallow the desktop lane into blocks, then attach whichever media cleared the floor on each
+/// one.
+///
+/// The one call the render path needs, so it does not have to know that media attachment has to
+/// run after grouping and swallowing have settled the block boundaries, or scatter that
+/// ordering across the module that renders rather than the one that builds.
+pub fn build_day(segments: &[TimelineSegment], media: &[MediaSegment]) -> Narrative {
+    let mut narrative = build_narrative(segments);
+    attach_background_media(&mut narrative.blocks, media);
+    narrative
 }
 
 /// Group consecutive desktop segments sharing one application label into blocks, with a gap
@@ -72,7 +84,7 @@ fn group_into_blocks(segments: &[TimelineSegment]) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
 
     for segment in segments {
-        let label = block_label(segment);
+        let label = crate::timeline::application_label(segment);
         let touches_previous = blocks
             .last()
             .is_some_and(|block| block.label == label && block.ended_at == segment.started_at);
@@ -146,24 +158,6 @@ fn is_swallowable(blocks: &[Block], index: usize) -> bool {
         && short.ended_at - short.started_at < SWALLOW_THRESHOLD_SECONDS
 }
 
-/// The name a block is keyed by.
-///
-/// Mirrors `application_label` in `src/timeline.rs`, kept as its own copy rather than an
-/// import: that function is private to its module, and widening `timeline.rs`'s surface to
-/// reach it falls outside this bead's blast radius.
-fn block_label(segment: &TimelineSegment) -> &str {
-    match segment.snapshot.kind {
-        ActivityKind::Idle => "AFK",
-        ActivityKind::Suspended => "Suspended",
-        ActivityKind::Unknown => "Unknown",
-        ActivityKind::Window => segment
-            .snapshot
-            .app_class
-            .as_deref()
-            .unwrap_or("unknown app"),
-    }
-}
-
 /// A block prints at most this many distinct titles as their own line; anything past the cap
 /// rolls into one remainder. Measured against the live store rather than guessed: see the bead
 /// this constant belongs to.
@@ -171,19 +165,15 @@ const TITLE_PART_CAP: usize = 5;
 
 /// What a title part calls a segment whose title was never recorded.
 ///
-/// The same string `src/timeline.rs:280` already prints for that segment, rather than a new one
-/// from the "unknown app" family: the raw report keeps rendering these rows once the aggregated
-/// timeline exists beside it, and one fact under two names across two views of the same day is
-/// the confusion both views exist to avoid.
+/// The same string `format_segment` in `src/timeline.rs` already prints for that segment,
+/// rather than a new one from the "unknown app" family: the raw report keeps rendering these
+/// rows once the aggregated timeline exists beside it, and one fact under two names across two
+/// views of the same day is the confusion both views exist to avoid.
 const MISSING_TITLE: &str = "untitled";
 
 /// One line under a block: a distinct title with its own duration, or the remainder standing in
 /// for every title past `TITLE_PART_CAP`.
-///
-/// No renderer calls this yet (that lands in a later bead), hence the `#[allow(dead_code)]`
-/// below on every item that only a renderer would reach.
 #[derive(Debug, Eq, PartialEq)]
-#[allow(dead_code)]
 pub enum TitlePart {
     Title {
         title: String,
@@ -196,7 +186,6 @@ pub enum TitlePart {
 }
 
 impl TitlePart {
-    #[allow(dead_code)]
     pub fn duration_seconds(&self) -> i64 {
         match self {
             TitlePart::Title {
@@ -216,8 +205,8 @@ impl TitlePart {
 const BACKGROUND_MEDIA_FLOOR_SECONDS: i64 = 60;
 
 /// What a background fact calls a media segment whose player was never recorded, matching the
-/// fallback `src/timeline.rs:206` already renders for the same case in the `Media playing`
-/// section, so the two views of a day agree on the name.
+/// fallback `media_label` in `src/timeline.rs` already renders for the same case in the `Media
+/// playing` section, so the two views of a day agree on the name.
 const UNKNOWN_PLAYER: &str = "unknown player";
 
 /// Attach background media to every block: the player whose total overlap with the block is
@@ -232,7 +221,6 @@ const UNKNOWN_PLAYER: &str = "unknown player";
 /// Media never contributes time: this only ever writes `block.background`. `started_at`,
 /// `ended_at` and `segments` are read, never assigned, so no block's duration, no title part and
 /// no per-application total sourced from either can change here, whatever the media contains.
-#[allow(dead_code)]
 pub fn attach_background_media(blocks: &mut [Block], media: &[MediaSegment]) {
     for block in blocks.iter_mut() {
         block.background = background_media_for(block, media);
@@ -297,7 +285,6 @@ impl Block {
     /// not by position. Every segment in the block contributes to exactly one part, so the parts
     /// sum to the block's own duration exactly, remainder included. Nothing here can produce
     /// two parts covering the same segment, or a part covering none.
-    #[allow(dead_code)]
     pub fn title_parts(&self) -> Vec<TitlePart> {
         let mut durations: Vec<(String, i64)> = Vec::new();
         for segment in &self.segments {

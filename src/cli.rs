@@ -8,7 +8,7 @@ use crate::media::{BusctlClient, MediaSource, PlayerOutcome, PlayingMedia};
 use crate::service::render_user_unit;
 use crate::session::{PowerGapWatch, PoweredDownGap, SessionClock, SystemSessionClock};
 use crate::storage::{CaptureStore, Lane, Pruned, Store};
-use crate::timeline::{day_bounds, local_date, render_day, retention_cutoff, unix_now};
+use crate::timeline::{day_bounds, local_date, render_narrative_day, retention_cutoff, unix_now};
 use chrono::NaiveDate;
 use std::env;
 use std::fmt;
@@ -115,7 +115,7 @@ fn run(args: impl IntoIterator<Item = String>) -> Result<String, AppError> {
         [arg, rest @ ..] if arg == "today" => {
             let requested = requested_day(rest)?;
             let (date, segments, media) = stored_day(&Config::from_env()?, requested)?;
-            render_day(date, &segments, &media).map_err(AppError::from)
+            render_narrative_day(date, &segments, &media).map_err(AppError::from)
         }
         [arg, rest @ ..] if arg == "export" => {
             let requested = requested_day(rest)?;
