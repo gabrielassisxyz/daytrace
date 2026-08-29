@@ -6,6 +6,7 @@ mod export;
 mod input;
 mod lock;
 mod media;
+mod narrative;
 mod service;
 mod session;
 mod storage;
