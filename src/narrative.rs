@@ -1,7 +1,8 @@
 //! Groups a day's desktop segments into narrative blocks: consecutive segments that share one
-//! application label. Read-time and stateless, it consumes the desktop slice
-//! `Store::day_activity` already returns and produces an owned value. Nothing calls this module
-//! yet, so deleting it returns the tool to its current behaviour.
+//! application label, then absorbs a short foreign focus back into the block around it. Read-time
+//! and stateless, it consumes the desktop slice `Store::day_activity` already returns and
+//! produces an owned value. Nothing calls this module yet, so deleting it returns the tool to
+//! its current behaviour.
 
 use crate::activity::{ActivityKind, TimelineSegment};
 
@@ -9,10 +10,16 @@ use crate::activity::{ActivityKind, TimelineSegment};
 #[derive(Debug, Eq, PartialEq)]
 pub struct Block {
     pub label: String,
+    pub kind: ActivityKind,
     pub started_at: i64,
     pub ended_at: i64,
     pub segments: Vec<TimelineSegment>,
 }
+
+/// A foreign focus shorter than this is swallowed into the block around it, provided the
+/// segments on both sides are windows sharing one label different from its own. Measured
+/// against the live store rather than guessed: see the bead this constant belongs to.
+const SWALLOW_THRESHOLD_SECONDS: i64 = 5;
 
 /// One day's desktop segments, grouped into blocks.
 #[derive(Debug, Eq, PartialEq)]
@@ -20,13 +27,15 @@ pub struct Narrative {
     pub blocks: Vec<Block>,
 }
 
-/// Group the desktop slice of a stored day into blocks.
+/// Group the desktop slice of a stored day into blocks, then swallow short foreign focus.
 ///
 /// A segment extends the last block when it shares its label and picks up exactly where the
 /// last one left off. A gap between two segments of the same label, meaning the daemon was not
 /// running, starts a new block instead of extending the last one: a gap is an absence of
 /// evidence rather than a continuation of what came before it, so the block boundaries sit at
-/// the stored instants rather than spanning it.
+/// the stored instants rather than spanning it. Once grouped, a window block under the
+/// swallowing threshold sitting between two touching window blocks of one shared, different
+/// label is folded into them; see `swallow_short_foreign_blocks`.
 ///
 /// The caller is expected to pass what the store returns: segments ordered by start and never
 /// overlapping, which the desktop lane guarantees through its one-open-segment-per-lane index.
@@ -36,6 +45,14 @@ pub struct Narrative {
 /// No renderer calls this yet (that lands in a later bead), hence the `#[allow(dead_code)]`.
 #[allow(dead_code)]
 pub fn build_narrative(segments: &[TimelineSegment]) -> Narrative {
+    let blocks = group_into_blocks(segments);
+    let blocks = swallow_short_foreign_blocks(blocks);
+    Narrative { blocks }
+}
+
+/// Group consecutive desktop segments sharing one application label into blocks, with a gap
+/// between two segments breaking a block regardless of label.
+fn group_into_blocks(segments: &[TimelineSegment]) -> Vec<Block> {
     let mut blocks: Vec<Block> = Vec::new();
 
     for segment in segments {
@@ -51,6 +68,7 @@ pub fn build_narrative(segments: &[TimelineSegment]) -> Narrative {
         } else {
             blocks.push(Block {
                 label: label.to_string(),
+                kind: segment.snapshot.kind.clone(),
                 started_at: segment.started_at,
                 ended_at: segment.ended_at,
                 segments: vec![segment.clone()],
@@ -58,7 +76,57 @@ pub fn build_narrative(segments: &[TimelineSegment]) -> Narrative {
         }
     }
 
-    Narrative { blocks }
+    blocks
+}
+
+/// Absorb a foreign window block shorter than the threshold into the block around it, when the
+/// blocks on both sides are windows sharing one label different from its own and touch it in
+/// time on both sides. Touching is required, not merely same label: a gap is the daemon not
+/// running, and merging across it would claim seconds nothing covered, breaking the invariant
+/// that a narrative covers exactly the seconds its input covered.
+///
+/// Repeats until a full pass changes nothing, so an alternating run of two labels collapses to
+/// one block rather than leaving every other short block behind.
+fn swallow_short_foreign_blocks(mut blocks: Vec<Block>) -> Vec<Block> {
+    loop {
+        let mut changed = false;
+        let mut index = 1;
+        while index + 1 < blocks.len() {
+            if is_swallowable(&blocks, index) {
+                let right = blocks.remove(index + 1);
+                let short = blocks.remove(index);
+                let left = blocks
+                    .get_mut(index - 1)
+                    .expect("checked by is_swallowable");
+                left.ended_at = right.ended_at;
+                left.segments.extend(short.segments);
+                left.segments.extend(right.segments);
+                changed = true;
+            } else {
+                index += 1;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    blocks
+}
+
+/// Whether `blocks[index]` is a short foreign focus that its two neighbours should absorb.
+fn is_swallowable(blocks: &[Block], index: usize) -> bool {
+    let left = &blocks[index - 1];
+    let short = &blocks[index];
+    let right = &blocks[index + 1];
+
+    short.kind == ActivityKind::Window
+        && left.kind == ActivityKind::Window
+        && right.kind == ActivityKind::Window
+        && left.label == right.label
+        && short.label != left.label
+        && left.ended_at == short.started_at
+        && short.ended_at == right.started_at
+        && short.ended_at - short.started_at < SWALLOW_THRESHOLD_SECONDS
 }
 
 /// The name a block is keyed by.
@@ -192,6 +260,171 @@ mod tests {
         assert!(narrative.blocks.is_empty());
     }
 
+    #[test]
+    fn a_short_foreign_focus_between_matching_windows_is_swallowed() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            window_segment(10, 13, "zed", "quick check"),
+            window_segment(13, 23, "firefox", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 1);
+        let block = &narrative.blocks[0];
+        assert_eq!(block.label, "firefox");
+        assert_eq!(block.started_at, 0);
+        assert_eq!(block.ended_at, 23);
+        assert_eq!(block.segments.len(), 3);
+    }
+
+    #[test]
+    fn a_segment_of_exactly_five_seconds_is_not_swallowed() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            window_segment(10, 15, "zed", "exactly five"),
+            window_segment(15, 25, "firefox", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[1].label, "zed");
+        assert_eq!(
+            narrative.blocks[1].ended_at - narrative.blocks[1].started_at,
+            5
+        );
+    }
+
+    #[test]
+    fn a_short_focus_between_mismatched_neighbours_is_not_swallowed() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            window_segment(10, 13, "zed", "short"),
+            window_segment(13, 23, "kitty", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[0].label, "firefox");
+        assert_eq!(narrative.blocks[1].label, "zed");
+        assert_eq!(narrative.blocks[2].label, "kitty");
+    }
+
+    #[test]
+    fn an_afk_segment_is_never_swallowed_regardless_of_duration() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            idle_segment(10, 11),
+            window_segment(11, 20, "firefox", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[1].label, "AFK");
+        assert_eq!(narrative.blocks[1].started_at, 10);
+        assert_eq!(narrative.blocks[1].ended_at, 11);
+    }
+
+    #[test]
+    fn a_suspended_segment_is_never_swallowed_regardless_of_duration() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            suspended_segment(10, 11),
+            window_segment(11, 20, "firefox", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[1].label, "Suspended");
+    }
+
+    #[test]
+    fn a_short_focus_is_not_swallowed_when_the_following_neighbour_is_afk() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            window_segment(10, 13, "zed", "short"),
+            idle_segment(13, 20),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[0].label, "firefox");
+        assert_eq!(narrative.blocks[1].label, "zed");
+        assert_eq!(narrative.blocks[2].label, "AFK");
+    }
+
+    #[test]
+    fn a_short_focus_is_not_swallowed_when_the_preceding_neighbour_is_suspended() {
+        let segments = vec![
+            suspended_segment(0, 10),
+            window_segment(10, 13, "zed", "short"),
+            window_segment(13, 23, "firefox", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[1].label, "zed");
+    }
+
+    #[test]
+    fn a_window_named_afk_does_not_pass_the_afk_neighbour_check_by_label_text_alone() {
+        // A window whose own app class happens to be spelled "AFK" must not be mistaken for the
+        // idle block that precedes it: the check that keeps AFK out of a merge has to compare
+        // what kind of segment this is, not merely the text its label renders as.
+        let segments = vec![
+            idle_segment(0, 10),
+            window_segment(10, 13, "zed", "short"),
+            window_segment(13, 23, "AFK", "a window named like the idle label"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[1].label, "zed");
+    }
+
+    #[test]
+    fn a_short_focus_separated_from_a_neighbour_by_a_gap_is_not_swallowed() {
+        // The daemon was not running between the short segment and the block following it:
+        // merging across that gap would credit seconds nothing covered.
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            window_segment(10, 13, "zed", "short"),
+            window_segment(20, 30, "firefox", "b"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 3);
+        assert_eq!(narrative.blocks[1].label, "zed");
+    }
+
+    #[test]
+    fn an_alternating_run_of_short_foreign_focus_collapses_to_one_block() {
+        let segments = vec![
+            window_segment(0, 10, "firefox", "a"),
+            window_segment(10, 13, "term", "short 1"),
+            window_segment(13, 23, "firefox", "b"),
+            window_segment(23, 25, "term", "short 2"),
+            window_segment(25, 35, "firefox", "c"),
+        ];
+
+        let narrative = build_narrative(&segments);
+
+        assert_eq!(narrative.blocks.len(), 1);
+        let block = &narrative.blocks[0];
+        assert_eq!(block.label, "firefox");
+        assert_eq!(block.started_at, 0);
+        assert_eq!(block.ended_at, 35);
+        assert_eq!(block.segments.len(), 5);
+    }
+
     /// The invariant this whole layer rests on: whatever segments are grouped into, the result
     /// must be ordered and non-overlapping, must cover exactly the seconds the input covered,
     /// and must never reach outside the day it was built for. Each of the three has to be
@@ -271,9 +504,22 @@ mod tests {
                 cursor = (cursor + gap).min(day_end);
                 continue;
             }
-            let duration = 1 + (lcg_next(state) % 3_600) as i64;
+            // Duration and label both come from this one draw rather than two separate calls:
+            // an LCG's low bits cycle far faster than its high bits, so `% labels.len()` alone
+            // (a power of two) walked the four labels in a near-fixed rotation and the swallow
+            // branch below never once lined up with a matching pair of neighbours. Reading the
+            // label from the top bits and the swallow branch from a distinct, lower bit range
+            // keeps the two independent of each other.
+            let raw = lcg_next(state);
+            // One run in eight lands near the swallow threshold instead of the full range, so
+            // the generator exercises swallowing itself, not only the grouping it sits on top of.
+            let duration = if (raw >> 58) & 0b111 == 0 {
+                1 + (raw % 8) as i64
+            } else {
+                1 + (raw % 3_600) as i64
+            };
             let end = (cursor + duration).min(day_end);
-            let label = labels[(lcg_next(state) % labels.len() as u64) as usize];
+            let label = labels[(raw >> 62) as usize];
             let segment = match label {
                 "AFK" => idle_segment(cursor, end),
                 // A suspended stretch is a first-class label the criteria name beside AFK, and it
