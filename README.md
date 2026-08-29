@@ -2,7 +2,7 @@
 
 `daytrace` is a local-first personal activity logger for reconstructing where time went during the day.
 
-It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, stretches the machine spent suspended, and what was playing behind the focused window, stores them locally, and prints a chronological daily timeline with durations. `daytrace today` and `daytrace export` report the desktop timeline and a media section apart from each other: media overlaps the desktop and itself, so a shared list or a shared total would claim more time than the day held. Reconciling the two into one narrative is not built yet.
+It is a small Rust CLI and daemon that records active-window changes on Hyprland, idle periods, stretches the machine spent suspended, and what was playing behind the focused window, stores them locally, and prints a chronological daily narrative with durations. `daytrace today` groups the desktop activity into blocks and names whichever media held the background on each one; `daytrace export` keeps the desktop segments and the media segments as two separate arrays instead. Media never joins a block's own time: it overlaps the desktop and itself, so a shared total would claim more time than the day held, and only `Media playing` ever states a media duration.
 
 ## Privacy Controls
 
@@ -116,21 +116,36 @@ daytrace today
 daytrace today --date 2026-07-20
 ```
 
-`daytrace today` prints the chronological timeline with segment durations, then totals the day by application, so the report answers both what happened in order and what consumed the day:
+`daytrace today` groups the day's desktop activity into blocks and prints them in order, then totals the day by application from those blocks, so the report answers both what happened in order and what consumed the day. A block is a run of consecutive desktop activity that stayed on one application; a foreign focus shorter than five seconds is folded into the block around it rather than reported as an interruption, so a quick alt-tab does not break a forty-minute block of writing into three rows. A block with more than one distinct title lists its five longest beneath it, longest first, with anything past the fifth rolled into one remainder line. A block line names the application and, where a media player overlapped it for at least a minute, what was playing behind it; the workspace and monitor a raw row carries are not shown, since a block can span several of each, and they are still in `daytrace export`:
 
 ```text
 Timeline for 2026-07-20
 09:10-09:34  24m     ghostty - tmux
-09:34-09:51  17m     firefox - Inbox - Brave
-09:51-09:52  12s     ghostty - tmux
-09:52-10:08  16m     AFK
-23:40-24:00  20m     ghostty - tmux
+09:34-10:14  40m     firefox, spotify playing in the background
+             18m       GitHub pull request
+             11m       tokio docs
+             6m        Inbox - Brave
+             3m        Rust changelog
+             1m        Cargo book
+             1m        other (2 titles)
+10:14-10:30  16m     AFK
+10:30-10:33  3m      zed - notes, brave playing in the background and 1 more
 
 Time per application
-   44m  ghostty
-   17m  firefox
+   40m  firefox
+   24m  ghostty
    16m  AFK
+    3m  zed
+
+Media playing
+09:35-09:40  5m      spotify - Track title
+10:30-10:32  2m      brave - Some video
+10:30-10:31  1m      mpv - Another stream
+
+    7m  Total
 ```
+
+A block that a media player overlapped by at least a minute carries the player's name as a suffix, `, spotify playing in the background`, with `and N more` appended when other players also cleared that floor; a track heard for a few seconds explains nothing about the block and is left out of the suffix, though it still gets its own row in `Media playing` below. Naming a player never moves a second between blocks: the desktop lane alone decides where the day's time went, and media is a fact riding along rather than a second claim on it.
 
 A span shorter than a minute reports the seconds it lasted. Rounding it to the nearest minute called it `0m`, and with one-second polling a stretch of rapid window switching became a column of identical zeroes crowding out the blocks that held the day. A segment that lasted no time at all reads as `0s`, which says what happened instead of looking like a duration lost to rounding: a focus change with no input during an idle wait closes the displaced window at the instant it opened, and startup recovery does the same to a segment the daemon only ever observed once, which is the last application focused before it died.
 
@@ -140,7 +155,7 @@ The wall clock is used only to place that stretch on the timeline, never to deci
 
 What that leaves. Suspend and hibernate are not told apart, because the kernel counts both the same way and both mean the machine was not running. A stretch during which the daemon itself was not running stays an ordinary gap in the day, whether the machine was off or the daemon was merely stopped: the clocks restart at boot and a fresh process has nothing earlier to compare against. Each endpoint is placed by the wall clock at the poll that noticed the resume, so it carries up to a polling interval of error and, on a boot whose clock has not yet been corrected, whatever error that clock still holds: a stretch of the right length can land at the wrong time, or on the wrong day. A stored stretch can also come out shorter than the kernel counted, where it would otherwise reach back over activity the daemon had already observed, which is the right way to lose the argument. A suspend shorter than five seconds is left with whatever segment was open rather than breaking the day into three rows.
 
-Totals sum seconds and round once, so a minute spread over several short visits still reports as a minute rather than inheriting each row's rounding. Absence is totalled as `AFK`, apart from any application.
+Totals sum seconds from the blocks, not the raw rows behind them, and round once, so a minute spread over several short visits still reports as a minute rather than inheriting each row's rounding. A foreign focus swallowed into a block moves its seconds to whichever application the block belongs to rather than dropping them, so the totals still close to the same number of seconds the desktop lane recorded. Absence is totalled as `AFK`, apart from any application.
 
 `--date YYYY-MM-DD` reports any other local day, which is what a review of the past week needs once midnight has passed. Day boundaries come from the local calendar day, so a day that a clock change shortens or lengthens still meets its neighbours exactly. A segment reaching the end of the reported day ends at `24:00`, which names the boundary: the instant it is clipped to belongs to the following day, so a clock would call it `00:00` and a whole day would read as beginning and ending at the same time.
 

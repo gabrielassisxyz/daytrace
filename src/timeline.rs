@@ -1,4 +1,5 @@
 use crate::activity::{ActivityKind, MediaSegment, TimelineSegment};
+use crate::narrative::{self, BackgroundMedia, Block, TitlePart};
 use chrono::{Days, Local, MappedLocalTime, NaiveDate, TimeZone};
 use std::cmp::Reverse;
 use std::collections::BTreeMap;
@@ -117,10 +118,17 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
             seconds,
         })
         .collect();
-    // Longest first, and equal totals by name so the same day reads the same way twice.
-    // The name comparison ignores case: application classes arrive in whichever case the
-    // compositor reports, and raw byte order would sort every capitalised one above every
-    // lowercase one.
+    sort_totals_longest_first(&mut totals);
+    totals
+}
+
+/// Longest first, and equal totals by name so the same day reads the same way twice. The name
+/// comparison ignores case: application classes arrive in whichever case the compositor
+/// reports, and raw byte order would sort every capitalised one above every lowercase one.
+///
+/// Shared between `application_totals` (raw segments) and `application_totals_from_blocks`
+/// (the narrative), so the two orderings cannot drift apart from each other independently.
+fn sort_totals_longest_first(totals: &mut [ApplicationTotal]) {
     totals.sort_by(|left, right| {
         Reverse(left.seconds)
             .cmp(&Reverse(right.seconds))
@@ -131,6 +139,28 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
                     .then_with(|| left.label.cmp(&right.label))
             })
     });
+}
+
+/// `Time per application`, totalled from the blocks rather than the raw segments.
+///
+/// Swallowing moves seconds between applications, so a total taken from the rows would
+/// contradict the timeline printed above it: `block.label` is `application_label` under
+/// another name, kept in step with it because grouping is built on that same function.
+fn application_totals_from_blocks(blocks: &[Block]) -> Vec<ApplicationTotal> {
+    let mut seconds_by_label: BTreeMap<&str, i64> = BTreeMap::new();
+    for block in blocks {
+        *seconds_by_label.entry(block.label.as_str()).or_default() +=
+            block.ended_at.saturating_sub(block.started_at).max(0);
+    }
+
+    let mut totals: Vec<ApplicationTotal> = seconds_by_label
+        .into_iter()
+        .map(|(label, seconds)| ApplicationTotal {
+            label: label.to_string(),
+            seconds,
+        })
+        .collect();
+    sort_totals_longest_first(&mut totals);
     totals
 }
 
@@ -141,6 +171,12 @@ pub fn application_totals(segments: &[TimelineSegment]) -> Vec<ApplicationTotal>
 /// overlaps with the desktop and with itself: a track played behind a window is real time
 /// twice over, and a total that summed both would claim more than the day held. Reconciling
 /// them into one narrative is the aggregation layer's job, not this one's.
+///
+/// `today` renders `render_narrative_day` instead as of the aggregation layer; this stays for
+/// `today --raw` to print byte for byte, which is a later bead in that layer, and for the tests
+/// that check the aggregated view against it. `#[allow(dead_code)]` because that flag does not
+/// exist yet, so nothing in the production binary reaches this until it does.
+#[allow(dead_code)]
 pub fn render_day(
     date: NaiveDate,
     segments: &[TimelineSegment],
@@ -183,6 +219,124 @@ pub fn render_day(
     }
 
     Ok(output)
+}
+
+/// The width of `{start}-{end}`, both of which always format to `HH:MM`: two five-character
+/// clocks and the dash between them. A sub-line's leading blank replaces exactly this many
+/// columns, so a duration below a block sits under the block's own without depending on either
+/// clock reading.
+const CLOCK_RANGE_WIDTH: usize = 11;
+
+/// Render one day as the narrative: blocks with their title sub-lines and background media,
+/// `Time per application` totalled from those blocks, and the `Media playing` section unchanged.
+///
+/// The media section shares `format_media_segment` and `media_playing_seconds` with
+/// [`render_day`] rather than a copy, which is what keeps decision 6 (the section stays
+/// byte-identical) true by construction instead of by a golden test alone.
+pub fn render_narrative_day(
+    date: NaiveDate,
+    segments: &[TimelineSegment],
+    media: &[MediaSegment],
+) -> Result<String, String> {
+    let (_, day_end) = day_bounds(date)?;
+
+    if segments.is_empty() && media.is_empty() {
+        return Ok(format!("No activity events recorded for {date}.\n"));
+    }
+
+    let narrative = narrative::build_day(segments, media);
+
+    let mut output = format!("Timeline for {date}\n");
+    for block in &narrative.blocks {
+        output.push_str(&format_block(block, day_end)?);
+        output.push('\n');
+    }
+
+    if !segments.is_empty() {
+        output.push_str("\nTime per application\n");
+        for total in application_totals_from_blocks(&narrative.blocks) {
+            let duration = format_duration(total.seconds);
+            output.push_str(&format!("{duration:>6}  {}\n", total.label));
+        }
+    }
+
+    if !media.is_empty() {
+        if !segments.is_empty() {
+            output.push('\n');
+        }
+        output.push_str("Media playing\n");
+        for entry in media {
+            output.push_str(&format_media_segment(entry, day_end)?);
+            output.push('\n');
+        }
+        output.push('\n');
+        let total = format_duration(media_playing_seconds(media));
+        output.push_str(&format!("{total:>6}  Total\n"));
+    }
+
+    Ok(output)
+}
+
+/// One block: its line, then its title sub-lines when it has more than one, exactly as
+/// `format_segment` already distinguishes a window's title from every other kind's fixed label.
+fn format_block(block: &Block, day_end: i64) -> Result<String, String> {
+    let started = format_clock(block.started_at)?;
+    let ended = format_end_clock(block.ended_at, day_end)?;
+    let duration = format_duration(block.ended_at.saturating_sub(block.started_at));
+    let parts = block.title_parts();
+    let label = block_line_label(block, &parts);
+    let mut rendered = format!("{started}-{ended}  {duration:<6}  {label}");
+
+    if block.kind == ActivityKind::Window && parts.len() > 1 {
+        for part in &parts {
+            rendered.push('\n');
+            rendered.push_str(&format_title_part(part));
+        }
+    }
+
+    Ok(rendered)
+}
+
+/// The block line's label: the application or absence name, its title when a window block has
+/// exactly one (the same shape a raw window row already prints), and the background suffix.
+fn block_line_label(block: &Block, parts: &[TitlePart]) -> String {
+    let mut label = block.label.clone();
+    if block.kind == ActivityKind::Window
+        && let [TitlePart::Title { title, .. }] = parts
+    {
+        label.push_str(" - ");
+        label.push_str(title);
+    }
+    if let Some(background) = &block.background {
+        label.push_str(&format_background_suffix(background));
+    }
+    label
+}
+
+/// `, <player> playing in the background`, with `and N more` appended when other players also
+/// cleared the floor, naming only the one that overlapped the block longest.
+fn format_background_suffix(background: &BackgroundMedia) -> String {
+    let mut suffix = format!(", {} playing in the background", background.player);
+    if background.other_player_count > 0 {
+        suffix.push_str(&format!(" and {} more", background.other_player_count));
+    }
+    suffix
+}
+
+/// One title beneath a block: the clock range blanked out, its duration under the block's own,
+/// and the title indented two columns past where the block label starts.
+fn format_title_part(part: &TitlePart) -> String {
+    let blank_range = " ".repeat(CLOCK_RANGE_WIDTH);
+    let duration = format_duration(part.duration_seconds());
+    let text = title_part_text(part);
+    format!("{blank_range}  {duration:<6}    {text}")
+}
+
+fn title_part_text(part: &TitlePart) -> String {
+    match part {
+        TitlePart::Title { title, .. } => title.clone(),
+        TitlePart::Remainder { title_count, .. } => format!("other ({title_count} titles)"),
+    }
 }
 
 /// One row of the media section, at the timeline's own column widths so the two sections read
@@ -251,8 +405,10 @@ fn media_playing_seconds(media: &[MediaSegment]) -> i64 {
 /// What to call the thing that held the time, for both a timeline row and a total.
 ///
 /// One source for both, because a row and a total that disagree about the name of an
-/// application read as two different applications in the same report.
-fn application_label(segment: &TimelineSegment) -> &str {
+/// application read as two different applications in the same report. `pub(crate)` rather than
+/// private: `narrative::group_into_blocks` keys a block by this same name, and a second copy is
+/// how a row and a total came to name the same application differently before this bead.
+pub(crate) fn application_label(segment: &TimelineSegment) -> &str {
     match segment.snapshot.kind {
         ActivityKind::Idle => "AFK",
         // Named apart from absence on purpose: a report that called a suspended night "AFK"
@@ -344,10 +500,11 @@ fn format_duration(seconds: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        ApplicationTotal, application_totals, day_bounds, local_date, media_playing_seconds,
-        render_day, retention_cutoff,
+        ApplicationTotal, application_totals, application_totals_from_blocks, day_bounds,
+        local_date, media_playing_seconds, render_day, render_narrative_day, retention_cutoff,
     };
     use crate::activity::{ActivitySnapshot, MediaSegment, MediaSnapshot, TimelineSegment};
+    use crate::narrative::build_day;
     use chrono::NaiveDate;
 
     fn idle_segment(started_at: i64, ended_at: i64) -> TimelineSegment {
@@ -376,6 +533,22 @@ mod tests {
             snapshot: ActivitySnapshot::window(
                 Some(app.to_string()),
                 Some("a window".to_string()),
+                None,
+                None,
+            ),
+        }
+    }
+
+    /// A window segment with its own title, for the narrative tests below: unlike `segment`,
+    /// which fixes the title to make every desktop row read the same, a block's title parts
+    /// need segments that genuinely differ.
+    fn window_titled(started_at: i64, ended_at: i64, app: &str, title: &str) -> TimelineSegment {
+        TimelineSegment {
+            started_at,
+            ended_at,
+            snapshot: ActivitySnapshot::window(
+                Some(app.to_string()),
+                Some(title.to_string()),
                 None,
                 None,
             ),
@@ -870,6 +1043,239 @@ mod tests {
         assert_eq!(rendered, "No activity events recorded for 2026-07-20.\n");
     }
 
+    // Narrative rendering: `render_narrative_day`, the path `today` calls as of this bead.
+
+    /// A day built to actually contain the cases the golden test has to reach, not merely claim
+    /// to: a block with a background (`firefox`, overlapped by `spotify` well past the floor), a
+    /// block with more titles than the five-title cap (seven distinct pages, so a remainder line
+    /// is unavoidable), and a block a foreign focus was swallowed into (`kitty`, with a
+    /// three-second `rofi` window folded into it). A fourth block (`zed`) carries three media
+    /// players overlapping it at once, so `and N more` is reachable, and a fifth (`Suspended`)
+    /// closes the day with the longest single total.
+    ///
+    /// The floor is exercised by the `AFK` block, which `vlc` overlaps for thirty seconds and so
+    /// never names. That segment is the golden's only rejection case, which is why it is called
+    /// out here: a later reader trimming it as redundant would remove the coverage silently.
+    fn narrative_mixed_day_fixture() -> (NaiveDate, i64, Vec<TimelineSegment>, Vec<MediaSegment>) {
+        let day = date(2026, 7, 20);
+        let (start, _) = day_bounds(day).expect("bounds");
+
+        let segments = vec![
+            // firefox: seven distinct titles, longest first once sorted, so titles "z".."e" are
+            // kept and "d"/"c" (the two shortest) become the remainder.
+            window_titled(start, start + 600, "firefox", "z"),
+            window_titled(start + 600, start + 1_080, "firefox", "y"),
+            window_titled(start + 1_080, start + 1_440, "firefox", "x"),
+            window_titled(start + 1_440, start + 1_740, "firefox", "w"),
+            window_titled(start + 1_740, start + 1_980, "firefox", "v"),
+            window_titled(start + 1_980, start + 2_160, "firefox", "u"),
+            window_titled(start + 2_160, start + 2_280, "firefox", "t"),
+            idle_segment(start + 2_280, start + 2_880),
+            window_titled(start + 2_880, start + 3_060, "zed", "notes"),
+            window_titled(start + 3_060, start + 3_660, "kitty", "editing"),
+            window_titled(start + 3_660, start + 3_663, "rofi", "quick check"),
+            window_titled(start + 3_663, start + 4_263, "kitty", "editing"),
+            TimelineSegment {
+                started_at: start + 4_263,
+                ended_at: start + 7_863,
+                snapshot: ActivitySnapshot::suspended(),
+            },
+        ];
+
+        let media = vec![
+            // Clears the floor on the firefox block alone.
+            media_segment(start + 100, start + 190, Some("spotify"), None, None, None),
+            // Overlaps the AFK block for 30s, under the floor: listed in Media playing, named
+            // on no block line.
+            media_segment(start + 2_290, start + 2_320, Some("vlc"), None, None, None),
+            // Three players over the zed block: brave overlaps longest, so "and 2 more".
+            media_segment(
+                start + 2_880,
+                start + 3_050,
+                Some("brave"),
+                None,
+                None,
+                None,
+            ),
+            media_segment(start + 2_900, start + 2_990, Some("mpv"), None, None, None),
+            media_segment(
+                start + 2_950,
+                start + 3_015,
+                Some("mplayer"),
+                None,
+                None,
+                None,
+            ),
+        ];
+
+        (day, start, segments, media)
+    }
+
+    #[test]
+    fn a_mixed_narrative_day_golden() {
+        let (day, _, segments, media) = narrative_mixed_day_fixture();
+
+        let rendered = render_narrative_day(day, &segments, &media).expect("render");
+
+        assert_eq!(
+            rendered,
+            [
+                "Timeline for 2026-07-20",
+                "00:00-00:38  38m     firefox, spotify playing in the background",
+                "             10m       z",
+                "             8m        y",
+                "             6m        x",
+                "             5m        w",
+                "             4m        v",
+                "             5m        other (2 titles)",
+                "00:38-00:48  10m     AFK",
+                "00:48-00:51  3m      zed - notes, brave playing in the background and 2 more",
+                "00:51-01:11  20m     kitty",
+                "             20m       editing",
+                "             3s        quick check",
+                "01:11-02:11  1h      Suspended",
+                "",
+                "Time per application",
+                "    1h  Suspended",
+                "   38m  firefox",
+                "   20m  kitty",
+                "   10m  AFK",
+                "    3m  zed",
+                "",
+                "Media playing",
+                "00:01-00:03  2m      spotify - unknown media",
+                "00:38-00:38  30s     vlc - unknown media",
+                "00:48-00:50  3m      brave - unknown media",
+                "00:48-00:49  2m      mpv - unknown media",
+                "00:49-00:50  1m      mplayer - unknown media",
+                "",
+                "    5m  Total",
+                "",
+            ]
+            .join("\n"),
+            "actual rendering: {rendered}"
+        );
+    }
+
+    /// A block with exactly one title reads exactly as a raw window row does, minus the
+    /// workspace and monitor location the output shape drops: the narrative names an
+    /// application and a title, not where on the desktop it sat.
+    #[test]
+    fn a_narrative_day_with_one_title_per_block_golden() {
+        let (day, _, segments) = desktop_only_fixture();
+
+        let rendered = render_narrative_day(day, &segments, &[]).expect("render");
+
+        assert_eq!(
+            rendered,
+            [
+                "Timeline for 2026-07-20",
+                "00:00-00:24  24m     ghostty - tmux",
+                "00:24-00:41  17m     firefox - Inbox - Brave",
+                "00:41-00:57  16m     AFK",
+                "",
+                "Time per application",
+                "   24m  ghostty",
+                "   17m  firefox",
+                "   16m  AFK",
+                "",
+            ]
+            .join("\n"),
+            "actual rendering: {rendered}"
+        );
+    }
+
+    /// Six distinct titles is one past the five-title cap: the smallest case that actually
+    /// forces a remainder line, rather than one so large the cap's edge is never approached.
+    #[test]
+    fn a_narrative_block_with_six_titles_prints_five_and_a_remainder() {
+        let day = date(2026, 7, 20);
+        let (start, _) = day_bounds(day).expect("bounds");
+        let segments: Vec<TimelineSegment> = (0..6)
+            .map(|index| {
+                window_titled(
+                    start + index * 60,
+                    start + index * 60 + 60,
+                    "firefox",
+                    &format!("title {index}"),
+                )
+            })
+            .collect();
+
+        let rendered = render_narrative_day(day, &segments, &[]).expect("render");
+
+        assert_eq!(
+            rendered,
+            [
+                "Timeline for 2026-07-20",
+                "00:00-00:06  6m      firefox",
+                "             1m        title 0",
+                "             1m        title 1",
+                "             1m        title 2",
+                "             1m        title 3",
+                "             1m        title 4",
+                "             1m        other (1 titles)",
+                "",
+                "Time per application",
+                "    6m  firefox",
+                "",
+            ]
+            .join("\n"),
+            "actual rendering: {rendered}"
+        );
+    }
+
+    #[test]
+    fn an_empty_day_through_the_narrative_path_is_unchanged() {
+        let rendered = render_narrative_day(date(2026, 7, 20), &[], &[]).expect("render");
+
+        assert_eq!(rendered, "No activity events recorded for 2026-07-20.\n");
+    }
+
+    /// Decision 6: the `Media playing` section stays byte-identical under the narrative path,
+    /// and a media-only day still skips the empty timeline and the empty totals heading.
+    #[test]
+    fn a_media_only_day_through_the_narrative_path_matches_the_media_section() {
+        let (day, start, _) = desktop_only_fixture();
+        let media = media_only_fixture(start);
+
+        let rendered = render_narrative_day(day, &[], &media).expect("render");
+
+        assert_eq!(
+            rendered,
+            format!("Timeline for {day}\n{}", media_block_golden())
+        );
+    }
+
+    /// Decision 5, proved directly rather than only through the golden above: a total taken from
+    /// the raw segments still names the swallowed application on its own, while the total taken
+    /// from the blocks folds its seconds into the block that absorbed it and never names it at
+    /// all. The two must disagree here, or the totals are not actually sourced from the blocks.
+    #[test]
+    fn time_per_application_is_sourced_from_blocks_not_raw_segments_when_swallowing_moves_seconds()
+    {
+        let segments = vec![
+            segment(0, 600, "term"),
+            segment(600, 603, "popup"),
+            segment(603, 1_203, "term"),
+        ];
+
+        let raw_totals = application_totals(&segments);
+        assert!(
+            raw_totals.iter().any(|total| total.label == "popup"),
+            "the raw segments still name the three seconds on their own: {raw_totals:?}"
+        );
+
+        let narrative = build_day(&segments, &[]);
+        let block_totals = application_totals_from_blocks(&narrative.blocks);
+        assert_eq!(
+            block_totals,
+            vec![total("term", 1_203)],
+            "swallowing must fold the popup's seconds into term and leave no total under \
+             popup's own name: {block_totals:?}"
+        );
+    }
+
     #[test]
     fn a_day_with_media_and_no_desktop_rows_skips_straight_to_the_media_section() {
         let (day, start, _) = desktop_only_fixture();
@@ -1006,7 +1412,12 @@ mod tests {
 
     /// A day where media and desktop overlap for most of it must still keep every total the
     /// report prints at or under the length of the day, whichever source produced it, and
-    /// whichever players overlapped each other.
+    /// whichever players overlapped each other. Extended to the narrative path: the same
+    /// generated day, rendered through `render_narrative_day`, must keep its own
+    /// `Time per application` (sourced from blocks rather than raw segments) under the same
+    /// ceiling, and media attached to a block must not have raised it. Breaking that on purpose,
+    /// by letting `application_totals_from_blocks` add a block's `background` overlap into its
+    /// seconds, turns this loop red well before 200 iterations.
     #[test]
     fn no_total_the_report_prints_exceeds_the_length_of_the_day() {
         let day = date(2026, 7, 20);
@@ -1035,6 +1446,24 @@ mod tests {
                 media_total <= day_length,
                 "the media section's own total was {media_total}s, more than the day's \
                  {day_length}s: {rendered}"
+            );
+
+            let narrative_rendered = render_narrative_day(day, &desktop, &media).expect("render");
+            let narrative = build_day(&desktop, &media);
+            let block_total: i64 = application_totals_from_blocks(&narrative.blocks)
+                .iter()
+                .map(|total| total.seconds)
+                .sum();
+            assert!(
+                block_total <= day_length,
+                "the block totals summed to {block_total}s, more than the day's {day_length}s: \
+                 {narrative_rendered}"
+            );
+            assert_eq!(
+                block_total, desktop_total,
+                "grouping and swallowing must not change how many desktop seconds the day \
+                 totals to, only which application some of them are credited to: \
+                 {narrative_rendered}"
             );
         }
     }
