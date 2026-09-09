@@ -9,6 +9,15 @@ jobs:
   ci:
     if: github.event_name != 'pull_request' || github.event.action != 'edited'
     runs-on: ubuntu-latest
+    # bin/ci derives a per-worktree CARGO_TARGET_DIR so parallel worktrees on the
+    # desktop never judge each other's artifacts; on a machine without /mnt/build
+    # that lands under /tmp. The runner has one checkout and nothing to isolate,
+    # and Swatinem/rust-cache saves <workspace>/target without ever reading
+    # CARGO_TARGET_DIR, so without this line the two paths differ and every run
+    # compiles the whole dependency tree cold. bin/ci honours an explicit value,
+    # which is why this is set here and not there.
+    env:
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
