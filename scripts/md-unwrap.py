@@ -73,6 +73,13 @@ BLOCK_START_RE = re.compile(
 # Four-space (or tab) indent is an indented code block only outside a list; inside a
 # list the same indent is a continuation. Handled at the call site, not here.
 INDENTED_CODE_RE = re.compile(r"^(\t| {4,})")
+# `<` above opens an HTML block, so a comment's OPENING line is left alone -- but the
+# lines inside a multi-line comment read as ordinary prose to every rule here and get
+# folded into it, taking the closing `-->` with them. Comments are where tools park
+# machine-readable state, and joining those lines destroys data rather than reflowing
+# prose: it erased a 174-record evidence block whose reader matches on the newline
+# after the opening marker. Same lesson as the fixtures in SKIP_PARTS, one step out.
+HTML_COMMENT_OPEN_RE = re.compile(r"^\s*<!--")
 # Two trailing spaces or a trailing backslash is an explicit <br>. Joining it would
 # delete a line break the author asked for.
 HARD_BREAK_RE = re.compile(r"(  +|\\)$")
@@ -128,6 +135,7 @@ def unwrap(text: str) -> str:
     item_indent = 0
     in_fence = False
     fence_marker = ""
+    in_html_comment = False
     # YAML frontmatter: only when `---` is the very first line of the file.
     in_frontmatter = bool(lines) and lines[0].strip() == "---"
     seen_frontmatter_start = False
@@ -203,6 +211,20 @@ def unwrap(text: str) -> str:
 
         if in_fence:
             out.append(line)
+            continue
+
+        # A comment closed on its own line is an ordinary HTML block; only one left
+        # open spans lines that would otherwise be joined into it.
+        if in_html_comment:
+            out.append(line)
+            if "-->" in line:
+                in_html_comment = False
+            continue
+
+        if HTML_COMMENT_OPEN_RE.match(line) and "-->" not in line:
+            flush()
+            out.append(line)
+            in_html_comment = True
             continue
 
         # A setext underline terminates the paragraph above it and stays on its own
